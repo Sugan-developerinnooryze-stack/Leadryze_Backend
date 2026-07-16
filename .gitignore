@@ -1,0 +1,25 @@
+# Environment variables — NEVER commit these
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+pids/
+*.pid
+*.seed
+
+# OS files
+.DS_Store
+Thumbs.db
