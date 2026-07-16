@@ -12,7 +12,7 @@ dist/
 build/
 
 # Logs
-logs/
+/logs/
 *.log
 
 # Runtime data
