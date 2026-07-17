@@ -23,12 +23,22 @@ export function buildKey(tenantId: string, folder: string, filename: string): st
 }
 
 /**
+ * Resolve this backend's own public base URL.
+ * - BACKEND_URL: explicit, always wins if set (works for any host).
+ * - RENDER_EXTERNAL_URL: auto-injected by Render on web services at runtime —
+ *   covers deployments where BACKEND_URL was never configured.
+ * - Falls back to localhost only for local dev.
+ */
+function resolveBaseUrl(): string {
+  return process.env.BACKEND_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${config.app.port}`;
+}
+
+/**
  * Build the public URL for a given S3 key by pointing it to our backend proxy route.
  * Format: {BACKEND_URL}/api/v1/storage/{key}
  */
 export function buildPublicUrl(key: string): string {
-  const baseUrl = process.env.BACKEND_URL || `http://localhost:${config.app.port}`;
-  return `${baseUrl}/api/${config.app.apiVersion}/storage/${key}`;
+  return `${resolveBaseUrl()}/api/${config.app.apiVersion}/storage/${key}`;
 }
 
 /**
@@ -73,7 +83,12 @@ export async function deleteFromS3(key: string): Promise<void> {
  *   → "Leadryze_Bucket/tenantId/logos/file.png"
  */
 export function keyFromUrl(publicUrl: string): string {
-  const baseUrl = process.env.BACKEND_URL || `http://localhost:${config.app.port}`;
-  const prefix = `${baseUrl}/api/${config.app.apiVersion}/storage/`;
-  return publicUrl.startsWith(prefix) ? publicUrl.slice(prefix.length) : publicUrl;
+  const prefix = `${resolveBaseUrl()}/api/${config.app.apiVersion}/storage/`;
+  if (publicUrl.startsWith(prefix)) return publicUrl.slice(prefix.length);
+  // Also strip a bare "/api/{version}/storage/" prefix regardless of host —
+  // covers URLs stored before BACKEND_URL/RENDER_EXTERNAL_URL was available,
+  // e.g. old rows saved with a localhost URL that no longer matches resolveBaseUrl().
+  const pathPrefix = `/api/${config.app.apiVersion}/storage/`;
+  const idx = publicUrl.indexOf(pathPrefix);
+  return idx >= 0 ? publicUrl.slice(idx + pathPrefix.length) : publicUrl;
 }
