@@ -60,6 +60,38 @@ function svcRows(services: any[], showUnit: boolean, cur: string): string {
     </tr>`).join('');
 }
 
+// ─── Shared parts table (Parts / Materials) — mirrors every *PrintPage.tsx's
+// separate parts table, which the backend previously dropped entirely even
+// though the total already includes parts cost. ────────────────────────────
+
+function partRows(parts: any[], cur: string): string {
+  return parts.map((p: any, i: number) => `
+    <tr class="${i % 2 === 1 ? 'tr-alt' : ''}">
+      <td>${i + 1}</td>
+      <td>
+        <strong>${esc(p.name)}</strong>
+        ${p.description ? `<br><span style="color:#9ca3af;font-size:10px">${esc(p.description)}</span>` : ''}
+      </td>
+      <td>${esc(p.partNumber ?? '—')}</td>
+      <td class="td-r">${p.count ?? 1}</td>
+      <td class="td-r">${fmt(p.amount, cur)}</td>
+      <td class="td-r"><strong>${fmt((p.amount ?? 0) * (p.count ?? 1), cur)}</strong></td>
+    </tr>`).join('');
+}
+
+function partsTableHtml(parts: any[] | undefined, cur: string): string {
+  if (!parts?.length) return '';
+  return `
+    <p class="section-lbl" style="margin-top:16px">Parts / Materials</p>
+    <table>
+      <thead><tr>
+        <th style="width:32px">#</th><th>Part Name</th><th style="width:100px">Part No.</th>
+        <th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th>
+      </tr></thead>
+      <tbody>${partRows(parts, cur)}</tbody>
+    </table>`;
+}
+
 // ─── Totals block ─────────────────────────────────────────────────────────────
 
 function totalsHtml(doc: any, label: string, cur: string): string {
@@ -83,10 +115,13 @@ function sigsHtml(left: string, right: string, s: any): string {
   const sigImg = s?.companySignature
     ? `<img src="${esc(s.companySignature)}" style="height:40px;margin-bottom:4px" />`
     : '';
+  const stampImg = s?.stampImage
+    ? `<img src="${esc(s.stampImage)}" style="height:56px;margin-bottom:4px;margin-left:8px" />`
+    : '';
   return `
     <div class="sig-row">
       <div>
-        ${sigImg}
+        <div style="display:flex;align-items:flex-end;justify-content:center">${sigImg}${stampImg}</div>
         <div class="sig-line">${left}</div>
       </div>
       <div><div class="sig-line">${right}</div></div>
@@ -99,16 +134,32 @@ function bankHtml(s: any, cur: string): string {
   if (!s?.bankName && !s?.accountNumber && !s?.upiId) return '';
   return `
     <div class="bank-box">
-      <p class="section-lbl">Payment Details</p>
-      <div class="bank-grid">
-        ${s.bankName      ? `<div><span class="t-lbl">Bank</span><br><strong>${esc(s.bankName)}</strong></div>`          : ''}
-        ${s.accountName   ? `<div><span class="t-lbl">Account Name</span><br><strong>${esc(s.accountName)}</strong></div>` : ''}
-        ${s.accountNumber ? `<div><span class="t-lbl">Account No.</span><br><strong>${esc(s.accountNumber)}</strong></div>`: ''}
-        ${s.ifscCode      ? `<div><span class="t-lbl">BSB / IFSC</span><br><strong>${esc(s.ifscCode)}</strong></div>`     : ''}
-        ${s.upiId         ? `<div><span class="t-lbl">UPI</span><br><strong>${esc(s.upiId)}</strong></div>`               : ''}
+      <p class="bank-title">Payment Details</p>
+      <div style="display:flex;align-items:flex-start;gap:16px">
+        <div class="bank-grid" style="flex:1">
+          ${s.bankName      ? `<div><span class="t-lbl">Bank</span><br><strong>${esc(s.bankName)}</strong></div>`          : ''}
+          ${s.accountName   ? `<div><span class="t-lbl">Account Name</span><br><strong>${esc(s.accountName)}</strong></div>` : ''}
+          ${s.accountNumber ? `<div><span class="t-lbl">Account No.</span><br><strong>${esc(s.accountNumber)}</strong></div>`: ''}
+          ${s.ifscCode      ? `<div><span class="t-lbl">BSB / IFSC</span><br><strong>${esc(s.ifscCode)}</strong></div>`     : ''}
+          ${s.upiId         ? `<div style="grid-column:span 2"><span class="t-lbl">UPI</span><br><strong>${esc(s.upiId)}</strong></div>` : ''}
+        </div>
+        ${s.qrCodeImage ? `
+        <div style="flex-shrink:0;text-align:center">
+          <img src="${esc(s.qrCodeImage)}" style="height:64px;width:64px;object-fit:contain" />
+          <div style="font-size:9px;color:#9ca3af;margin-top:2px">Scan to Pay</div>
+        </div>` : ''}
       </div>
-      ${s.qrCodeImage ? `<img src="${esc(s.qrCodeImage)}" style="height:64px;margin-top:8px" />` : ''}
     </div>`;
+}
+
+// ─── Rich-text box (Notes / Terms & Conditions) ──────────────────────────────
+// doc.notes and doc.termsAndConditions are authored via the app's RichEditor
+// and rendered as raw HTML in every *PrintPage.tsx (dangerouslySetInnerHTML) —
+// they must NOT be passed through esc() here or the formatting (and the tags
+// themselves) would show up as literal escaped text instead of rendering.
+function richBox(label: string, htmlContent?: string): string {
+  if (!htmlContent) return '';
+  return `<div style="margin-bottom:16px"><p class="section-lbl">${label}</p><div class="notes-box">${htmlContent}</div></div>`;
 }
 
 // ─── Status badges ────────────────────────────────────────────────────────────
@@ -150,7 +201,10 @@ td { border: 1px solid #e5e7eb; padding: 6px 10px; color: #374151; }
 .t-row.grand { font-size: 14px; font-weight: 700; color: #111827; border-top: 2px solid #d1d5db; padding-top: 6px; margin-top: 4px; }
 .sig-row { display: flex; justify-content: space-between; margin-top: 48px; }
 .sig-line { border-top: 1px solid #9ca3af; width: 160px; padding-top: 4px; text-align: center; font-size: 10px; color: #6b7280; }
-.notes-box { border: 1px solid #e5e7eb; border-radius: 4px; padding: 10px; font-size: 11px; color: #4b5563; white-space: pre-line; }
+.notes-box { border: 1px solid #e5e7eb; border-radius: 4px; padding: 10px; font-size: 11px; color: #4b5563; }
+.notes-box p { margin: 0 0 4px; } .notes-box p:last-child { margin-bottom: 0; }
+.notes-box ul, .notes-box ol { margin: 4px 0; padding-left: 18px; } .notes-box li { margin: 2px 0; }
+.notes-box h2, .notes-box h3 { font-size: 12px; margin: 4px 0; }
 .hl-box { background: #f9fafb; border-radius: 4px; padding: 10px; margin-bottom: 20px; }
 .co-name { font-size: 18px; font-weight: 700; color: #111827; }
 .co-meta { font-size: 10px; color: #6b7280; margin-top: 2px; line-height: 1.5; }
@@ -158,26 +212,37 @@ td { border: 1px solid #e5e7eb; padding: 6px 10px; color: #374151; }
 .doc-id { font-size: 11px; color: #6b7280; margin-top: 2px; }
 .doc-meta { font-size: 11px; color: #374151; line-height: 1.8; text-align: right; }
 .bank-box { border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px; margin-bottom: 20px; background: #f9fafb; }
-.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; font-size: 11px; }
+.bank-title { font-size: 12px; font-weight: 700; color: #4b5563; margin-bottom: 8px; }
+.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 11px; }
 .cust-name { font-size: 13px; font-weight: 700; }
 .cust-meta { font-size: 11px; color: #6b7280; margin-top: 2px; line-height: 1.5; }
 .footer-text { font-size: 10px; color: #9ca3af; border-top: 1px solid #e5e7eb; padding-top: 10px; margin-top: 20px; white-space: pre-line; text-align: center; }
 `;
 
+// Full company info block — same fields/order as every *PrintPage.tsx's
+// Company Header: address, GSTIN, PAN, Reg #, email, phone, WhatsApp, website, Branch.
+function companyMetaLines(s: any): string {
+  const addr = companyFullAddress(s);
+  return `
+    ${addr ? `${esc(addr)}<br>` : ''}
+    ${s?.gstin             ? `GSTIN: ${esc(s.gstin)}<br>` : ''}
+    ${s?.pan               ? `PAN: ${esc(s.pan)}<br>` : ''}
+    ${s?.businessRegNumber ? `Reg: ${esc(s.businessRegNumber)}<br>` : ''}
+    ${s?.companyEmail      ? `${esc(s.companyEmail)}<br>` : ''}
+    ${s?.phone             ? `${esc(s.phone)}<br>` : ''}
+    ${s?.whatsapp          ? `WA: ${esc(s.whatsapp)}<br>` : ''}
+    ${s?.website            ? `${esc(s.website)}<br>` : ''}
+    ${s?.branch            ? `Branch: ${esc(s.branch)}` : ''}`;
+}
+
 function classicHeader(ctx: Ctx, docTitle: string, docId: string, metaRight: string): string {
   const { s } = ctx;
-  const addr = companyFullAddress(s);
   return `
     <div class="row" style="margin-bottom:20px;align-items:flex-start">
       <div>
         ${s?.companyLogo ? `<img src="${esc(s.companyLogo)}" style="height:52px;margin-bottom:6px;display:block" />` : ''}
         ${s?.companyName ? `<div class="co-name">${esc(s.companyName)}</div>` : ''}
-        <div class="co-meta">
-          ${addr ? `${esc(addr)}<br>` : ''}
-          ${s?.gstin ? `GSTIN: ${esc(s.gstin)}<br>` : ''}
-          ${s?.companyEmail ? `${esc(s.companyEmail)}` : ''}
-          ${s?.phone ? ` · ${esc(s.phone)}` : ''}
-        </div>
+        <div class="co-meta">${companyMetaLines(s)}</div>
       </div>
       <div>
         <div class="doc-title">${docTitle}</div>
@@ -246,25 +311,25 @@ td { border-bottom: 1px solid #e2e8f0; padding: 8px 12px; color: #334155; }
 .t-row.grand { font-size: 15px; font-weight: 800; color: #0f172a; border-top: 2px solid #0f172a; padding-top: 8px; margin-top: 6px; }
 .sig-row { display: flex; justify-content: space-between; margin-top: 48px; }
 .sig-line { border-top: 1px solid #94a3b8; width: 160px; padding-top: 4px; text-align: center; font-size: 10px; color: #64748b; }
-.notes-box { border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; font-size: 11px; color: #475569; white-space: pre-line; background: #f8fafc; margin-bottom: 20px; }
+.notes-box { border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; font-size: 11px; color: #475569; background: #f8fafc; }
+.notes-box p { margin: 0 0 4px; } .notes-box p:last-child { margin-bottom: 0; }
+.notes-box ul, .notes-box ol { margin: 4px 0; padding-left: 18px; } .notes-box li { margin: 2px 0; }
+.notes-box h2, .notes-box h3 { font-size: 12px; margin: 4px 0; }
 .hl-box { background: #f8fafc; border-radius: 6px; padding: 12px; margin-bottom: 20px; border-left: 4px solid #0f172a; }
 .bank-box { border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 20px; background: #f8fafc; }
-.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; font-size: 11px; }
+.bank-title { font-size: 12px; font-weight: 700; color: #334155; margin-bottom: 8px; }
+.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 11px; }
 .footer-text { font-size: 10px; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 10px; margin-top: 20px; white-space: pre-line; text-align: center; }
 `;
 
 function modernHeader(ctx: Ctx, docTitle: string, docId: string, metaRight: string): string {
   const { s } = ctx;
-  const addr = companyFullAddress(s);
   return `
     <div class="mod-header">
       <div>
         ${s?.companyLogo ? `<img src="${esc(s.companyLogo)}" class="mod-logo" />` : ''}
         ${s?.companyName ? `<div class="mod-co">${esc(s.companyName)}</div>` : ''}
-        <div class="mod-co-meta">
-          ${addr ? `${esc(addr)}<br>` : ''}
-          ${s?.gstin ? `GSTIN: ${esc(s.gstin)}` : ''}
-        </div>
+        <div class="mod-co-meta">${companyMetaLines(s)}</div>
       </div>
       <div class="mod-doc">
         <div class="mod-doc-title">${docTitle}</div>
@@ -323,10 +388,14 @@ td { border-bottom: 1px solid #e5e7eb; padding: 7px 8px; }
 .t-row.grand { font-size: 14px; font-weight: bold; border-bottom: none; border-top: 2px solid #111; padding-top: 8px; margin-top: 4px; }
 .sig-row { display: flex; justify-content: space-between; margin-top: 56px; }
 .sig-line { border-top: 1px solid #555; width: 160px; padding-top: 4px; text-align: center; font-size: 10px; color: #777; font-family: Arial, sans-serif; }
-.notes-box { border-left: 3px solid #e5e7eb; padding-left: 12px; font-size: 11px; color: #555; white-space: pre-line; margin-bottom: 20px; }
+.notes-box { border-left: 3px solid #e5e7eb; padding-left: 12px; font-size: 11px; color: #555; }
+.notes-box p { margin: 0 0 4px; } .notes-box p:last-child { margin-bottom: 0; }
+.notes-box ul, .notes-box ol { margin: 4px 0; padding-left: 18px; } .notes-box li { margin: 2px 0; }
+.notes-box h2, .notes-box h3 { font-size: 12px; margin: 4px 0; }
 .hl-box { border-left: 3px solid #111; padding-left: 12px; margin-bottom: 20px; }
 .bank-box { border: 1px solid #e5e7eb; padding: 12px; margin-bottom: 20px; font-family: Arial, sans-serif; }
-.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; font-size: 11px; }
+.bank-title { font-size: 12px; font-weight: 700; color: #333; margin-bottom: 8px; }
+.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 11px; }
 .co-name { font-size: 20px; font-weight: bold; letter-spacing: -0.5px; }
 .co-meta { font-size: 10px; color: #555; margin-top: 3px; line-height: 1.6; font-family: Arial, sans-serif; }
 .doc-title { font-size: 20px; font-weight: bold; text-align: right; text-transform: uppercase; letter-spacing: 1px; }
@@ -339,16 +408,12 @@ td { border-bottom: 1px solid #e5e7eb; padding: 7px 8px; }
 
 function minimalHeader(ctx: Ctx, docTitle: string, docId: string, metaRight: string): string {
   const { s } = ctx;
-  const addr = companyFullAddress(s);
   return `
     <div class="row" style="margin-bottom:24px;align-items:flex-start">
       <div>
         ${s?.companyLogo ? `<img src="${esc(s.companyLogo)}" style="height:44px;margin-bottom:6px;display:block" />` : ''}
         ${s?.companyName ? `<div class="co-name">${esc(s.companyName)}</div>` : ''}
-        <div class="co-meta">
-          ${addr ? `${esc(addr)}<br>` : ''}
-          ${s?.gstin ? `GSTIN: ${esc(s.gstin)}` : ''}
-        </div>
+        <div class="co-meta">${companyMetaLines(s)}</div>
       </div>
       <div>
         <div class="doc-title">${docTitle}</div>
@@ -398,12 +463,15 @@ function invoiceClassic(ctx: Ctx): string {
   return html(CLASSIC_CSS, `<div class="page">
     ${classicHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
     ${classicBillTo(ctx, doc.address)}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'TOTAL DUE', cur)}
-    ${doc.notes ? `<div style="margin:20px 0"><p class="section-lbl">Notes</p><div class="notes-box">${esc(doc.notes)}</div></div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
     ${bankHtml(s, cur)}
     ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
@@ -422,12 +490,15 @@ function invoiceModern(ctx: Ctx): string {
   return html(MODERN_CSS, `
     ${modernHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
     ${modernBillTo(ctx, companyInfo, doc.address)}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'TOTAL DUE', cur)}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
     ${bankHtml(s, cur)}
     ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
@@ -443,12 +514,15 @@ function invoiceMinimal(ctx: Ctx): string {
   return html(MINIMAL_CSS, `<div class="page">
     ${minimalHeader(ctx, 'Tax Invoice', doc.invoiceId ?? '', metaRight)}
     ${minimalBillTo(ctx, doc.address)}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'Total Due', cur)}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
     ${bankHtml(s, cur)}
     ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
@@ -469,13 +543,17 @@ function quotationClassic(ctx: Ctx): string {
     ${classicHeader(ctx, 'QUOTATION', doc.quotationId ?? '', metaRight)}
     ${classicBillTo(ctx, doc.address)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:700;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'TOTAL', cur)}
-    ${doc.notes ? `<div style="margin:20px 0"><p class="section-lbl">Notes</p><div class="notes-box">${esc(doc.notes)}</div></div>` : ''}
-    ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : s?.termsAndConditions ? `<div style="margin-bottom:16px"><p class="section-lbl">Terms &amp; Conditions</p><div class="notes-box">${esc(s.termsAndConditions)}</div></div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${bankHtml(s, cur)}
+    ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
   </div>`);
 }
@@ -492,13 +570,17 @@ function quotationModern(ctx: Ctx): string {
     ${modernHeader(ctx, 'QUOTATION', doc.quotationId ?? '', metaRight)}
     ${modernBillTo(ctx, companyInfo, doc.address)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:700;font-size:13px;color:#0f172a">${esc(doc.title)}</p></div>` : ''}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'TOTAL', cur)}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
-    ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : s?.termsAndConditions ? `<div class="notes-box" style="margin-bottom:16px"><p class="section-lbl">Terms &amp; Conditions</p>${esc(s.termsAndConditions)}</div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${bankHtml(s, cur)}
+    ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
     </div>`);
 }
@@ -513,12 +595,16 @@ function quotationMinimal(ctx: Ctx): string {
     ${minimalHeader(ctx, 'Quotation', doc.quotationId ?? '', metaRight)}
     ${minimalBillTo(ctx, doc.address)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:bold;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'Total', cur)}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${bankHtml(s, cur)}
     ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
   </div>`);
@@ -545,13 +631,17 @@ function contractClassic(ctx: Ctx): string {
       </div>
     </div>
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:700;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'CONTRACT VALUE', cur)}
-    ${doc.notes ? `<div style="margin:20px 0"><p class="section-lbl">Terms &amp; Notes</p><div class="notes-box">${esc(doc.notes)}</div></div>` : ''}
-    ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : s?.termsAndConditions ? `<div style="margin-bottom:16px"><p class="section-lbl">Terms &amp; Conditions</p><div class="notes-box">${esc(s.termsAndConditions)}</div></div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${bankHtml(s, cur)}
+    ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
     ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
   </div>`);
 }
@@ -570,13 +660,17 @@ function contractModern(ctx: Ctx): string {
     ${modernBillTo(ctx, companyInfo)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:700;font-size:13px;color:#0f172a">${esc(doc.title)}</p></div>` : ''}
     ${doc.serviceFrequency ? `<p style="margin-bottom:16px;font-size:11px"><span style="font-weight:700">Service Frequency:</span> <span style="text-transform:capitalize">${esc(doc.serviceFrequency)}</span></p>` : ''}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'CONTRACT VALUE', cur)}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
-    ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : s?.termsAndConditions ? `<div class="notes-box" style="margin-bottom:16px">${esc(s.termsAndConditions)}</div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${bankHtml(s, cur)}
+    ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
     ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
     </div>`);
 }
@@ -592,12 +686,16 @@ function contractMinimal(ctx: Ctx): string {
     ${minimalHeader(ctx, 'Service Contract', doc.contractId ?? '', metaRight)}
     ${minimalBillTo(ctx)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:bold;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>
+    ${partsTableHtml(doc.parts, cur)}
     ${totalsHtml(doc, 'Contract Value', cur)}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${bankHtml(s, cur)}
     ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
     ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
   </div>`);
@@ -634,11 +732,15 @@ function workorderClassic(ctx: Ctx): string {
       <p style="font-weight:700;font-size:13px">${esc(doc.title ?? '')}</p>
     </div>
     ${(doc.services ?? []).length > 0 ? `
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services, false, cur)}</tbody>
     </table>` : ''}
-    ${doc.notes ? `<div style="margin-bottom:20px"><p class="section-lbl">Notes</p><div class="notes-box">${esc(doc.notes)}</div></div>` : ''}
+    ${partsTableHtml(doc.parts, cur)}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
     ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
   </div>`);
 }
@@ -682,11 +784,15 @@ function workorderModern(ctx: Ctx): string {
     </div>` : ''}
     <div class="hl-box"><p class="section-lbl">Work Description</p><p style="font-weight:700;font-size:13px;color:#0f172a">${esc(doc.title ?? '')}</p></div>
     ${(doc.services ?? []).length > 0 ? `
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services, false, cur)}</tbody>
     </table>` : ''}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
+    ${partsTableHtml(doc.parts, cur)}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
     ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
     </div>`);
 }
@@ -715,11 +821,15 @@ function workorderMinimal(ctx: Ctx): string {
       <p style="font-weight:bold;font-size:13px">${esc(doc.title ?? '')}</p>
     </div>
     ${(doc.services ?? []).length > 0 ? `
+    <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services, false, cur)}</tbody>
     </table>` : ''}
-    ${doc.notes ? `<div class="notes-box">${esc(doc.notes)}</div>` : ''}
+    ${partsTableHtml(doc.parts, cur)}
+    ${richBox('Notes', doc.notes)}
+    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
     ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
   </div>`);
 }

@@ -52,14 +52,18 @@ export function maskField(fieldName: string, value: string): string {
     case 'mobile':
     case 'whatsapp':
     case 'alternatePhone':
+    case 'addPhone':
       return maskPhone(value);
     case 'email':
+    case 'addEmail':
       return maskEmail(value);
     case 'gstin':
       return maskGST(value);
     case 'pan':
       return maskPAN(value);
     case 'address':
+    case 'billingAddress':
+    case 'deliveryAddress':
       return maskAddress(value);
     default:
       return maskGeneric(value);

@@ -14,12 +14,17 @@ export interface ICustomerDoc extends Document {
   email?:      string;
   phone?:      string;
   mobile?:     string;
+  addEmail?:   string[];
+  addPhone?:   string[];
   website?:    string;
   address?:    string;
   city?:       string;
   state?:      string;
   postcode?:   string;
   country?:    string;
+  billingName?:     string;
+  billingAddress?:  string;
+  deliveryAddress?: string;
   notes?:      string;
   tags?:       string[];
   status:      'active' | 'inactive';
@@ -56,12 +61,17 @@ const schema = new Schema<ICustomerDoc>(
     email:       { type: String, trim: true, lowercase: true },
     phone:       { type: String, trim: true },
     mobile:      { type: String, trim: true },
+    addEmail:    [{ type: String, trim: true, lowercase: true }],
+    addPhone:    [{ type: String, trim: true }],
     website:     { type: String, trim: true },
     address:     { type: String, trim: true },
     city:        { type: String, trim: true },
     state:       { type: String, trim: true },
     postcode:    { type: String, trim: true },
     country:     { type: String, trim: true },
+    billingName:     { type: String, trim: true },
+    billingAddress:  { type: String, trim: true },
+    deliveryAddress: { type: String, trim: true },
     notes:       { type: String },
     tags:        [{ type: String }],
     status:      { type: String, enum: ['active', 'inactive'], default: 'active' },

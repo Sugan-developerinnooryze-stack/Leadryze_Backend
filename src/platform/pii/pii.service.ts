@@ -13,7 +13,11 @@ export function encryptPIIFields(obj: Record<string, any>, module: string): void
   const allFields = [...def.level2, ...def.level3];
   for (const field of allFields) {
     const val = obj[field];
-    if (val && typeof val === 'string' && val.trim() !== '' && !isEncrypted(val)) {
+    if (Array.isArray(val)) {
+      obj[field] = val.map((v) =>
+        (v && typeof v === 'string' && v.trim() !== '' && !isEncrypted(v)) ? encrypt(v) : v
+      );
+    } else if (val && typeof val === 'string' && val.trim() !== '' && !isEncrypted(val)) {
       obj[field] = encrypt(val);
     }
   }
@@ -61,27 +65,23 @@ export function transformPIIResponse(
     // Level 2 fields
     for (const field of def.level2) {
       const val = plain[field];
-      if (!val || typeof val !== 'string') continue;
-      if (canViewL2) {
-        // Decrypt if encrypted
-        plain[field] = isEncrypted(val) ? safeDecrypt(val, field) : val;
-      } else {
-        // Decrypt to get real value, then mask it
-        const real = isEncrypted(val) ? safeDecrypt(val, field) : val;
-        plain[field] = maskField(field, real);
+      if (Array.isArray(val)) {
+        plain[field] = val.map((v) => (v && typeof v === 'string') ? revealOrMask(field, v, canViewL2) : v);
+        continue;
       }
+      if (!val || typeof val !== 'string') continue;
+      plain[field] = revealOrMask(field, val, canViewL2);
     }
 
     // Level 3 fields
     for (const field of def.level3) {
       const val = plain[field];
-      if (!val || typeof val !== 'string') continue;
-      if (isAdmin) {
-        plain[field] = isEncrypted(val) ? safeDecrypt(val, field) : val;
-      } else {
-        const real = isEncrypted(val) ? safeDecrypt(val, field) : val;
-        plain[field] = maskField(field, real);
+      if (Array.isArray(val)) {
+        plain[field] = val.map((v) => (v && typeof v === 'string') ? revealOrMask(field, v, isAdmin) : v);
+        continue;
       }
+      if (!val || typeof val !== 'string') continue;
+      plain[field] = revealOrMask(field, val, isAdmin);
     }
 
     // Remove internal search fields from API response
@@ -92,6 +92,12 @@ export function transformPIIResponse(
   };
 
   return Array.isArray(items) ? items.map(transform) : transform(items);
+}
+
+/** Decrypts a stored value if needed, then either reveals it or masks it. */
+function revealOrMask(field: string, val: string, reveal: boolean): string {
+  const real = isEncrypted(val) ? safeDecrypt(val, field) : val;
+  return reveal ? real : maskField(field, real);
 }
 
 function safeDecrypt(val: string, field: string): string {

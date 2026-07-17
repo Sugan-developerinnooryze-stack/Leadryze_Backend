@@ -6,7 +6,17 @@ export type CustomModuleFieldType =
   | 'date' | 'datetime' | 'textarea' | 'boolean' | 'url' | 'rating'
   | 'select' | 'multiselect' | 'relationship'
   | 'image' | 'images'
-  | 'categoryselect';
+  | 'categoryselect'
+  | 'table';
+
+/** One column of a Table/Grid field. Formula columns compute from other columns in the same row. */
+export interface ITableColumn {
+  key:      string;
+  label:    string;
+  type:     'text' | 'number' | 'dropdown' | 'formula';
+  options?: string[];
+  formula?: string;
+}
 
 export interface ICustomModuleField {
   key:        string;
@@ -21,6 +31,7 @@ export interface ICustomModuleField {
     cascadeTree?:      unknown;
     levelNames?:       string[];
     subFields?:        string[];
+    columns?:          ITableColumn[];
   };
   order: number;
 }
@@ -40,13 +51,24 @@ export interface ICustomModuleDef extends Document {
   updatedAt:    Date;
 }
 
+const TableColumnSchema = new Schema<ITableColumn>(
+  {
+    key:     { type: String, required: true, trim: true },
+    label:   { type: String, required: true, trim: true },
+    type:    { type: String, enum: ['text', 'number', 'dropdown', 'formula'], required: true },
+    options: [{ type: String }],
+    formula: { type: String },
+  },
+  { _id: false }
+);
+
 const CustomModuleFieldSchema = new Schema<ICustomModuleField>(
   {
     key:       { type: String, required: true, trim: true },
     label:     { type: String, required: true, trim: true },
     fieldType: {
       type: String,
-      enum: ['text','email','phone','number','currency','date','datetime','textarea','boolean','url','rating','select','multiselect','relationship','image','images','categoryselect'],
+      enum: ['text','email','phone','number','currency','date','datetime','textarea','boolean','url','rating','select','multiselect','relationship','image','images','categoryselect','table'],
       required: true,
     },
     required: { type: Boolean, default: false },
@@ -58,6 +80,7 @@ const CustomModuleFieldSchema = new Schema<ICustomModuleField>(
       cascadeTree:      { type: Schema.Types.Mixed },
       levelNames:       [{ type: String }],
       subFields:        [{ type: String }],
+      columns:          [TableColumnSchema],
     },
     order: { type: Number, default: 0 },
   },

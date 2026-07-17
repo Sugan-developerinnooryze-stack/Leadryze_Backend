@@ -10,6 +10,7 @@ export interface IFSSettingsDoc extends Document {
   businessRegNumber?: string;
   companyEmail?:      string;
   phone?:             string;
+  defaultCountryCode?: string;
   whatsapp?:          string;
   website?:           string;
   address1?:          string;
@@ -76,6 +77,7 @@ const schema = new Schema<IFSSettingsDoc>(
     businessRegNumber:  { type: String, trim: true },
     companyEmail:       { type: String, trim: true, lowercase: true },
     phone:              { type: String, trim: true },
+    defaultCountryCode: { type: String, trim: true, default: '+91' },
     whatsapp:           { type: String, trim: true },
     website:            { type: String, trim: true },
     address1:           { type: String, trim: true },

@@ -13,12 +13,19 @@ function headers() {
   };
 }
 
+export interface EmailAttachment {
+  name:    string;
+  content: string; // base64
+}
+
 export interface EmailOptions {
   to: string;
   toName?: string;
+  cc?: string[];
   subject: string;
   htmlContent: string;
   textContent?: string;
+  attachment?: EmailAttachment[];
 }
 
 export async function sendEmailNow(opts: EmailOptions): Promise<string | null> {
@@ -36,6 +43,8 @@ export async function sendEmailNow(opts: EmailOptions): Promise<string | null> {
         subject: opts.subject,
         htmlContent: opts.htmlContent,
         ...(opts.textContent ? { textContent: opts.textContent } : {}),
+        ...(opts.cc?.length ? { cc: opts.cc.map((email) => ({ email })) } : {}),
+        ...(opts.attachment?.length ? { attachment: opts.attachment } : {}),
       },
       { headers: headers(), timeout: 15000 }
     );

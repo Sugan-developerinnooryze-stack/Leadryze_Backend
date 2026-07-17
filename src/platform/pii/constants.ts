@@ -5,7 +5,7 @@ export interface PIIFieldDef {
 
 export const PII_FIELDS: Record<string, PIIFieldDef> = {
   customers: {
-    level2: ['phone', 'mobile', 'email', 'address', 'website', 'gstin', 'pan'],
+    level2: ['phone', 'mobile', 'email', 'address', 'website', 'gstin', 'pan', 'addEmail', 'addPhone', 'billingAddress', 'deliveryAddress'],
     level3: [],
   },
   leads: {
@@ -31,7 +31,7 @@ export const ADMIN_ROLES = ['SUPER_ADMIN', 'TENANT_ADMIN'];
 
 // Human-readable label + protected field list for the frontend Permission tab
 export const PII_MODULES = [
-  { key: 'customers', label: 'Customers', fields: 'Phone, Email, Address, GST, PAN' },
+  { key: 'customers', label: 'Customers', fields: 'Phone, Email, Address, GST, PAN, Additional Emails/Phones, Billing/Delivery Address' },
   { key: 'leads',     label: 'Leads',     fields: 'Phone, Email, Address, WhatsApp' },
   { key: 'contacts',  label: 'Contacts',  fields: 'Phone, Email' },
   { key: 'staffs',    label: 'Staff',     fields: 'Phone, Email' },
