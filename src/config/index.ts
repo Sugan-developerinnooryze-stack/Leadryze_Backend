@@ -103,4 +103,12 @@ if (config.app.env === 'production') {
       );
     }
   }
+  // AES-256-GCM requires an exactly-32-byte key — a wrong length passes the
+  // generic check above but throws later on the first encrypt()/decrypt() call.
+  if (config.encryption.key.length !== 32) {
+    throw new Error(
+      `[CONFIG] ENCRYPTION_KEY must be exactly 32 characters (got ${config.encryption.key.length}). ` +
+      `Generate one: node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"`
+    );
+  }
 }

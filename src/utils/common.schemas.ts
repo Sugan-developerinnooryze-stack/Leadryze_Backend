@@ -14,6 +14,14 @@ export const pageQuery = z.object({
 
 export const customFields = z.record(z.unknown()).optional();
 
+// For optional fields that map to a Mongoose ObjectId ref — an unselected
+// dropdown sends "" rather than omitting the key, which Mongoose can't cast.
+export const optionalObjectId = z
+  .string()
+  .trim()
+  .optional()
+  .transform((v) => (v === '' ? undefined : v));
+
 export const serviceLine = z.object({
   name:        z.string().trim().min(1),
   description: z.string().optional(),
