@@ -162,7 +162,15 @@ export async function getTenantLockAudit(
   return { items, total, page };
 }
 
-// Called from controllers after a milestone status change — checks FS Settings config
+// Called from controllers after a milestone status change — checks FS Settings config.
+// Every call site already only calls this from inside an
+// `if (req.body.status === <freshly resolved outcome key>)` guard, so which
+// stage counts as "the trigger" is already correct at call time — matching
+// again against a STORED literal (autoLockOnStatus) here would go stale the
+// moment a tenant renames that stage, silently disabling auto-lock with no
+// warning. The stored `autoLock` boolean is the only thing this still needs
+// to check; autoLockOnStatus survives on the record purely as a display hint
+// for Settings UI, not as a gate.
 export async function autoLockIfConfigured(
   tenantId:    string,
   entityModule: string,
@@ -174,7 +182,7 @@ export async function autoLockIfConfigured(
   const settings = await FSSettings.findOne({ tenantId: tid })
     .select('lockingConfig').lean();
   const rule = (settings?.lockingConfig as any[] | undefined)?.find(
-    (r: any) => r.module === entityModule && r.autoLock && r.autoLockOnStatus === reachedStatus,
+    (r: any) => r.module === entityModule && r.autoLock,
   );
   if (!rule) return;
 

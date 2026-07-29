@@ -22,6 +22,7 @@ import messageRoutes from './modules/messages/message.routes';
 import connectorRoutes from './modules/connectors/connector.routes';
 import analyticsRoutes from './modules/analytics/analytics.routes';
 import webhookRoutes from './modules/webhooks/webhook.routes';
+import automationWebhookRoutes from './modules/native-crm/automation-webhooks/automation-webhook.routes';
 import notificationRoutes from './modules/notifications/notification.routes';
 import aiRoutes from './modules/ai/ai.routes';
 import adminRoutes from './modules/admin/admin.routes';
@@ -124,6 +125,7 @@ app.use(`${V}/messages`, messageRoutes);
 app.use(`${V}/connectors`, connectorRoutes);
 app.use(`${V}/analytics`, analyticsRoutes);
 app.use(`${V}/webhooks`, webhookRoutes);
+app.use(`${V}/automation-webhooks`, automationWebhookRoutes); // public, unauthenticated — Webhook Trigger's entry point, deliberately outside /native-crm's own auth middleware
 app.use(`${V}/notifications`, notificationRoutes);
 app.use(`${V}/ai`, aiRoutes);
 app.use(`${V}/admin`, adminRoutes);

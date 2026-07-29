@@ -107,8 +107,8 @@ router.post('/:slug/records', async (req: AuthRequest, res: Response) => {
   try {
     const rec = await createCustomRecord(req.tenantId!, req.params.slug, req.body, req.user?.userId);
     res.status(201).json({ success: true, data: rec });
-  } catch {
-    sendError(res, 'Failed to create record', 500);
+  } catch (err: any) {
+    sendError(res, err.message ?? 'Failed to create record', 400);
   }
 });
 
@@ -129,8 +129,8 @@ router.put('/:slug/records/:id', async (req: AuthRequest, res: Response) => {
     const rec = await updateCustomRecord(req.tenantId!, req.params.slug, req.params.id, req.body);
     if (!rec) { sendError(res, 'Record not found', 404); return; }
     sendSuccess(res, rec);
-  } catch {
-    sendError(res, 'Failed to update record', 500);
+  } catch (err: any) {
+    sendError(res, err.message ?? 'Failed to update record', 400);
   }
 });
 

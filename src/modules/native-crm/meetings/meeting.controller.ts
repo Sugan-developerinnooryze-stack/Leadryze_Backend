@@ -5,9 +5,10 @@ import * as svc from './meeting.service';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId, upcoming } = req.query as Record<string, string>;
     const result = await svc.listMeetings(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
+      relatedModule, relatedId, upcoming: upcoming === 'true',
     });
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch meetings', 500); }

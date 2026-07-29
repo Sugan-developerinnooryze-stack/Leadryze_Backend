@@ -9,16 +9,25 @@ export const dealSchema = new Schema(
     title:       { type: String, required: true, trim: true },
     amount:      { type: Number },
     currency:    { type: String, default: 'USD' },
-    stage:       { type: String, enum: ['prospect', 'qualified', 'proposal', 'negotiation', 'closed_won', 'closed_lost'], required: true, default: 'prospect' },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config), not a fixed
+    // schema enum, so each tenant can have their own stage list.
+    stage:       { type: String, required: true, default: 'prospect' },
     closeDate:   { type: Date },
     contactName: { type: String, trim: true },
     companyName: { type: String, trim: true },
+    // NativeStaff.staffId of the assigned owner — same human-readable-ID
+    // convention Custom Module relationship fields use, not a Mongo _id.
+    // Lets automation rules resolve a real recipient for the 'assigned_user'
+    // strategy (see automation-rule.service.ts's resolveAutomationRecipient).
+    assignedStaffId: { type: String, index: true },
     notes:       { type: String },
     tags:        [{ type: String }],
     customFields:  { type: Schema.Types.Mixed },
     createdBy:     { type: String },
     leadId:        { type: String },
     contactId:     { type: String },
+    importBatchId: { type: String, index: true },
     isLocked:   { type: Boolean, default: false, index: true },
     lockedAt:   { type: Date },
     lockedBy:   { type: String },

@@ -47,6 +47,12 @@ export interface ICustomModuleDef extends Document {
   showInSidebar: boolean;
   menuOrder:    number;
   fields:       ICustomModuleField[];
+  /** Key of the 'select' field (if any) this module treats as its pipeline —
+   * when set, that field's options are sourced from this tenant's own
+   * configurable stages (native-crm/pipeline-config, module `custom:<slug>`)
+   * instead of its static `options[]`, and automation rules can trigger off
+   * it the same way they do for the 8 built-in modules. */
+  pipelineFieldKey?: string;
   createdAt:    Date;
   updatedAt:    Date;
 }
@@ -99,6 +105,7 @@ const CustomModuleDefSchema = new Schema<ICustomModuleDef>(
     showInSidebar: { type: Boolean, default: true },
     menuOrder:    { type: Number, default: 0 },
     fields:       [CustomModuleFieldSchema],
+    pipelineFieldKey: { type: String },
   },
   { timestamps: true }
 );

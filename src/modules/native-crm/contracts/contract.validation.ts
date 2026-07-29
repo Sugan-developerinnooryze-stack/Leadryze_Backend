@@ -59,7 +59,9 @@ export const createContractSchema = z.object({
   gstPercentage:         z.number().min(0).optional(),
   servicesAmount:        z.number().min(0).optional(),
   servicesAmountWithTax: z.number().min(0).optional(),
-  status:                z.enum(['draft','pending','active','suspended','completed','expired','cancelled']).optional(),
+  // Tenant-configurable pipeline stage key — validity checked at the service
+  // layer against this tenant's own stage list, not a fixed enum here.
+  status:                z.string().trim().min(1).optional(),
   notes:                 z.string().optional(),
   termsAndConditions:    z.string().optional(),
   customFields,

@@ -1,6 +1,14 @@
 import mongoose from 'mongoose';
 import { NativeQuotation } from './quotation.model';
 import { QuotationListOptions } from './quotation.types';
+import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+
+async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
+  if (!status) return;
+  if (!(await isValidStageKey(tenantId, 'quotation', status))) {
+    throw new Error(`"${status}" is not a valid stage for this tenant's Quotation pipeline`);
+  }
+}
 
 export async function listQuotations(tenantId: string, opts: QuotationListOptions, branchId?: string | null) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -28,6 +36,7 @@ export async function getQuotationById(id: string, tenantId: string) {
 }
 
 export async function createQuotation(data: any) {
+  await assertValidStatus(String(data.tenantId), data.status);
   const services: any[]  = data.services ?? [];
   const parts: any[]     = data.parts ?? [];
   const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
@@ -44,6 +53,7 @@ export async function createQuotation(data: any) {
 }
 
 export async function updateQuotation(id: string, tenantId: string, data: any) {
+  await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined || data.gstPercentage !== undefined) {
     const existing = await NativeQuotation.findOne({ _id: id, tenantId: tid }).lean();

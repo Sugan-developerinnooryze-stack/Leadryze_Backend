@@ -1,3 +1,5 @@
+export type RelatedModule = 'contact' | 'company' | 'deal' | 'customer' | 'quotation' | 'workorder' | 'contract';
+
 export interface ITask {
   _id: string;
   tenantId: string;
@@ -8,6 +10,9 @@ export interface ITask {
   assignedTo?: string;
   notes?: string;
   tags?: string[];
+  relatedModule?: RelatedModule;
+  relatedId?: string;
+  relatedLabel?: string;
   createdBy?: string;
   createdAt: Date;
   updatedAt: Date;
@@ -21,6 +26,9 @@ export interface CreateTaskDTO {
   assignedTo?: string;
   notes?: string;
   tags?: string[];
+  relatedModule?: RelatedModule;
+  relatedId?: string;
+  relatedLabel?: string;
 }
 
 export type UpdateTaskDTO = Partial<CreateTaskDTO>;

@@ -1,3 +1,6 @@
+import { ITemplateSections, DEFAULT_TEMPLATE_SECTIONS } from '../fs-settings/doc-template-preference.model';
+export { DEFAULT_TEMPLATE_SECTIONS };
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function fmt(n: number | null | undefined, cur = '$'): string {
@@ -35,10 +38,11 @@ function esc(v: any): string {
 // ─── Context type ────────────────────────────────────────────────────────────
 
 interface Ctx {
-  doc: any;
-  s:   any;    // FSSettings
-  c:   any;    // Customer (may be null)
-  cur: string; // currency symbol
+  doc:      any;
+  s:        any;    // FSSettings
+  c:        any;    // Customer (may be null)
+  cur:      string; // currency symbol
+  sections: ITemplateSections;
 }
 
 // ─── Shared service table ────────────────────────────────────────────────────
@@ -94,12 +98,19 @@ function partsTableHtml(parts: any[] | undefined, cur: string): string {
 
 // ─── Totals block ─────────────────────────────────────────────────────────────
 
+// Derived fully from services/parts/discount/gst rather than trusting the
+// persisted servicesAmount/servicesAmountWithTax fields — identical result
+// for docTypes that store them in sync (invoice/quotation/contract, see
+// invoice.service.ts), and the only way workorder (which has no such
+// persisted fields) can ever show a nonzero total at all.
 function totalsHtml(doc: any, label: string, cur: string): string {
-  const sub  = doc.servicesAmount ?? 0;
+  const svc  = (doc.services ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
+  const prt  = (doc.parts    ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
   const disc = doc.discount       ?? 0;
   const gst  = doc.gstPercentage  ?? 0;
-  const tot  = doc.servicesAmountWithTax ?? sub;
-  const raw  = sub + disc; // subtotal before discount
+  const raw  = svc + prt;          // subtotal before discount
+  const sub  = raw - disc;         // after discount, before tax
+  const tot  = sub + sub * (gst / 100);
   return `
     <div class="totals-box">
       <div class="t-row"><span class="t-lbl">Subtotal</span><span>${fmt(raw, cur)}</span></div>
@@ -442,6 +453,88 @@ function minimalBillTo(ctx: Ctx, extraAddr?: string): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ─── ELEGANT TEMPLATE ─────────────────────────────────────────────────────────
+// A formal, contract-grade look distinct from the other 3: deep navy + a warm
+// gold accent rule, a serif display face for the company name/doc title
+// (Classic/Modern use a plain sans headline; Minimal is all-serif with no
+// color at all), paired with a clean sans body for everything else.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const ELEGANT_CSS = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #1e2a38; background: white; }
+.page { width: 210mm; min-height: 297mm; padding: 16mm 17mm; }
+.el-rule { border: none; border-top: 2px solid #b8860b; margin: 16px 0 20px; }
+.section-lbl { font-size: 10px; font-weight: 700; color: #1e3a5f; text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 4px; font-variant: small-caps; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 10px; font-weight: 700; margin-left: 4px; }
+.bg{background:#dcfce7;color:#166534} .bb{background:#dbeafe;color:#1e40af}
+.ba{background:#fef3c7;color:#92400e} .bd{background:#fee2e2;color:#991b1b}
+.bz{background:#f3f4f6;color:#4b5563} .bv{background:#ede9fe;color:#5b21b6}
+table { width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 20px; }
+th { background: #1e3a5f; color: #f5f0e6; padding: 8px 10px; text-align: left; font-weight: 700; border-bottom: 2px solid #b8860b; }
+td { border-bottom: 1px solid #e5e2da; padding: 7px 10px; color: #1e2a38; }
+.tr-alt { background: #f9f7f2; }
+.td-r { text-align: right; }
+.totals-box { margin-left: auto; width: 230px; margin-top: 4px; }
+.t-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 11px; }
+.t-lbl { color: #5b6b7d; }
+.t-row.grand { font-size: 14px; font-weight: 700; color: #1e3a5f; border-top: 2px solid #b8860b; padding-top: 6px; margin-top: 4px; }
+.sig-row { display: flex; justify-content: space-between; margin-top: 48px; }
+.sig-line { border-top: 1px solid #b8860b; width: 160px; padding-top: 4px; text-align: center; font-size: 10px; color: #5b6b7d; }
+.notes-box { border: 1px solid #e5e2da; border-radius: 2px; padding: 10px; font-size: 11px; color: #3d4a58; }
+.notes-box p { margin: 0 0 4px; } .notes-box p:last-child { margin-bottom: 0; }
+.notes-box ul, .notes-box ol { margin: 4px 0; padding-left: 18px; } .notes-box li { margin: 2px 0; }
+.notes-box h2, .notes-box h3 { font-size: 12px; margin: 4px 0; }
+.hl-box { background: #f9f7f2; border-left: 3px solid #b8860b; padding: 10px 12px; margin-bottom: 20px; }
+.co-name { font-family: Georgia, 'Times New Roman', serif; font-size: 19px; font-weight: 700; color: #1e3a5f; }
+.co-meta { font-size: 10px; color: #5b6b7d; margin-top: 3px; line-height: 1.6; }
+.doc-title { font-family: Georgia, 'Times New Roman', serif; font-size: 22px; font-weight: 700; color: #1e3a5f; letter-spacing: 0.5px; }
+.doc-id { font-size: 11px; color: #5b6b7d; margin-top: 2px; }
+.doc-meta { font-size: 11px; color: #3d4a58; text-align: right; line-height: 1.8; }
+.bank-box { border: 1px solid #e5e2da; border-radius: 2px; padding: 12px; margin-bottom: 20px; background: #f9f7f2; }
+.bank-title { font-size: 12px; font-weight: 700; color: #1e3a5f; margin-bottom: 8px; }
+.bank-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 11px; }
+.cust-name { font-size: 13px; font-weight: 700; color: #1e3a5f; }
+.cust-meta { font-size: 11px; color: #5b6b7d; margin-top: 2px; line-height: 1.5; }
+.footer-text { font-size: 10px; color: #8a97a6; border-top: 1px solid #e5e2da; padding-top: 10px; margin-top: 20px; white-space: pre-line; text-align: center; }
+`;
+
+function elegantHeader(ctx: Ctx, docTitle: string, docId: string, metaRight: string): string {
+  const { s } = ctx;
+  return `
+    <div class="row" style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px">
+      <div>
+        ${s?.companyLogo ? `<img src="${esc(s.companyLogo)}" style="height:50px;margin-bottom:8px;display:block" />` : ''}
+        ${s?.companyName ? `<div class="co-name">${esc(s.companyName)}</div>` : ''}
+        <div class="co-meta">${companyMetaLines(s)}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="doc-title">${docTitle}</div>
+        <div class="doc-id">${esc(docId)}</div>
+        <div class="doc-meta" style="margin-top:8px">${metaRight}</div>
+      </div>
+    </div>
+    <hr class="el-rule">`;
+}
+
+function elegantBillTo(ctx: Ctx, extraAddr?: string): string {
+  const { c, doc } = ctx;
+  const name = c?.name ?? doc.customerId ?? '';
+  const addr = customerFullAddress(c) || extraAddr || '';
+  return `
+    <div style="margin-bottom:20px">
+      <p class="section-lbl">Bill To</p>
+      <div class="cust-name">${esc(name)}</div>
+      <div class="cust-meta">
+        ${c?.email ? `${esc(c.email)}<br>` : ''}
+        ${c?.phone ? `${esc(c.phone)}<br>` : ''}
+        ${addr ? esc(addr) : ''}
+        ${extraAddr && addr !== extraAddr ? `<br>${esc(extraAddr)}` : ''}
+      </div>
+    </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ─── Wrap into full HTML document ─────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -454,7 +547,7 @@ function html(css: string, body: string): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function invoiceClassic(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     <div>Date: ${fmtDate(doc.createdAt)}</div>
     ${doc.dueDate    ? `<div>Due: ${fmtDate(doc.dueDate)}</div>`      : ''}
@@ -463,15 +556,16 @@ function invoiceClassic(ctx: Ctx): string {
   return html(CLASSIC_CSS, `<div class="page">
     ${classicHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
     ${classicBillTo(ctx, doc.address)}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'TOTAL DUE', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
@@ -479,7 +573,7 @@ function invoiceClassic(ctx: Ctx): string {
 }
 
 function invoiceModern(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const addr = companyFullAddress(s);
   const companyInfo = [s?.companyName, addr, s?.gstin ? `GSTIN: ${s.gstin}` : '', s?.companyEmail, s?.phone].filter(Boolean).join('<br>');
   const metaRight = `
@@ -490,15 +584,16 @@ function invoiceModern(ctx: Ctx): string {
   return html(MODERN_CSS, `
     ${modernHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
     ${modernBillTo(ctx, companyInfo, doc.address)}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'TOTAL DUE', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
@@ -506,7 +601,7 @@ function invoiceModern(ctx: Ctx): string {
 }
 
 function invoiceMinimal(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     ${fmtDate(doc.createdAt)}<br>
     ${doc.dueDate ? `Due: ${fmtDate(doc.dueDate)}<br>` : ''}
@@ -514,15 +609,42 @@ function invoiceMinimal(ctx: Ctx): string {
   return html(MINIMAL_CSS, `<div class="page">
     ${minimalHeader(ctx, 'Tax Invoice', doc.invoiceId ?? '', metaRight)}
     ${minimalBillTo(ctx, doc.address)}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'Total Due', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'Total Due', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
+    ${bankHtml(s, cur)}
+    ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
+    ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
+  </div>`);
+}
+
+function invoiceElegant(ctx: Ctx): string {
+  const { doc, s, cur, sections } = ctx;
+  const metaRight = `
+    <div>Date: ${fmtDate(doc.createdAt)}</div>
+    ${doc.dueDate    ? `<div>Due: ${fmtDate(doc.dueDate)}</div>`      : ''}
+    ${doc.workOrderId? `<div>Work Order: ${esc(doc.workOrderId)}</div>` : ''}
+    <div style="margin-top:6px">${badge(INVOICE_BADGE, doc.status ?? 'draft')}${doc.paid ? `<span class="badge bg">PAID</span>` : ''}</div>`;
+  return html(ELEGANT_CSS, `<div class="page">
+    ${elegantHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
+    ${elegantBillTo(ctx, doc.address)}
+    ${sections.services ? `
+    <p class="section-lbl">Services</p>
+    <table>
+      <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
+      <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.invoiceFooter ? `<div class="footer-text">${esc(s.invoiceFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Customer Acknowledgement', s)}
@@ -534,7 +656,7 @@ function invoiceMinimal(ctx: Ctx): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function quotationClassic(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     <div>Date: ${fmtDate(doc.createdAt)}</div>
     ${doc.validUntil ? `<div>Valid Until: ${fmtDate(doc.validUntil)}</div>` : ''}
@@ -543,15 +665,16 @@ function quotationClassic(ctx: Ctx): string {
     ${classicHeader(ctx, 'QUOTATION', doc.quotationId ?? '', metaRight)}
     ${classicBillTo(ctx, doc.address)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:700;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'TOTAL', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
@@ -559,7 +682,7 @@ function quotationClassic(ctx: Ctx): string {
 }
 
 function quotationModern(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const addr = companyFullAddress(s);
   const companyInfo = [s?.companyName, addr, s?.gstin ? `GSTIN: ${s.gstin}` : '', s?.companyEmail, s?.phone].filter(Boolean).join('<br>');
   const metaRight = `
@@ -570,15 +693,16 @@ function quotationModern(ctx: Ctx): string {
     ${modernHeader(ctx, 'QUOTATION', doc.quotationId ?? '', metaRight)}
     ${modernBillTo(ctx, companyInfo, doc.address)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:700;font-size:13px;color:#0f172a">${esc(doc.title)}</p></div>` : ''}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'TOTAL', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
@@ -586,7 +710,7 @@ function quotationModern(ctx: Ctx): string {
 }
 
 function quotationMinimal(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     ${fmtDate(doc.createdAt)}<br>
     ${doc.validUntil ? `Valid Until: ${fmtDate(doc.validUntil)}<br>` : ''}
@@ -595,15 +719,42 @@ function quotationMinimal(ctx: Ctx): string {
     ${minimalHeader(ctx, 'Quotation', doc.quotationId ?? '', metaRight)}
     ${minimalBillTo(ctx, doc.address)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:bold;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'Total', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'Total', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
+    ${bankHtml(s, cur)}
+    ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
+    ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
+  </div>`);
+}
+
+function quotationElegant(ctx: Ctx): string {
+  const { doc, s, cur, sections } = ctx;
+  const metaRight = `
+    <div>Date: ${fmtDate(doc.createdAt)}</div>
+    ${doc.validUntil ? `<div>Valid Until: ${fmtDate(doc.validUntil)}</div>` : ''}
+    <div style="margin-top:6px">${badge(QUOTATION_BADGE, doc.status ?? 'draft')}</div>`;
+  return html(ELEGANT_CSS, `<div class="page">
+    ${elegantHeader(ctx, 'QUOTATION', doc.quotationId ?? '', metaRight)}
+    ${elegantBillTo(ctx, doc.address)}
+    ${doc.title ? `<div class="hl-box"><p class="section-lbl">Subject</p><p style="font-weight:700;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    ${sections.services ? `
+    <p class="section-lbl">Services</p>
+    <table>
+      <thead><tr><th style="width:32px">#</th><th>Description</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
+      <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.quotationFooter ? `<div class="footer-text">${esc(s.quotationFooter)}</div>` : ''}
     ${sigsHtml('Authorised Signature', 'Client Acceptance &amp; Date', s)}
@@ -615,7 +766,7 @@ function quotationMinimal(ctx: Ctx): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function contractClassic(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     <div>Created: ${fmtDate(doc.createdAt)}</div>
     ${doc.startDate ? `<div>Start: ${fmtDate(doc.startDate)}</div>` : ''}
@@ -631,15 +782,22 @@ function contractClassic(ctx: Ctx): string {
       </div>
     </div>
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:700;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    ${doc.siteId || doc.teamId || doc.staffId ? `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:20px">
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700">${esc(doc.siteName ?? doc.siteId)}</p></div>`  : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700">${esc(doc.teamName ?? doc.teamId)}</p></div>`  : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700">${esc(doc.staffName ?? doc.staffId)}</p></div>` : ''}
+    </div>` : ''}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'CONTRACT VALUE', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'CONTRACT VALUE', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
     ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
@@ -647,7 +805,7 @@ function contractClassic(ctx: Ctx): string {
 }
 
 function contractModern(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const addr = companyFullAddress(s);
   const companyInfo = [s?.companyName, addr, s?.gstin ? `GSTIN: ${s.gstin}` : '', s?.companyEmail, s?.phone].filter(Boolean).join('<br>');
   const metaRight = `
@@ -660,15 +818,22 @@ function contractModern(ctx: Ctx): string {
     ${modernBillTo(ctx, companyInfo)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:700;font-size:13px;color:#0f172a">${esc(doc.title)}</p></div>` : ''}
     ${doc.serviceFrequency ? `<p style="margin-bottom:16px;font-size:11px"><span style="font-weight:700">Service Frequency:</span> <span style="text-transform:capitalize">${esc(doc.serviceFrequency)}</span></p>` : ''}
+    ${doc.siteId || doc.teamId || doc.staffId ? `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:20px">
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700;font-size:11px">${esc(doc.siteName ?? doc.siteId)}</p></div>`       : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700;font-size:11px">${esc(doc.teamName ?? doc.teamId)}</p></div>`       : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700;font-size:11px">${esc(doc.staffName ?? doc.staffId)}</p></div>` : ''}
+    </div>` : ''}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'CONTRACT VALUE', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'CONTRACT VALUE', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
     ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
@@ -676,7 +841,7 @@ function contractModern(ctx: Ctx): string {
 }
 
 function contractMinimal(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     ${fmtDate(doc.createdAt)}<br>
     ${doc.startDate ? `Start: ${fmtDate(doc.startDate)}<br>` : ''}
@@ -686,15 +851,61 @@ function contractMinimal(ctx: Ctx): string {
     ${minimalHeader(ctx, 'Service Contract', doc.contractId ?? '', metaRight)}
     ${minimalBillTo(ctx)}
     ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:bold;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    ${doc.siteId || doc.teamId || doc.staffId ? `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><div class="cust-name" style="font-size:12px">${esc(doc.siteName ?? doc.siteId)}</div></div>`  : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><div class="cust-name" style="font-size:12px">${esc(doc.teamName ?? doc.teamId)}</div></div>`  : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><div class="cust-name" style="font-size:12px">${esc(doc.staffName ?? doc.staffId)}</div></div>` : ''}
+    </div>` : ''}
+    ${sections.services ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
-    </table>
-    ${partsTableHtml(doc.parts, cur)}
-    ${totalsHtml(doc, 'Contract Value', cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'Contract Value', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
+    ${bankHtml(s, cur)}
+    ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
+    ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
+  </div>`);
+}
+
+function contractElegant(ctx: Ctx): string {
+  const { doc, s, cur, sections } = ctx;
+  const metaRight = `
+    <div>Created: ${fmtDate(doc.createdAt)}</div>
+    ${doc.startDate ? `<div>Start: ${fmtDate(doc.startDate)}</div>` : ''}
+    ${doc.endDate   ? `<div>End: ${fmtDate(doc.endDate)}</div>`     : ''}
+    <div style="margin-top:6px">${badge(CONTRACT_BADGE, doc.status ?? 'draft')}</div>`;
+  return html(ELEGANT_CSS, `<div class="page">
+    ${elegantHeader(ctx, 'SERVICE CONTRACT', doc.contractId ?? '', metaRight)}
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+      <div>${elegantBillTo(ctx)}</div>
+      <div>
+        ${doc.serviceFrequency ? `<p class="section-lbl">Service Frequency</p><p style="font-weight:700;text-transform:capitalize;margin-bottom:12px">${esc(doc.serviceFrequency)}</p>` : ''}
+        ${doc.quotationId ? `<p class="section-lbl">Based on Quotation</p><p style="font-weight:700">${esc(doc.quotationId)}</p>` : ''}
+      </div>
+    </div>
+    ${doc.title ? `<div class="hl-box"><p class="section-lbl">Contract Title</p><p style="font-weight:700;font-size:13px">${esc(doc.title)}</p></div>` : ''}
+    ${doc.siteId || doc.teamId || doc.staffId ? `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:20px">
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700">${esc(doc.siteName ?? doc.siteId)}</p></div>`  : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700">${esc(doc.teamName ?? doc.teamId)}</p></div>`  : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700">${esc(doc.staffName ?? doc.staffId)}</p></div>` : ''}
+    </div>` : ''}
+    ${sections.services ? `
+    <p class="section-lbl">Services</p>
+    <table>
+      <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Unit Price</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
+      <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'CONTRACT VALUE', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
     ${s?.contractFooter ? `<div class="footer-text">${esc(s.contractFooter)}</div>` : ''}
     ${sigsHtml('Service Provider Signature', 'Client Signature &amp; Date', s)}
@@ -706,7 +917,7 @@ function contractMinimal(ctx: Ctx): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function workorderClassic(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const metaRight = `
     <div>Created: ${fmtDate(doc.createdAt)}</div>
     ${doc.scheduledDate ? `<div>Scheduled: ${fmtDate(doc.scheduledDate)}</div>`  : ''}
@@ -723,30 +934,31 @@ function workorderClassic(ctx: Ctx): string {
       <div><p class="section-lbl">Customer</p><p style="font-weight:700">${esc(custName)}</p>
         ${c?.phone ? `<p style="color:#6b7280;font-size:11px">${esc(c.phone)}</p>` : ''}
       </div>
-      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700">${esc(doc.siteId)}</p></div>`  : ''}
-      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700">${esc(doc.teamId)}</p></div>`  : ''}
-      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700">${esc(doc.staffId)}</p></div>` : ''}
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700">${esc(doc.siteName ?? doc.siteId)}</p></div>`  : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700">${esc(doc.teamName ?? doc.teamId)}</p></div>`  : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700">${esc(doc.staffName ?? doc.staffId)}</p></div>` : ''}
     </div>
     <div class="hl-box">
       <p class="section-lbl">Work Description</p>
       <p style="font-weight:700;font-size:13px">${esc(doc.title ?? '')}</p>
     </div>
-    ${(doc.services ?? []).length > 0 ? `
+    ${sections.services && (doc.services ?? []).length > 0 ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services, false, cur)}</tbody>
     </table>` : ''}
-    ${partsTableHtml(doc.parts, cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
     ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
   </div>`);
 }
 
 function workorderModern(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const addr = companyFullAddress(s);
   const companyInfo = [s?.companyName, addr, s?.companyEmail, s?.phone].filter(Boolean).join('<br>');
   const { c } = ctx;
@@ -778,27 +990,28 @@ function workorderModern(ctx: Ctx): string {
     </div>
     ${doc.siteId || doc.teamId || doc.staffId ? `
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:20px">
-      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700;font-size:11px">${esc(doc.siteId)}</p></div>`       : ''}
-      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700;font-size:11px">${esc(doc.teamId)}</p></div>`       : ''}
-      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700;font-size:11px">${esc(doc.staffId)}</p></div>` : ''}
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700;font-size:11px">${esc(doc.siteName ?? doc.siteId)}</p></div>`       : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700;font-size:11px">${esc(doc.teamName ?? doc.teamId)}</p></div>`       : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700;font-size:11px">${esc(doc.staffName ?? doc.staffId)}</p></div>` : ''}
     </div>` : ''}
     <div class="hl-box"><p class="section-lbl">Work Description</p><p style="font-weight:700;font-size:13px;color:#0f172a">${esc(doc.title ?? '')}</p></div>
-    ${(doc.services ?? []).length > 0 ? `
+    ${sections.services && (doc.services ?? []).length > 0 ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services, false, cur)}</tbody>
     </table>` : ''}
-    ${partsTableHtml(doc.parts, cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
     ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
     </div>`);
 }
 
 function workorderMinimal(ctx: Ctx): string {
-  const { doc, s, cur } = ctx;
+  const { doc, s, cur, sections } = ctx;
   const { c } = ctx;
   const custName = c?.name ?? doc.customerId ?? '—';
   const metaRight = `
@@ -814,21 +1027,68 @@ function workorderMinimal(ctx: Ctx): string {
         <div class="cust-name">${esc(custName)}</div>
         <div class="cust-meta">${c?.phone ? esc(c.phone) : ''}</div>
       </div>
-      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><div class="cust-name" style="font-size:12px">${esc(doc.staffId)}</div></div>` : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><div class="cust-name" style="font-size:12px">${esc(doc.staffName ?? doc.staffId)}</div></div>` : ''}
     </div>
+    ${doc.siteId || doc.teamId ? `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+      ${doc.siteId ? `<div><p class="section-lbl">Site</p><div class="cust-name" style="font-size:12px">${esc(doc.siteName ?? doc.siteId)}</div></div>` : ''}
+      ${doc.teamId ? `<div><p class="section-lbl">Team</p><div class="cust-name" style="font-size:12px">${esc(doc.teamName ?? doc.teamId)}</div></div>` : ''}
+    </div>` : ''}
     <div class="hl-box">
       <p class="section-lbl">Work Description</p>
       <p style="font-weight:bold;font-size:13px">${esc(doc.title ?? '')}</p>
     </div>
-    ${(doc.services ?? []).length > 0 ? `
+    ${sections.services && (doc.services ?? []).length > 0 ? `
     <p class="section-lbl">Services</p>
     <table>
       <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
       <tbody>${svcRows(doc.services, false, cur)}</tbody>
     </table>` : ''}
-    ${partsTableHtml(doc.parts, cur)}
-    ${richBox('Notes', doc.notes)}
-    ${richBox('Terms &amp; Conditions', doc.termsAndConditions)}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
+    ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
+    ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
+  </div>`);
+}
+
+function workorderElegant(ctx: Ctx): string {
+  const { doc, s, cur, sections } = ctx;
+  const metaRight = `
+    <div>Created: ${fmtDate(doc.createdAt)}</div>
+    ${doc.scheduledDate ? `<div>Scheduled: ${fmtDate(doc.scheduledDate)}</div>`  : ''}
+    ${doc.completedDate ? `<div>Completed: ${fmtDate(doc.completedDate)}</div>` : ''}
+    <div style="margin-top:6px">
+      ${badge(PRIORITY_BADGE, doc.priority ?? 'medium')}
+      ${badge(WORKORDER_BADGE, doc.status ?? 'draft')}
+    </div>`;
+  const { c } = ctx;
+  const custName = c?.name ?? doc.customerId ?? '—';
+  return html(ELEGANT_CSS, `<div class="page">
+    ${elegantHeader(ctx, 'WORK ORDER', doc.workOrderId ?? '', metaRight)}
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+      <div><p class="section-lbl">Customer</p><p style="font-weight:700">${esc(custName)}</p>
+        ${c?.phone ? `<p style="color:#5b6b7d;font-size:11px">${esc(c.phone)}</p>` : ''}
+      </div>
+      ${doc.siteId  ? `<div><p class="section-lbl">Site</p><p style="font-weight:700">${esc(doc.siteName ?? doc.siteId)}</p></div>`  : ''}
+      ${doc.teamId  ? `<div><p class="section-lbl">Team</p><p style="font-weight:700">${esc(doc.teamName ?? doc.teamId)}</p></div>`  : ''}
+      ${doc.staffId ? `<div><p class="section-lbl">Assigned To</p><p style="font-weight:700">${esc(doc.staffName ?? doc.staffId)}</p></div>` : ''}
+    </div>
+    <div class="hl-box">
+      <p class="section-lbl">Work Description</p>
+      <p style="font-weight:700;font-size:13px">${esc(doc.title ?? '')}</p>
+    </div>
+    ${sections.services && (doc.services ?? []).length > 0 ? `
+    <p class="section-lbl">Services</p>
+    <table>
+      <thead><tr><th style="width:32px">#</th><th>Service</th><th class="td-r" style="width:50px">Qty</th><th class="td-r" style="width:80px">Amount</th></tr></thead>
+      <tbody>${svcRows(doc.services, false, cur)}</tbody>
+    </table>` : ''}
+    ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.notes ? richBox('Notes', doc.notes) : ''}
+    ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${s?.workorderFooter ? `<div class="footer-text">${esc(s.workorderFooter)}</div>` : ''}
     ${sigsHtml('Technician Signature', 'Customer Signature &amp; Date', s)}
   </div>`);
@@ -838,30 +1098,41 @@ function workorderMinimal(ctx: Ctx): string {
 // ─── PUBLIC API — one function per document type ───────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export function invoiceTemplate(doc: any, settings?: any, customer?: any, variant = 'classic'): string {
-  const ctx: Ctx = { doc, s: settings ?? {}, c: customer ?? null, cur: currencySymbol(settings?.currency) };
+function buildCtx(doc: any, settings: any, customer: any, sections?: Partial<ITemplateSections>): Ctx {
+  return {
+    doc, s: settings ?? {}, c: customer ?? null, cur: currencySymbol(settings?.currency),
+    sections: { ...DEFAULT_TEMPLATE_SECTIONS, ...(sections ?? {}) },
+  };
+}
+
+export function invoiceTemplate(doc: any, settings?: any, customer?: any, variant = 'classic', sections?: Partial<ITemplateSections>): string {
+  const ctx = buildCtx(doc, settings, customer, sections);
   if (variant === 'modern')  return invoiceModern(ctx);
   if (variant === 'minimal') return invoiceMinimal(ctx);
+  if (variant === 'elegant') return invoiceElegant(ctx);
   return invoiceClassic(ctx);
 }
 
-export function quotationTemplate(doc: any, settings?: any, customer?: any, variant = 'classic'): string {
-  const ctx: Ctx = { doc, s: settings ?? {}, c: customer ?? null, cur: currencySymbol(settings?.currency) };
+export function quotationTemplate(doc: any, settings?: any, customer?: any, variant = 'classic', sections?: Partial<ITemplateSections>): string {
+  const ctx = buildCtx(doc, settings, customer, sections);
   if (variant === 'modern')  return quotationModern(ctx);
   if (variant === 'minimal') return quotationMinimal(ctx);
+  if (variant === 'elegant') return quotationElegant(ctx);
   return quotationClassic(ctx);
 }
 
-export function contractTemplate(doc: any, settings?: any, customer?: any, variant = 'classic'): string {
-  const ctx: Ctx = { doc, s: settings ?? {}, c: customer ?? null, cur: currencySymbol(settings?.currency) };
+export function contractTemplate(doc: any, settings?: any, customer?: any, variant = 'classic', sections?: Partial<ITemplateSections>): string {
+  const ctx = buildCtx(doc, settings, customer, sections);
   if (variant === 'modern')  return contractModern(ctx);
   if (variant === 'minimal') return contractMinimal(ctx);
+  if (variant === 'elegant') return contractElegant(ctx);
   return contractClassic(ctx);
 }
 
-export function workorderTemplate(doc: any, settings?: any, customer?: any, variant = 'classic'): string {
-  const ctx: Ctx = { doc, s: settings ?? {}, c: customer ?? null, cur: currencySymbol(settings?.currency) };
+export function workorderTemplate(doc: any, settings?: any, customer?: any, variant = 'classic', sections?: Partial<ITemplateSections>): string {
+  const ctx = buildCtx(doc, settings, customer, sections);
   if (variant === 'modern')  return workorderModern(ctx);
   if (variant === 'minimal') return workorderMinimal(ctx);
+  if (variant === 'elegant') return workorderElegant(ctx);
   return workorderClassic(ctx);
 }

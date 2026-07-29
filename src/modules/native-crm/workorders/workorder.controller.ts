@@ -13,6 +13,8 @@ import {
 import { logTimeline } from '../timeline/timeline.service';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { uploadToS3 } from '../../../services/s3.service';
+import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -42,6 +44,7 @@ export async function create(req: AuthRequest, res: Response) {
       createdBy: req.user?.userId,
     });
     logTimeline(req.tenantId!, 'workorder', String(item._id), 'created', `Work order ${(item as any).workOrderId} created`, req.user?.userId).catch(() => {});
+    runAutomationsOnCreate(req.tenantId!, 'workorder', item as any).catch(() => {});
     sendCreated(res, item);
   } catch (err: any) {
     sendError(res, err.message, 400);
@@ -50,6 +53,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
+    const prev = await getWorkorderById(req.params.id, req.tenantId!);
     const item = await updateWorkorder(req.params.id, req.tenantId!, req.body);
     if (!item) return sendError(res, 'Work order not found', 404);
     const action = req.body.status ? 'status_changed' : 'updated';
@@ -57,9 +61,14 @@ export async function update(req: AuthRequest, res: Response) {
       ? `Status changed to ${req.body.status}`
       : `Work order ${(item as any).workOrderId} updated`;
     logTimeline(req.tenantId!, 'workorder', String(item._id), action as any, desc, req.user?.userId, req.body.status ? { status: req.body.status } : undefined).catch(() => {});
-    if (req.body.status === 'completed') {
-      autoLockIfConfigured(req.tenantId!, 'workorders', String(item._id), 'completed', req.user?.userId ?? 'system').catch(() => {});
+    if (req.body.status) {
+      const completedKey = await getOutcomeStageKey(req.tenantId!, 'workorder', 'completed', 'completed');
+      if (req.body.status === completedKey) {
+        autoLockIfConfigured(req.tenantId!, 'workorders', String(item._id), completedKey, req.user?.userId ?? 'system').catch(() => {});
+      }
+      runAutomations(req.tenantId!, 'workorder', item as any, req.body.status).catch(() => {});
     }
+    if (prev) runAutomationsOnUpdate(req.tenantId!, 'workorder', prev as any, item as any).catch(() => {});
     sendSuccess(res, item);
   } catch (err: any) {
     sendError(res, err.message, 400);
@@ -71,6 +80,7 @@ export async function remove(req: AuthRequest, res: Response) {
     const item = await deleteWorkorder(req.params.id, req.tenantId!);
     if (!item) return sendError(res, 'Work order not found', 404);
     logTimeline(req.tenantId!, 'workorder', req.params.id, 'deleted', `Work order deleted`, req.user?.userId).catch(() => {});
+    runAutomationsOnDelete(req.tenantId!, 'workorder', item as any).catch(() => {});
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);

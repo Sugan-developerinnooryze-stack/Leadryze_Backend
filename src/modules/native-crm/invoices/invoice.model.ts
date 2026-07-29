@@ -36,7 +36,7 @@ export interface IInvoiceDoc extends Document {
   servicesAmountWithTax: number;
   dueDate?:              Date;
   paid:                  boolean;
-  status:                'draft' | 'sent' | 'paid' | 'overdue' | 'cancelled';
+  status:                string;
   notes?:                string;
   termsAndConditions?:   string;
   workflowState?: 'pending' | 'in_progress' | 'complete';
@@ -93,9 +93,10 @@ const schema = new Schema<IInvoiceDoc>(
     servicesAmountWithTax: { type: Number, default: 0 },
     dueDate:               { type: Date },
     paid:                  { type: Boolean, default: false },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config), not a fixed enum.
     status: {
       type:    String,
-      enum:    ['draft', 'sent', 'paid', 'overdue', 'cancelled'],
       default: 'draft',
     },
     notes:              { type: String },

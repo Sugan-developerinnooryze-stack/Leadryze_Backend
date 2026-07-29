@@ -2,10 +2,11 @@ import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 import { encryptPIIFields } from '../../../platform/pii/pii.service';
 
-export type LeadStatus =
-  | 'new' | 'contacted' | 'qualified' | 'meeting_scheduled'
-  | 'proposal_sent' | 'negotiation' | 'won' | 'lost'
-  | 'on_hold' | 'disqualified';
+// A tenant-configurable stage key (native-crm/pipeline-config) — no longer a
+// fixed union, since each tenant defines their own pipeline. Default seed
+// values: new, contacted, qualified, meeting_scheduled, proposal_sent,
+// negotiation, won, lost, on_hold, disqualified.
+export type LeadStatus = string;
 
 export type LeadSource =
   | 'website' | 'landing_page' | 'chatbot' | 'whatsapp' | 'facebook'
@@ -57,6 +58,12 @@ export interface ILeadDoc extends Document {
   score:    number;
   priority: 'high' | 'medium' | 'low';
   leadOwner?: string;
+  /** NativeStaff.staffId of the assigned owner (not a Mongo _id — same
+   * human-readable-ID convention Custom Module relationship fields use) —
+   * lets automation rules resolve a real recipient for the 'assigned_user'
+   * strategy, which leadOwner's free text alone can't support. leadOwner is
+   * kept in sync as this staff's display name for existing exports/search. */
+  leadOwnerStaffId?: string;
 
   // Sales
   expectedRevenue?:   number;
@@ -108,6 +115,9 @@ export interface ILeadDoc extends Document {
   customFields?:  Record<string, any>;
   createdBy?:     string;
   lastActivityAt?: Date;
+  /** Stamped on every lead created by a CSV import run (native-crm/lead-import)
+   * so an admin can filter/audit exactly what one import batch produced. */
+  importBatchId?: string;
   createdAt:      Date;
   updatedAt:      Date;
 }
@@ -147,12 +157,16 @@ const schema = new Schema<ILeadDoc>(
     country:    { type: String, trim: true },
     postalCode: { type: String, trim: true },
 
-    status:   { type: String, enum: ['new','contacted','qualified','meeting_scheduled','proposal_sent','negotiation','won','lost','on_hold','disqualified'], default: 'new' },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config) rather than a
+    // fixed schema enum, so each tenant can have their own stage list.
+    status:   { type: String, default: 'new' },
     source:   { type: String, enum: ['website','landing_page','chatbot','whatsapp','facebook','google','manual','csv','api','referral','other'], default: 'manual' },
     rating:   { type: String, enum: ['hot','warm','cold'], default: 'warm' },
     score:    { type: Number, default: 0, min: 0, max: 100 },
     priority: { type: String, enum: ['high','medium','low'], default: 'medium' },
     leadOwner: { type: String },
+    leadOwnerStaffId: { type: String, index: true },
 
     expectedRevenue:   { type: Number },
     expectedCloseDate: { type: Date },
@@ -199,9 +213,25 @@ const schema = new Schema<ILeadDoc>(
     lockReason:  { type: String },
     phoneSearch: { type: String, index: true },
     emailDomain: { type: String, index: true },
+    importBatchId: { type: String, index: true },
   },
   { timestamps: true }
 );
+
+// Must run BEFORE the PII-encryption hook below — email/phone are plaintext
+// here and become ciphertext once encryptPIIFields runs, so this is the only
+// point at which a searchable domain/normalized-phone can be derived.
+schema.pre('save', function (next) {
+  if (this.isModified('email')) {
+    const at = (this.email ?? '').indexOf('@');
+    this.emailDomain = at > 0 ? this.email!.slice(at + 1).toLowerCase().trim() : undefined;
+  }
+  if (this.isModified('phone')) {
+    const digits = (this.phone ?? '').replace(/\D/g, '');
+    this.phoneSearch = digits || undefined;
+  }
+  next();
+});
 
 schema.pre('save', function (next) {
   encryptPIIFields(this as any, 'leads');

@@ -12,6 +12,8 @@ import {
 } from './contract.service';
 import { generateVisits, summarizeVisits } from './schedule.engine';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
+import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -40,6 +42,7 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
+    runAutomationsOnCreate(req.tenantId!, 'contract', item as any).catch(() => {});
     sendCreated(res, item);
   } catch (err: any) {
     sendError(res, err.message, 400);
@@ -48,11 +51,17 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
+    const prev = await getContractById(req.params.id, req.tenantId!);
     const item = await updateContract(req.params.id, req.tenantId!, req.body);
     if (!item) return sendError(res, 'Contract not found', 404);
-    if (req.body.status === 'active') {
-      autoLockIfConfigured(req.tenantId!, 'contracts', String(item._id), 'active', req.user?.userId ?? 'system').catch(() => {});
+    if (req.body.status) {
+      const activeKey = await getOutcomeStageKey(req.tenantId!, 'contract', 'active', 'active');
+      if (req.body.status === activeKey) {
+        autoLockIfConfigured(req.tenantId!, 'contracts', String(item._id), activeKey, req.user?.userId ?? 'system').catch(() => {});
+      }
+      runAutomations(req.tenantId!, 'contract', item as any, req.body.status).catch(() => {});
     }
+    if (prev) runAutomationsOnUpdate(req.tenantId!, 'contract', prev as any, item as any).catch(() => {});
     sendSuccess(res, item);
   } catch (err: any) {
     sendError(res, err.message, 400);
@@ -63,6 +72,7 @@ export async function remove(req: AuthRequest, res: Response) {
   try {
     const item = await deleteContract(req.params.id, req.tenantId!);
     if (!item) return sendError(res, 'Contract not found', 404);
+    runAutomationsOnDelete(req.tenantId!, 'contract', item as any).catch(() => {});
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);

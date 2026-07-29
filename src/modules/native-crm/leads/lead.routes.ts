@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import * as ctrl from './lead.controller';
+import * as importCtrl from './lead-import.controller';
 import { validate } from '../../../middleware/validate.middleware';
 import { idParam } from '../../../utils/common.schemas';
 import { createLeadSchema, updateLeadSchema, updateStageSchema } from './lead.validation';
@@ -9,6 +10,10 @@ const router = Router();
 
 router.get('/',                 ctrl.list);
 router.get('/stats',            ctrl.stats);
+router.get('/export',           ctrl.exportCsv);
+router.post('/import',                    importCtrl.importCsv);
+router.get('/import/triage',              importCtrl.listTriage);
+router.post('/import/triage/:id/resolve', importCtrl.resolveTriage);
 router.post('/',                validate({ body: createLeadSchema }), ctrl.create);
 router.get('/:id',              validate({ params: idParam }),        ctrl.getOne);
 router.put('/:id',              validate({ params: idParam, body: updateLeadSchema }), requireUnlocked('leads'), ctrl.update);

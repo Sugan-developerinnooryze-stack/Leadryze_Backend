@@ -32,7 +32,7 @@ export interface IQuotationDoc extends Document {
   gstPercentage:         number;
   servicesAmount:        number;
   servicesAmountWithTax: number;
-  status:                'draft' | 'sent' | 'approved' | 'rejected';
+  status:                string;
   notes?:                string;
   termsAndConditions?:   string;
   validUntil?:           Date;
@@ -86,9 +86,10 @@ const schema = new Schema<IQuotationDoc>(
     gstPercentage:         { type: Number, default: 0 },
     servicesAmount:        { type: Number, default: 0 },
     servicesAmountWithTax: { type: Number, default: 0 },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config), not a fixed enum.
     status: {
       type:    String,
-      enum:    ['draft', 'sent', 'approved', 'rejected'],
       default: 'draft',
     },
     notes:               { type: String },

@@ -85,7 +85,7 @@ export interface IContractDoc extends Document {
   gstPercentage:         number;
   servicesAmount:        number;
   servicesAmountWithTax: number;
-  status:                'draft' | 'pending' | 'active' | 'suspended' | 'completed' | 'expired' | 'cancelled';
+  status:                string;
   notes?:                string;
   termsAndConditions?:   string;
   workflowState?: 'pending' | 'in_progress' | 'complete';
@@ -217,9 +217,12 @@ const schema = new Schema<IContractDoc>(
     gstPercentage:         { type: Number, default: 0 },
     servicesAmount:        { type: Number, default: 0 },
     servicesAmountWithTax: { type: Number, default: 0 },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config), not a fixed enum.
+    // Note: visits[].status (above) is a SEPARATE, out-of-scope enum for the
+    // per-visit schedule engine — it is not tenant-configurable.
     status: {
       type:    String,
-      enum:    ['draft', 'pending', 'active', 'suspended', 'completed', 'expired', 'cancelled'],
       default: 'draft',
     },
     notes:              { type: String },

@@ -4,6 +4,14 @@ import { ContractListOptions } from './contract.types';
 import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { generateVisits, computeBalance, serviceRangeSummary } from './schedule.engine';
+import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+
+async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
+  if (!status) return;
+  if (!(await isValidStageKey(tenantId, 'contract', status))) {
+    throw new Error(`"${status}" is not a valid stage for this tenant's Contract pipeline`);
+  }
+}
 
 /** True when any service line carries a schedule rule (new master-engine contracts). */
 function hasScheduleRules(services: any[]): boolean {
@@ -48,6 +56,7 @@ export async function getContractById(id: string, tenantId: string) {
 }
 
 export async function createContract(data: any) {
+  await assertValidStatus(String(data.tenantId), data.status);
   const services: any[]  = data.services ?? [];
   const parts: any[]     = data.parts ?? [];
   const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
@@ -78,6 +87,7 @@ export async function createContract(data: any) {
 }
 
 export async function updateContract(id: string, tenantId: string, data: any) {
+  await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const touchesSchedule =
     data.services !== undefined || data.startDate !== undefined || data.endDate !== undefined;
@@ -165,6 +175,8 @@ export async function generateWorkordersForVisits(
   // Lazy import avoids a circular dependency (workorder.service imports this module)
   const { createWorkorder } = await import('../workorders/workorder.service');
 
+  const scheduledKey = await getOutcomeStageKey(tenantId, 'workorder', 'scheduled', 'scheduled');
+
   let created = 0;
   for (const visit of targets) {
     try {
@@ -181,7 +193,7 @@ export async function generateWorkordersForVisits(
         staffIds:              contract.staffIds ?? [],
         scheduledDate:         visit.serviceDate,
         durationHours:         visit.services?.reduce((s: number, x: any) => s + (Number(x.durationHours) || 0), 0) || undefined,
-        status:                'scheduled',
+        status:                scheduledKey,
         priority:              contract.priority && ['low', 'medium', 'high'].includes(contract.priority) ? contract.priority : 'medium',
         createdBy:             opts?.createdBy ?? 'system',
       });

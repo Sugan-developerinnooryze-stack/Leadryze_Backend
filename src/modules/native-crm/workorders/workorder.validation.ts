@@ -17,8 +17,12 @@ export const createWorkorderSchema = z.object({
   services:      z.array(serviceLine).optional(),
   parts:         z.array(partLine).optional(),
   partsAmount:   z.number().min(0).optional(),
+  discount:      z.number().min(0).optional(),
+  gstPercentage: z.number().min(0).optional(),
   priority:      z.enum(['low','medium','high']).optional(),
-  status:        z.enum(['draft','scheduled','in_progress','completed','cancelled']).optional(),
+  // Tenant-configurable pipeline stage key — validity checked at the service
+  // layer against this tenant's own stage list, not a fixed enum here.
+  status:        z.string().trim().min(1).optional(),
   notes:         z.string().optional(),
   termsAndConditions: z.string().optional(),
   checklists:    z.array(z.object({ item: z.string(), completed: z.boolean().optional() })).optional(),

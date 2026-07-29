@@ -6,6 +6,14 @@ import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeContract }  from '../contracts/contract.model';
 import { NativeStaff }     from '../staffs/staff.model';
 import { getSettings }     from '../fs-settings/fs-settings.service';
+import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+
+async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
+  if (!status) return;
+  if (!(await isValidStageKey(tenantId, 'workorder', status))) {
+    throw new Error(`"${status}" is not a valid stage for this tenant's Work Order pipeline`);
+  }
+}
 
 /** Tenant's default workorder duration from FS Settings (hours), or null. */
 async function getDefaultDuration(tenantId: string, branchId?: string | null): Promise<number | null> {
@@ -75,6 +83,7 @@ function syncContractVisit(
 }
 
 export async function createWorkorder(data: any) {
+  await assertValidStatus(String(data.tenantId), data.status);
   // Duration is managed centrally: default from FS Settings when not provided
   if (data.durationHours == null || Number(data.durationHours) <= 0) {
     const def = await getDefaultDuration(String(data.tenantId), data.branchId ? String(data.branchId) : null);
@@ -104,6 +113,7 @@ export async function createWorkorder(data: any) {
 }
 
 export async function updateWorkorder(id: string, tenantId: string, data: any) {
+  await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const doc = await NativeWorkorder.findOneAndUpdate(
     { _id: id, tenantId: tid },
@@ -111,14 +121,19 @@ export async function updateWorkorder(id: string, tenantId: string, data: any) {
     { new: true, runValidators: true }
   );
 
-  // Contract master engine: keep the linked visit's status in sync
+  // Contract master engine: keep the linked visit's status in sync. The
+  // visit's own status values ('completed'/'planned') are a separate,
+  // out-of-scope enum (schedule.engine.ts) — only the WO status keys being
+  // compared against are resolved per-tenant here.
   const wo: any = doc;
   if (wo?.contractId && wo?.contractVisitNumber && data.status) {
-    if (data.status === 'completed') {
+    const completedKey = await getOutcomeStageKey(tenantId, 'workorder', 'completed', 'completed');
+    const cancelledKey = await getOutcomeStageKey(tenantId, 'workorder', 'cancelled', 'cancelled');
+    if (data.status === completedKey) {
       syncContractVisit(wo.tenantId, wo.contractId, Number(wo.contractVisitNumber), {
         'visits.$.status': 'completed',
       });
-    } else if (data.status === 'cancelled') {
+    } else if (data.status === cancelledKey) {
       syncContractVisit(wo.tenantId, wo.contractId, Number(wo.contractVisitNumber), {
         'visits.$.status':      'planned',
         'visits.$.workOrderId': '',
@@ -210,11 +225,12 @@ export async function checkStaffAvailability(
   const queryStart = new Date(dayStart.getTime() - 24 * 3600 * 1000);
   const queryEnd   = new Date(dayEnd.getTime()   + 24 * 3600 * 1000);
 
+  const cancelledKey = await getOutcomeStageKey(tenantId, 'workorder', 'cancelled', 'cancelled');
   const filter: any = {
     tenantId: tid,
     $or: [{ staffId }, { staffIds: staffId }],
     scheduledDate: { $gte: queryStart, $lte: queryEnd },
-    status: { $nin: ['cancelled'] },
+    status: { $nin: [cancelledKey] },
   };
   if (opts?.excludeId && mongoose.Types.ObjectId.isValid(opts.excludeId)) {
     filter._id = { $ne: new mongoose.Types.ObjectId(opts.excludeId) };

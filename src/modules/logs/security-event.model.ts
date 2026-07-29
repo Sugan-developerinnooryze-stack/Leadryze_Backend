@@ -14,6 +14,7 @@ export type SecurityEventType =
   | 'auth.email_verified'
   | 'ratelimit.violation'
   | 'webhook.sig_invalid'
+  | 'webhook.token_invalid'
   | 'websocket.auth_failed'
   | 'tenant.access_denied'
   | 'ai.prompt_blocked';

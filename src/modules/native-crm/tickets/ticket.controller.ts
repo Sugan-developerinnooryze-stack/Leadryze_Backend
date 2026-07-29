@@ -2,12 +2,14 @@ import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated } from '../../../utils/response';
 import * as svc from './ticket.service';
+import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId } = req.query as Record<string, string>;
     const result = await svc.listTickets(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
+      relatedModule, relatedId,
     });
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch tickets', 500); }
@@ -24,22 +26,27 @@ export async function getOne(req: AuthRequest, res: Response) {
 export async function create(req: AuthRequest, res: Response) {
   try {
     const record = await svc.createTicket(req.tenantId!, req.body);
+    runAutomationsOnCreate(req.tenantId!, 'ticket', record as any).catch(() => {});
     sendCreated(res, record, 'Ticket created');
   } catch { sendError(res, 'Failed to create ticket', 500); }
 }
 
 export async function update(req: AuthRequest, res: Response) {
   try {
+    const prev = await svc.getTicketById(req.tenantId!, req.params.id);
     const record = await svc.updateTicket(req.tenantId!, req.params.id, req.body);
     if (!record) return void sendError(res, 'Ticket not found', 404);
+    if (req.body.ticketStatus) runAutomations(req.tenantId!, 'ticket', record as any, req.body.ticketStatus).catch(() => {});
+    if (prev) runAutomationsOnUpdate(req.tenantId!, 'ticket', prev, record as any).catch(() => {});
     sendSuccess(res, record, 'Ticket updated');
   } catch { sendError(res, 'Failed to update ticket', 500); }
 }
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const ok = await svc.deleteTicket(req.tenantId!, req.params.id);
-    if (!ok) return void sendError(res, 'Ticket not found', 404);
+    const record = await svc.deleteTicket(req.tenantId!, req.params.id);
+    if (!record) return void sendError(res, 'Ticket not found', 404);
+    runAutomationsOnDelete(req.tenantId!, 'ticket', record as any).catch(() => {});
     sendSuccess(res, null, 'Ticket deleted');
   } catch { sendError(res, 'Failed to delete ticket', 500); }
 }

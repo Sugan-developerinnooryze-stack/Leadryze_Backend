@@ -2,12 +2,15 @@ import mongoose from 'mongoose';
 import { Meeting } from './meeting.model';
 import { CreateMeetingDTO, UpdateMeetingDTO } from './meeting.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
+import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 
 export async function listMeetings(tenantId: string, opts: ListOptions = {}): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status } = opts;
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (status) filter.meetingStatus = status;
+  if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
+  if (upcoming) filter.startDate = { $gte: new Date() };
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     filter.$or = [{ title: re }, { location: re }, { notes: re }];
@@ -26,7 +29,9 @@ export async function getMeetingById(tenantId: string, id: string) {
 
 export async function createMeeting(tenantId: string, dto: CreateMeetingDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Meeting.create({ tenantId: tid, ...dto });
+  const created = await Meeting.create({ tenantId: tid, ...dto });
+  void sendOnCreateConfirmation(tenantId, 'meeting', created.toObject()); // fire-and-forget, never throws
+  return created;
 }
 
 export async function updateMeeting(tenantId: string, id: string, dto: UpdateMeetingDTO) {

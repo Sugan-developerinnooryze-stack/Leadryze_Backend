@@ -67,6 +67,9 @@ export const config = {
   ai: {
     internalApiKey: process.env.AI_INTERNAL_API_KEY || 'internal-key',
     internalServiceKey: process.env.INTERNAL_SERVICE_KEY || 'leadryze-service-key-change-in-prod',
+    // Mongo-backed backstop for the PDF/Image Template Analyzer — independent
+    // of the ai/ service's Redis rate limiter, which fails open if Redis is down.
+    maxTemplateAnalysesPerDay: parseInt(process.env.MAX_TEMPLATE_ANALYSES_PER_DAY || '20', 10),
   },
   rateLimit: {
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10),

@@ -2,6 +2,14 @@ import mongoose from 'mongoose';
 import { Deal } from './deal.model';
 import { CreateDealDTO, UpdateDealDTO } from './deal.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
+import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+
+async function assertValidStage(tenantId: string, stage: string | undefined): Promise<void> {
+  if (!stage) return;
+  if (!(await isValidStageKey(tenantId, 'deal', stage))) {
+    throw new Error(`"${stage}" is not a valid stage for this tenant's Deal pipeline`);
+  }
+}
 
 export async function listDeals(tenantId: string, opts: ListOptions = {}, branchId?: string | null): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status } = opts;
@@ -26,19 +34,20 @@ export async function getDealById(tenantId: string, id: string) {
 }
 
 export async function createDeal(tenantId: string, dto: CreateDealDTO) {
+  await assertValidStage(tenantId, dto.stage);
   const tid = new mongoose.Types.ObjectId(tenantId);
   return Deal.create({ tenantId: tid, ...dto });
 }
 
 export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDTO) {
+  await assertValidStage(tenantId, dto.stage);
   const tid = new mongoose.Types.ObjectId(tenantId);
   return Deal.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: dto }, { new: true }).lean();
 }
 
-export async function deleteDeal(tenantId: string, id: string): Promise<boolean> {
+export async function deleteDeal(tenantId: string, id: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const res = await Deal.findOneAndDelete({ _id: id, tenantId: tid });
-  return !!res;
+  return Deal.findOneAndDelete({ _id: id, tenantId: tid }).lean();
 }
 
 export async function getDealStats(tenantId: string) {

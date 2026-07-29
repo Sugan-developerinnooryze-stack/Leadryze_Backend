@@ -32,6 +32,7 @@ import receiptRoutes   from './receipts/receipt.routes';
 /* ── Field-service modules (Phase 3) ─────────────────────────────────────── */
 import expenseRoutes    from './expenses/expense.routes';
 import activityRoutes   from './activities/activity.routes';
+import activityFeedRoutes from './activity-feed/activity-feed.routes';
 import pdfRoutes        from './pdf/pdf.routes';
 
 /* ── Field-service modules (Phase 4) ─────────────────────────────────────── */
@@ -42,6 +43,8 @@ import vehicleRoutes    from './vehicles/vehicle.routes';
 import timelineRoutes   from './timeline/timeline.routes';
 import customFieldRoutes    from './custom-fields/custom-field.routes';
 import customTemplateRoutes from './custom-templates/custom-template.routes';
+import templateAssetRoutes  from './custom-templates/template-asset.routes';
+import templateAnalysisRoutes from './custom-templates/template-analysis.routes';
 import leadRoutes           from './leads/lead.routes';
 import recordLockRoutes    from './record-lock/record-lock.routes';
 import branchRoutes        from './branches/branch.routes';
@@ -50,6 +53,11 @@ import customFormTemplateRoutes  from './custom-fields/custom-form-template.rout
 import { fsCounts }         from './fs-counts.controller';
 import { nativeCrmLog }     from '../../middlewares/native-crm-log.middleware';
 import nativeLogRoutes      from './native-logs/native-crm-log.routes';
+import notificationSettingsRoutes from './notification-settings/notification-settings.routes';
+import { emailLogRoutes }   from '../notifications';
+import pipelineConfigRoutes from './pipeline-config/pipeline-config.routes';
+import automationRuleRoutes from './automation-rules/automation-rule.routes';
+import automationFlowRoutes from './automation-flows/automation-flow.routes';
 
 import { Contact }  from './contacts/contact.model';
 import { Company }  from './companies/company.model';
@@ -95,6 +103,7 @@ router.use('/receipts',   receiptRoutes);
 /* ── Phase 3 sub-routers ──────────────────────────────────────────────────── */
 router.use('/expenses',   expenseRoutes);
 router.use('/activities', activityRoutes);
+router.use('/activity-feed', activityFeedRoutes);
 router.use('/pdf',        pdfRoutes);
 
 /* ── Phase 4 sub-routers ──────────────────────────────────────────────────── */
@@ -105,11 +114,18 @@ router.use('/vehicles',      vehicleRoutes);
 router.use('/timeline',      timelineRoutes);
 router.use('/custom-fields',       customFieldRoutes);
 router.use('/custom-templates',    customTemplateRoutes);
+router.use('/template-assets',     templateAssetRoutes);
+router.use('/template-analysis',   templateAnalysisRoutes);
 router.use('/leads',               leadRoutes);
 router.use('/record-lock',         recordLockRoutes);
 router.use('/branches',            branchRoutes);
 router.use('/workflow-templates',       workflowTemplateRoutes);
 router.use('/custom-form-templates',   customFormTemplateRoutes);
+router.use('/notification-settings',   notificationSettingsRoutes);
+router.use('/email-logs',              emailLogRoutes);
+router.use('/pipeline-config',         pipelineConfigRoutes);
+router.use('/automation-rules',        automationRuleRoutes);
+router.use('/automation-flows',        automationFlowRoutes);
 
 /* ── GET /fs-counts — field service module record counts ─────────────────── */
 router.get('/fs-counts', fsCounts);

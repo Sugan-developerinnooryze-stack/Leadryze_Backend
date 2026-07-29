@@ -3,6 +3,8 @@ import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated } from '../../../utils/response';
 import * as svc from './deal.service';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
+import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -25,22 +27,27 @@ export async function getOne(req: AuthRequest, res: Response) {
 export async function create(req: AuthRequest, res: Response) {
   try {
     const record = await svc.createDeal(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null });
+    runAutomationsOnCreate(req.tenantId!, 'deal', record as any).catch(() => {});
     sendCreated(res, record, 'Deal created');
-  } catch { sendError(res, 'Failed to create deal', 500); }
+  } catch (err: any) { sendError(res, err.message ?? 'Failed to create deal', 400); }
 }
 
 export async function update(req: AuthRequest, res: Response) {
   try {
+    const prev = await svc.getDealById(req.tenantId!, req.params.id);
     const record = await svc.updateDeal(req.tenantId!, req.params.id, req.body);
     if (!record) return void sendError(res, 'Deal not found', 404);
+    if (req.body.stage) runAutomations(req.tenantId!, 'deal', record, req.body.stage).catch(() => {});
+    if (prev) runAutomationsOnUpdate(req.tenantId!, 'deal', prev, record).catch(() => {});
     sendSuccess(res, record, 'Deal updated');
-  } catch { sendError(res, 'Failed to update deal', 500); }
+  } catch (err: any) { sendError(res, err.message ?? 'Failed to update deal', 400); }
 }
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const ok = await svc.deleteDeal(req.tenantId!, req.params.id);
-    if (!ok) return void sendError(res, 'Deal not found', 404);
+    const record = await svc.deleteDeal(req.tenantId!, req.params.id);
+    if (!record) return void sendError(res, 'Deal not found', 404);
+    runAutomationsOnDelete(req.tenantId!, 'deal', record).catch(() => {});
     sendSuccess(res, null, 'Deal deleted');
   } catch { sendError(res, 'Failed to delete deal', 500); }
 }
@@ -56,9 +63,11 @@ export async function updateStage(req: AuthRequest, res: Response) {
     if (!stage) return void sendError(res, 'stage is required', 400);
     const record = await svc.updateDeal(req.tenantId!, req.params.id, { stage });
     if (!record) return void sendError(res, 'Deal not found', 404);
-    if (stage === 'closed_won') {
-      autoLockIfConfigured(req.tenantId!, 'deals', (record as any)._id.toString(), 'closed_won', req.user?.userId ?? 'system').catch(() => {});
+    const wonKey = await getOutcomeStageKey(req.tenantId!, 'deal', 'won', 'closed_won');
+    if (stage === wonKey) {
+      autoLockIfConfigured(req.tenantId!, 'deals', (record as any)._id.toString(), wonKey, req.user?.userId ?? 'system').catch(() => {});
     }
+    runAutomations(req.tenantId!, 'deal', record as any, stage).catch(() => {});
     sendSuccess(res, record, 'Stage updated');
-  } catch { sendError(res, 'Failed to update stage', 500); }
+  } catch (err: any) { sendError(res, err.message ?? 'Failed to update stage', 400); }
 }

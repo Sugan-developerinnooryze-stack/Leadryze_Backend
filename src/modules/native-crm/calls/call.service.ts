@@ -2,12 +2,15 @@ import mongoose from 'mongoose';
 import { Call } from './call.model';
 import { CreateCallDTO, UpdateCallDTO } from './call.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
+import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 
 export async function listCalls(tenantId: string, opts: ListOptions = {}): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status } = opts;
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (status) filter.callStatus = status;
+  if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
+  if (upcoming) filter.date = { $gte: new Date() };
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     filter.$or = [{ contactName: re }, { notes: re }];
@@ -26,7 +29,9 @@ export async function getCallById(tenantId: string, id: string) {
 
 export async function createCall(tenantId: string, dto: CreateCallDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Call.create({ tenantId: tid, ...dto });
+  const created = await Call.create({ tenantId: tid, ...dto });
+  void sendOnCreateConfirmation(tenantId, 'call', created.toObject()); // fire-and-forget, never throws
+  return created;
 }
 
 export async function updateCall(tenantId: string, id: string, dto: UpdateCallDTO) {

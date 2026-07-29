@@ -43,8 +43,14 @@ export async function deleteTemplate(tenantId: string, id: string): Promise<void
   await Template.findOneAndUpdate({ _id: id, tenantId }, { isActive: false });
 }
 
+// A KNOWN variable that legitimately resolves to '' (e.g. buildVariables()'s
+// `title` for a Custom Module record with no title-like field) should render
+// blank, not leak the raw {{title}} syntax to whoever reads the message —
+// that only happens for a genuinely UNDEFINED key (a real typo in the
+// template), which is why this checks `key in variables` rather than
+// truthiness.
 export function renderTemplate(body: string, variables: Record<string, string>): string {
-  return body.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] || `{{${key}}}`);
+  return body.replace(/\{\{(\w+)\}\}/g, (match, key) => (key in variables ? variables[key] : match));
 }
 
 const DEFAULT_TEMPLATES: Array<{

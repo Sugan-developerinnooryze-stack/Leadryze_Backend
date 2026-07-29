@@ -8,12 +8,24 @@ export const taskSchema = new Schema(
     title:      { type: String, required: true, trim: true },
     dueDate:    { type: Date },
     priority:   { type: String, enum: ['low', 'medium', 'high'], default: 'medium' },
-    taskStatus: { type: String, enum: ['todo', 'in_progress', 'done', 'cancelled'], default: 'todo' },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config), not a fixed enum.
+    taskStatus: { type: String, default: 'todo' },
     assignedTo: { type: String, trim: true },
     notes:      { type: String },
     tags:       [{ type: String }],
     customFields: { type: Schema.Types.Mixed },
     createdBy:  { type: String },
+    // Optional link to a real Field Service record (Customer/Quotation/Work
+    // Order/Contract) so this task shows up in that record's Activity feed —
+    // relatedId is the target's Mongo _id (not its human-facing *Id string),
+    // matching the same convention already used by lead-conversion/Timeline.
+    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract'] },
+    relatedId:     { type: String, trim: true },
+    relatedLabel:  { type: String, trim: true },
+    // Guard so the "upcoming task" reminder cron never emails/texts twice for
+    // the same task — same shape as Call/Meeting's reminderSentAt.
+    reminderSentAt: { type: Date },
   },
   { timestamps: true }
 );
@@ -28,3 +40,4 @@ taskSchema.index({ tenantId: 1 });
 taskSchema.index({ tenantId: 1, taskStatus: 1 });
 taskSchema.index({ tenantId: 1, dueDate: 1 });
 taskSchema.index({ tenantId: 1, priority: 1 });
+taskSchema.index({ tenantId: 1, relatedModule: 1, relatedId: 1 });

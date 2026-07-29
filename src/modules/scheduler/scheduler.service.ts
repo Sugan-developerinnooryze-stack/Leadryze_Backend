@@ -1,6 +1,9 @@
 import cron from 'node-cron';
 import { logger } from '../../utils/logger';
 import { runContractScheduler } from '../native-crm/contracts/contract.scheduler';
+import { pollPausedFlows, pollScheduledFlows } from '../native-crm/automation-flows/automation-flow.service';
+import { pollScheduledRules } from '../native-crm/automation-rules/automation-rule.service';
+import { runCallMeetingReminders } from './crm-reminders.scheduler';
 import { Connector } from '../connectors/connector.model';
 import { Customer } from '../customers/customer.model';
 import { Activity } from '../activities/activity.model';
@@ -351,13 +354,40 @@ function initCronJobs(): void {
     await runMeetingFollowups();
   });
 
+  // Native CRM Call/Meeting reminders — every 2 minutes (separate from the
+  // Activity-based reminders above, which cover the unrelated "My CRM" feature)
+  cron.schedule('*/2 * * * *', async () => {
+    await runCallMeetingReminders();
+  });
+
   // Contract → Work Order auto-generator — daily at 6am
   cron.schedule('0 6 * * *', async () => {
     logger.info('Cron triggered: contract work-order scheduler');
     await runContractScheduler();
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), contract WO generator (6am daily)');
+  // Advanced Mode Delay-node resume poll — every 2 minutes, same cadence as
+  // the other windowed polls above. Cron-only by design (no BullMQ) — see
+  // automation-flow.service.ts's own comment: sub-minute precision doesn't
+  // matter for delays measured in minutes-to-days. Runs regardless of Redis
+  // availability, same as every other cron job here.
+  cron.schedule('*/2 * * * *', async () => {
+    await pollPausedFlows();
+  });
+
+  // Schedule Trigger poll — every minute, since cron patterns configured on
+  // a rule/flow can themselves be per-minute; anything coarser here would
+  // miss real schedules. Two separate polls (one per engine), each
+  // independently try/caught inside, so a bug in one can never affect the
+  // other or the rest of this function's own registrations.
+  cron.schedule('* * * * *', async () => {
+    await pollScheduledRules().catch((err) => logger.error('pollScheduledRules crashed', { error: (err as Error).message }));
+  });
+  cron.schedule('* * * * *', async () => {
+    await pollScheduledFlows().catch((err) => logger.error('pollScheduledFlows crashed', { error: (err as Error).message }));
+  });
+
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────

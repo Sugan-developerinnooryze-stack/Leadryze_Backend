@@ -2,12 +2,22 @@ import mongoose from 'mongoose';
 import { Ticket } from './ticket.model';
 import { CreateTicketDTO, UpdateTicketDTO } from './ticket.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
+import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
+import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+
+async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
+  if (!status) return;
+  if (!(await isValidStageKey(tenantId, 'ticket', status))) {
+    throw new Error(`"${status}" is not a valid stage for this tenant's Ticket pipeline`);
+  }
+}
 
 export async function listTickets(tenantId: string, opts: ListOptions = {}): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status } = opts;
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (status) filter.ticketStatus = status;
+  if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     filter.$or = [{ subject: re }, { contactName: re }, { description: re }];
@@ -25,19 +35,22 @@ export async function getTicketById(tenantId: string, id: string) {
 }
 
 export async function createTicket(tenantId: string, dto: CreateTicketDTO) {
+  await assertValidStatus(tenantId, dto.ticketStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Ticket.create({ tenantId: tid, ...dto });
+  const created = await Ticket.create({ tenantId: tid, ...dto });
+  void sendOnCreateConfirmation(tenantId, 'ticket', created.toObject()); // fire-and-forget, never throws
+  return created;
 }
 
 export async function updateTicket(tenantId: string, id: string, dto: UpdateTicketDTO) {
+  await assertValidStatus(tenantId, dto.ticketStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
   return Ticket.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: dto }, { new: true }).lean();
 }
 
-export async function deleteTicket(tenantId: string, id: string): Promise<boolean> {
+export async function deleteTicket(tenantId: string, id: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const res = await Ticket.findOneAndDelete({ _id: id, tenantId: tid });
-  return !!res;
+  return Ticket.findOneAndDelete({ _id: id, tenantId: tid }).lean();
 }
 
 export async function getTicketStats(tenantId: string) {

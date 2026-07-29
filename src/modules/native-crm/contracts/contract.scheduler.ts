@@ -2,7 +2,28 @@ import { NativeContract } from './contract.model';
 import { FSSettings } from '../fs-settings/fs-settings.model';
 import { createWorkorder } from '../workorders/workorder.service';
 import { generateWorkordersForVisits } from './contract.service';
+import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { logger } from '../../../utils/logger';
+
+/**
+ * contract.status is tenant-configurable (native-crm/pipeline-config), so a
+ * hardcoded {status:'active'} Mongo filter can no longer identify "active"
+ * contracts across every tenant — each tenant may have renamed that stage.
+ * This resolves and caches each tenant's own "active" key once per run so
+ * the per-document check below stays correct after any rename.
+ */
+function makeActiveKeyResolver() {
+  const cache = new Map<string, Promise<string>>();
+  return (tenantId: string): Promise<string> => {
+    const key = String(tenantId);
+    let p = cache.get(key);
+    if (!p) {
+      p = getOutcomeStageKey(key, 'contract', 'active', 'active');
+      cache.set(key, p);
+    }
+    return p;
+  };
+}
 
 type RecurringUnit = 'day' | 'week' | 'fortnight' | 'month' | 'bimonthly' | 'quarter' | 'halfyear' | 'year' | 'custom';
 
@@ -27,14 +48,20 @@ export function calcNextServiceDate(from: Date, unit: RecurringUnit, interval?: 
  * for planned visits inside their lead window (on visit day, or N days before).
  */
 async function runVisitScheduler(today: Date): Promise<void> {
+  // status:'active' is resolved per-tenant below, not filtered here — see
+  // makeActiveKeyResolver().
   const dueContracts = await NativeContract.find({
-    status: 'active',
     woGenerationMode: { $in: ['on_visit_day', 'days_before'] },
     'visits.status': 'planned',
-  }).select('_id tenantId contractId woGenerationMode woLeadDays visits').lean();
+  }).select('_id tenantId contractId status woGenerationMode woLeadDays visits').lean();
+
+  const resolveActiveKey = makeActiveKeyResolver();
 
   for (const contract of dueContracts) {
     try {
+      const activeKey = await resolveActiveKey(String(contract.tenantId));
+      if (contract.status !== activeKey) continue;
+
       const settings = await FSSettings.findOne({ tenantId: contract.tenantId }).lean();
       if (!settings?.autoGenerateWorkOrders) continue;
 
@@ -76,10 +103,18 @@ export async function runContractScheduler(): Promise<void> {
     logger.error('Contract visit scheduler crashed', { error: (err as Error).message }));
 
   try {
-    const dueContracts = await NativeContract.find({
-      status: 'active',
+    // status:'active' is resolved per-tenant below, not filtered here — see
+    // makeActiveKeyResolver().
+    const candidates = await NativeContract.find({
       nextServiceDate: { $lte: today },
     }).lean();
+
+    const resolveActiveKey = makeActiveKeyResolver();
+    const dueContracts: typeof candidates = [];
+    for (const contract of candidates) {
+      const activeKey = await resolveActiveKey(String(contract.tenantId));
+      if (contract.status === activeKey) dueContracts.push(contract);
+    }
 
     if (dueContracts.length === 0) {
       logger.info('Contract scheduler: no contracts due today');
@@ -93,6 +128,7 @@ export async function runContractScheduler(): Promise<void> {
         const settings = await FSSettings.findOne({ tenantId: contract.tenantId }).lean();
         if (!settings?.autoGenerateWorkOrders) continue;
 
+        const woScheduledKey = await getOutcomeStageKey(String(contract.tenantId), 'workorder', 'scheduled', 'scheduled');
         await createWorkorder({
           tenantId:      contract.tenantId,
           customerId:    contract.customerId,
@@ -103,7 +139,7 @@ export async function runContractScheduler(): Promise<void> {
           staffId:       (contract as any).staffId,
           teamId:        (contract as any).teamId,
           scheduledDate: contract.nextServiceDate,
-          status:        'scheduled',
+          status:        woScheduledKey,
           priority:      'medium',
           createdBy:     'system',
         });

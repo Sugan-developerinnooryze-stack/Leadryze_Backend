@@ -41,8 +41,10 @@ export interface IWorkorderDoc extends Document {
   durationHours?: number;
   services:       IServiceLine[];
   parts:          IPartLine[];
+  discount?:      number;
+  gstPercentage?: number;
   priority:       'low' | 'medium' | 'high';
-  status:         'draft' | 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
+  status:         string;
   notes?:               string;
   termsAndConditions?:  string;
   checklists:           IChecklist[];
@@ -103,14 +105,17 @@ const schema = new Schema<IWorkorderDoc>(
     durationHours:{ type: Number, min: 0 },
     services:     { type: [serviceLineSchema], default: [] },
     parts:        { type: [partLineSchema], default: [] },
+    discount:      { type: Number, min: 0, default: 0 },
+    gstPercentage: { type: Number, min: 0, default: 0 },
     priority: {
       type:    String,
       enum:    ['low', 'medium', 'high'],
       default: 'medium',
     },
+    // Stage validity is enforced at the service layer against the tenant's
+    // own configured pipeline (native-crm/pipeline-config), not a fixed enum.
     status: {
       type:    String,
-      enum:    ['draft', 'scheduled', 'in_progress', 'completed', 'cancelled'],
       default: 'draft',
     },
     notes:              { type: String },

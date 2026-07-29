@@ -1,7 +1,10 @@
 import { z } from 'zod';
 import { customFields } from '../../../utils/common.schemas';
 
-const statusEnum   = z.enum(['new','contacted','qualified','meeting_scheduled','proposal_sent','negotiation','won','lost','on_hold','disqualified']);
+// Stage keys are tenant-configurable (native-crm/pipeline-config), so this is
+// no longer a fixed enum — validity against the tenant's own stage list is
+// checked at the service layer instead.
+const statusSchema = z.string().trim().min(1);
 const sourceEnum   = z.enum(['website','landing_page','chatbot','whatsapp','facebook','google','manual','csv','api','referral','other']);
 const ratingEnum   = z.enum(['hot','warm','cold']);
 const priorityEnum = z.enum(['high','medium','low']);
@@ -34,12 +37,13 @@ export const createLeadSchema = z.object({
   country:    z.string().trim().optional(),
   postalCode: z.string().trim().optional(),
 
-  status:   statusEnum.optional(),
+  status:   statusSchema.optional(),
   source:   sourceEnum.optional(),
   rating:   ratingEnum.optional(),
   score:    z.number().min(0).max(100).optional(),
   priority: priorityEnum.optional(),
   leadOwner: z.string().optional(),
+  leadOwnerStaffId: z.string().optional(),
 
   expectedRevenue:   z.number().optional(),
   expectedCloseDate: z.string().optional(),
@@ -69,5 +73,5 @@ export const createLeadSchema = z.object({
 export const updateLeadSchema = createLeadSchema.partial();
 
 export const updateStageSchema = z.object({
-  status: statusEnum,
+  status: statusSchema,
 });
