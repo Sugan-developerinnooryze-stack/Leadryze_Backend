@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { NativeCustomer } from '../native-crm/customers/customer.model';
 import { Contact } from '../native-crm/contacts/contact.model';
+import { Lead } from '../native-crm/leads/lead.model';
 import { decrypt, isEncrypted } from '../../utils/crypto';
 
 export interface Recipient { email?: string; phone?: string; name: string; }
@@ -32,6 +33,13 @@ export async function resolveRecipient(tenantId: string, relatedModule: string, 
     const email = (c.email && isEncrypted(c.email) ? decrypt(c.email) : c.email) ?? undefined;
     const phone = (c.phone && isEncrypted(c.phone) ? decrypt(c.phone) : c.phone) ?? undefined;
     return { email, phone, name: `${c.firstName ?? ''} ${c.lastName ?? ''}`.trim() || 'there' };
+  }
+  if (relatedModule === 'lead') {
+    const l = await Lead.findOne({ _id: relatedId, tenantId: tid }).lean();
+    if (!l) return null;
+    const email = (l.email && isEncrypted(l.email) ? decrypt(l.email) : l.email) ?? undefined;
+    const phone = (l.phone && isEncrypted(l.phone) ? decrypt(l.phone) : l.phone) ?? undefined;
+    return { email, phone, name: `${l.firstName ?? ''} ${l.lastName ?? ''}`.trim() || 'there' };
   }
   return null;
 }

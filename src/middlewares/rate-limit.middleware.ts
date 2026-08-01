@@ -47,3 +47,22 @@ export const webhookRateLimit = rateLimit({
     sendError(res, 'Webhook rate limit exceeded', 429);
   },
 });
+
+/** Keyed by widgetKey (falling back to IP if somehow absent), not just IP —
+ * layered on TOP of globalRateLimit (which already applies to every route,
+ * IP-keyed), not instead of it. Reasoning: many visitors chatting through
+ * one tenant's widget from behind a single office NAT shouldn't
+ * collectively exhaust a budget meant to bound ONE tenant's traffic, and a
+ * single abusive script hitting many different tenants' widgetKeys from one
+ * IP is still caught by the existing IP-keyed globalRateLimit underneath. */
+export const widgetRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.query.widgetKey as string | undefined) || req.ip || 'unknown',
+  handler: (req, res) => {
+    logRateLimitViolation(req);
+    sendError(res, 'Too many requests — please try again shortly', 429);
+  },
+});

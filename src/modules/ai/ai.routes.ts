@@ -45,7 +45,10 @@ router.post('/chat', async (req: AuthRequest, res: Response, next: NextFunction)
     const response = await axios.post(
       `${AI_URL}/api/chat`,
       { ...req.body, tenantId: req.tenantId },
-      { headers: aiHeaders, timeout: 70000 }
+      // Raised from 70s: the tool-calling loop (up to 3 rounds, each
+      // possibly needing a primary+fallback retry) legitimately needs more
+      // room than a single plain completion did when 70s was chosen.
+      { headers: aiHeaders, timeout: 100000 }
     );
     sendSuccess(res, response.data.data, 'AI response generated');
   } catch (err) {
@@ -65,8 +68,12 @@ router.post('/chat', async (req: AuthRequest, res: Response, next: NextFunction)
  */
 router.post('/knowledge', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // Was posting to `${AI_URL}/api/knowledge` — the AI service has no such
+    // route (it's `/api/knowledge/ingest`), so this call 404'd every time.
+    // Pre-existing, unrelated to this pass — fixed here since this file is
+    // already being extended with the crawl proxy routes below.
     const response = await axios.post(
-      `${AI_URL}/api/knowledge`,
+      `${AI_URL}/api/knowledge/ingest`,
       { ...req.body, tenantId: req.tenantId },
       { headers: aiHeaders, timeout: 60000 }
     );
@@ -76,11 +83,48 @@ router.post('/knowledge', async (req: AuthRequest, res: Response, next: NextFunc
   }
 });
 
-router.get('/knowledge/search', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/knowledge/search', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const response = await axios.get(`${AI_URL}/api/knowledge/search`, {
+    // Was a GET reading req.query, but the AI service's /knowledge/search is
+    // a POST reading req.body — also pre-existing and also fixed here; the
+    // frontend's KnowledgePage already calls this as a POST, so this actually
+    // makes that existing UI feature work correctly for the first time.
+    const response = await axios.post(
+      `${AI_URL}/api/knowledge/search`,
+      { ...req.body, tenantId: req.tenantId },
+      { headers: aiHeaders, timeout: 15000 }
+    );
+    sendSuccess(res, response.data.data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * @swagger
+ * /ai/knowledge/crawl:
+ *   post:
+ *     tags: [AI]
+ *     summary: Crawl the tenant's own website and ingest its pages into the RAG knowledge base
+ */
+router.post('/knowledge/crawl', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const response = await axios.post(
+      `${AI_URL}/api/knowledge/crawl`,
+      { ...req.body, tenantId: req.tenantId },
+      { headers: aiHeaders, timeout: 15000 }
+    );
+    sendSuccess(res, response.data.data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/knowledge/crawl-status', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const response = await axios.get(`${AI_URL}/api/knowledge/crawl-status`, {
       headers: aiHeaders,
-      params: { tenantId: req.tenantId, ...req.query },
+      params: { tenantId: req.tenantId },
     });
     sendSuccess(res, response.data.data);
   } catch (err) {

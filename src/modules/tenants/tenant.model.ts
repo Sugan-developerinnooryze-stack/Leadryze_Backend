@@ -112,6 +112,61 @@ export interface ITenant extends Document {
     language: string;
     fallbackToHuman: boolean;
     agentName?: string;
+    /** Monthly token budget for the public widget's AI/LLM replies.
+     * Undefined = fall back to a plan-tier default (see ai/src/services/
+     * context.builder.ts) rather than being unlimited — an explicit value
+     * here is a per-tenant override for a custom deal. Never applies to the
+     * internal, staff-authenticated assistant (a different, unmetered
+     * surface — see isPublicVisitor in base.agent.ts). */
+    monthlyTokenLimit?: number;
+  };
+  /** Public embeddable chatbot widget — a tenant installs one <script> tag on
+   * THEIR OWN website; an anonymous visitor's browser talks only to the
+   * backend (never directly to the AI microservice or Mongo), resolved via
+   * `widgetKey` rather than a JWT. Deliberately separate from
+   * `featureFlags.bot_enabled` (which gates the INTERNAL, staff-authenticated
+   * AI chat) — these gate two different surfaces and must stay independently
+   * toggleable. Reuses the existing `branding`/`aiConfig` fields above for
+   * the widget's own theming/persona — no duplication needed there. */
+  widget: {
+    enabled: boolean;
+    /** "wgt_" + 32 hex chars — server-generated only (regenerateWidgetKey()),
+     * NEVER accepted from the generic tenant-update payload (see
+     * updateTenant()'s own dot-notation write, which deliberately never
+     * includes this key). Safe to embed in a client's public page source —
+     * it only identifies WHICH tenant, unlike the AI service's own internal
+     * API key, which grants access to every tenant if leaked. */
+    widgetKey?: string;
+    /** Bare hostnames only (no scheme/port/path), lowercase — e.g.
+     * "example.com", "www.example.com". Exact match only in this pass, no
+     * subdomain wildcarding. */
+    allowedDomains: string[];
+    greeting?: string;
+    /** Round-robin assignment scope for a Lead captured via this widget —
+     * null/absent means rotate across every active staff member tenant-wide. */
+    defaultTeamId?: mongoose.Types.ObjectId | null;
+    /** The tenant's own public website — crawled (manually, via "Crawl Now")
+     * into the RAG knowledge base so the widget can answer questions about
+     * that specific site's own content. lastCrawledAt/crawlPageCount are
+     * status fields, not user-editable config. */
+    websiteUrl?: string;
+    lastCrawledAt?: Date;
+    crawlPageCount?: number;
+    /** Real booking, tenant-wide business hours only in this pass — no
+     * per-staff calendars/schedules exist anywhere in this codebase, and no
+     * calendar-sync integration (Google/Outlook) is built. A booked slot is
+     * simply any slot in these hours not already occupied by another
+     * scheduled Meeting; round-robin still decides WHICH staff member gets
+     * assigned, same as lead capture already does — this doesn't add a
+     * second, competing assignment mechanism. */
+    booking?: {
+      enabled: boolean;
+      timezone: string;
+      slotMinutes: number;
+      leadTimeHours: number;
+      horizonDays: number;
+      hours: Array<{ day: 0 | 1 | 2 | 3 | 4 | 5 | 6; start: string; end: string }>;
+    };
   };
 }
 
@@ -174,6 +229,38 @@ const tenantSchema = new Schema<ITenant>(
       language: { type: String, default: 'en' },
       fallbackToHuman: { type: Boolean, default: true },
       agentName: String,
+      monthlyTokenLimit: Number,
+    },
+    widget: {
+      enabled:        { type: Boolean, default: false },
+      widgetKey:      { type: String, unique: true, sparse: true, index: true },
+      allowedDomains: { type: [String], default: [] },
+      greeting:       String,
+      defaultTeamId:  { type: Schema.Types.ObjectId, ref: 'NativeTeam', default: null },
+      websiteUrl:     String,
+      lastCrawledAt:  Date,
+      crawlPageCount: Number,
+      booking: {
+        enabled:       { type: Boolean, default: false },
+        timezone:      { type: String, default: 'UTC' },
+        slotMinutes:   { type: Number, default: 30 },
+        leadTimeHours: { type: Number, default: 2 },
+        horizonDays:   { type: Number, default: 14 },
+        hours: {
+          type: [{
+            day:   { type: Number, min: 0, max: 6 },
+            start: { type: String },
+            end:   { type: String },
+          }],
+          default: [
+            { day: 1, start: '09:00', end: '17:00' },
+            { day: 2, start: '09:00', end: '17:00' },
+            { day: 3, start: '09:00', end: '17:00' },
+            { day: 4, start: '09:00', end: '17:00' },
+            { day: 5, start: '09:00', end: '17:00' },
+          ],
+        },
+      },
     },
   },
   { timestamps: true }

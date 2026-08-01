@@ -66,6 +66,10 @@ const SKIP_MODULES = new Set([
   'fs-counts', 'stats', 'native-logs', 'timeline', 'pdf',
   'record-lock', 'workflow-templates', 'custom-form-templates',
   'custom-fields', 'custom-templates', 'fs-settings',
+  // lead-capture IS its own audit trail (see LeadCapture's own doc comment)
+  // — logging it a second time into this generic log would be pure noise,
+  // same reasoning 'timeline' above is already skipped for.
+  'lead-capture',
 ]);
 
 const SENSITIVE_KEYS = new Set(['password', 'token', 'secret', 'apiKey', 'accessToken', 'refreshToken']);

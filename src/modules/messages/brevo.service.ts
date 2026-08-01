@@ -125,6 +125,19 @@ export function buildBookingConfirmationEmail(
   };
 }
 
+/** Real, side-effect-free reachability check — reads account info rather
+ * than sending anything. Used by /admin/system/health so "Brevo" means
+ * "actually reachable right now," not just "an API key is set". */
+export async function checkBrevoHealth(): Promise<boolean> {
+  if (!config.brevo.apiKey) return false;
+  try {
+    await axios.get(`${BREVO_API}/account`, { headers: headers(), timeout: 4000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Legacy class-based API (kept for backward compatibility)
 export class BrevoService {
   async sendEmail(to: string, subject: string, htmlContent: string): Promise<boolean> {

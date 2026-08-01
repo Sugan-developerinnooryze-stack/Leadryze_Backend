@@ -15,6 +15,10 @@ import { config } from '../../config';
 import mongoose from 'mongoose';
 import { UserSession } from '../auth/user-session.model';
 import { AuditLog, logAuditEvent } from '../logs/audit-log.model';
+import { checkBrevoHealth } from '../messages/brevo.service';
+import { checkTwilioHealth } from '../messages/twilio.service';
+import { ChatSession } from '../bot/chat-session.model';
+import { attachAiActionTrace } from '../bot/chat-trace.util';
 
 const router = Router();
 
@@ -230,9 +234,12 @@ router.get('/system/health', async (_req, res, next) => {
     // MongoDB
     const mongoOk = mongoose.connection.readyState === 1;
 
-    // AI service ping — capture response body for key statuses
+    // AI service ping — capture response body for key statuses + its own
+    // already-computed live checks (Qdrant reachability lives here, not a
+    // new check on the backend side — the AI service already pings it).
     let aiOk = false;
     let aiKeys: Record<string, boolean | string> = {};
+    let aiChecks: Record<string, 'ok' | 'degraded'> = {};
     try {
       const aiRes = await axios.get(`${config.app.aiServiceUrl}/health/detail`, {
         timeout: 4000,
@@ -240,7 +247,13 @@ router.get('/system/health', async (_req, res, next) => {
       });
       aiOk = true;
       if (aiRes.data?.keys) aiKeys = aiRes.data.keys;
+      if (aiRes.data?.checks) aiChecks = aiRes.data.checks;
     } catch { /* offline */ }
+    const qdrantOk = aiChecks.qdrant === 'ok';
+
+    // Brevo/Twilio — real, side-effect-free reachability pings, not just
+    // "is the API key set" (which the apiKeys list below already shows).
+    const [brevoOk, twilioOk] = await Promise.all([checkBrevoHealth(), checkTwilioHealth()]);
 
     // Redis — always do a live ping rather than relying on startup flag
     let redisOk = false;
@@ -266,6 +279,9 @@ router.get('/system/health', async (_req, res, next) => {
       { name: 'MongoDB',    status: mongoOk ? 'ok' : 'error', detail: mongoOk ? 'Connected' : 'Disconnected' },
       { name: 'Redis',      status: redisOk ? 'ok' : 'error', detail: redisDetail },
       { name: 'AI Service', status: aiOk    ? 'ok' : 'error', detail: aiOk ? 'Reachable' : `Unreachable at ${config.app.aiServiceUrl}` },
+      { name: 'Qdrant',     status: qdrantOk ? 'ok' : 'error', detail: aiOk ? (qdrantOk ? 'Reachable' : 'Unreachable') : 'Unknown (AI service offline)' },
+      { name: 'Brevo',      status: brevoOk  ? 'ok' : 'error', detail: brevoOk  ? 'Reachable' : (config.brevo.apiKey ? 'Unreachable' : 'Not configured') },
+      { name: 'Twilio',     status: twilioOk ? 'ok' : 'error', detail: twilioOk ? 'Reachable' : (config.twilio.accountSid ? 'Unreachable' : 'Not configured') },
     ];
 
     // Determine which providers are active from AI service response
@@ -458,6 +474,132 @@ router.get('/system/key-stats', async (_req, res, next) => {
     }
 
     sendSuccess(res, { usage }, 'Key usage stats fetched');
+  } catch (err) { next(err); }
+});
+
+// GET /admin/ai-usage — per-tenant LLM token/cost/quota breakdown, built on the
+// tenant-scoped AiTokenUsage collection (populated by the AI service after every
+// real LLM call — see ai/src/agents/base.agent.ts's trackAiTokenUsage call).
+router.get('/ai-usage', async (_req, res, next) => {
+  try {
+    const { AiTokenUsage } = await import('./ai-token-usage.model');
+
+    const now = new Date();
+    const monthStart = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`;
+
+    const [tenants, usageRows] = await Promise.all([
+      Tenant.find({ isActive: true }).select('name plan aiConfig.monthlyTokenLimit').lean(),
+      AiTokenUsage.aggregate([
+        { $match: { date: { $gte: monthStart } } },
+        {
+          $group: {
+            _id: '$tenantId',
+            totalTokens: { $sum: '$totalTokens' },
+            estimatedCostUsd: { $sum: '$estimatedCostUsd' },
+            requestCount: { $sum: '$requestCount' },
+            moderationFallbackCount: { $sum: '$moderationFallbackCount' },
+          },
+        },
+      ]),
+    ]);
+
+    const usageByTenant = new Map(usageRows.map((r: any) => [String(r._id), r]));
+
+    // Mirrors ai/src/services/context.builder.ts's DEFAULT_MONTHLY_TOKEN_LIMITS —
+    // the two services don't share code, so this is kept in sync manually.
+    const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
+      starter: 300_000,
+      professional: 1_500_000,
+      enterprise: 8_000_000,
+    };
+
+    const rows = tenants
+      .map((t: any) => {
+        const usageRow = usageByTenant.get(String(t._id));
+        const monthlyTokenLimit =
+          t.aiConfig?.monthlyTokenLimit ?? DEFAULT_MONTHLY_TOKEN_LIMITS[t.plan] ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter;
+        const tokensUsedThisMonth = usageRow?.totalTokens ?? 0;
+        return {
+          tenantId: String(t._id),
+          tenantName: t.name,
+          plan: t.plan,
+          monthlyTokenLimit,
+          tokensUsedThisMonth,
+          percentUsed: monthlyTokenLimit > 0 ? tokensUsedThisMonth / monthlyTokenLimit : 0,
+          estimatedCostUsd: usageRow?.estimatedCostUsd ?? 0,
+          requestCount: usageRow?.requestCount ?? 0,
+          moderationFallbackCount: usageRow?.moderationFallbackCount ?? 0,
+        };
+      })
+      .sort((a, b) => b.percentUsed - a.percentUsed);
+
+    sendSuccess(res, { tenants: rows }, 'AI usage fetched');
+  } catch (err) { next(err); }
+});
+
+// GET /admin/conversations — paginated, filterable list across all tenants,
+// built entirely on the existing ChatSession collection (already stores the
+// full transcript per session) — no new tracking, purely a read layer.
+router.get('/conversations', async (req: AuthRequest, res, next) => {
+  try {
+    const page = Number(req.query.page ?? 1);
+    const limit = Number(req.query.limit ?? 20);
+    const filter: any = {};
+    if (req.query.tenantId) filter.tenantId = req.query.tenantId;
+    if (req.query.escalated === 'true') filter.escalated = true;
+    if (req.query.escalated === 'false') filter.escalated = false;
+    if (req.query.channel) filter.channel = req.query.channel;
+
+    const [sessions, total] = await Promise.all([
+      ChatSession.find(filter)
+        .sort({ updatedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .populate('tenantId', 'name')
+        .lean(),
+      ChatSession.countDocuments(filter),
+    ]);
+
+    const items = sessions.map((s: any) => ({
+      sessionId: s.sessionId,
+      tenantId: s.tenantId?._id ?? s.tenantId,
+      tenantName: s.tenantId?.name ?? 'Unknown',
+      visitorName: s.visitorName,
+      visitorEmail: s.visitorEmail,
+      visitorPhone: s.visitorPhone,
+      channel: s.channel,
+      escalated: s.escalated,
+      messageCount: s.messages?.length ?? 0,
+      lastActivityAt: s.updatedAt,
+    }));
+
+    sendSuccess(res, { items, total, page, totalPages: Math.ceil(total / limit) });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/conversations/:sessionId — full transcript + per-turn AI trace
+// (see attachAiActionTrace in ../bot/chat-trace.util for the matching logic —
+// shared with the tenant-facing Chat History panel at /bot/chat-history/:sessionId).
+router.get('/conversations/:sessionId', async (req: AuthRequest, res, next) => {
+  try {
+    const { sessionId } = req.params;
+    const session = await ChatSession.findOne({ sessionId }).populate('tenantId', 'name').lean();
+    if (!session) { sendError(res, 'Conversation not found', 404); return; }
+
+    const messages = await attachAiActionTrace(session.sessionId, session.messages || []);
+
+    const tenantRef = session.tenantId as any;
+    sendSuccess(res, {
+      sessionId: session.sessionId,
+      tenantId: tenantRef?._id ?? tenantRef,
+      tenantName: tenantRef?.name ?? 'Unknown',
+      visitorName: session.visitorName,
+      visitorEmail: session.visitorEmail,
+      visitorPhone: session.visitorPhone,
+      channel: session.channel,
+      escalated: session.escalated,
+      messages,
+    });
   } catch (err) { next(err); }
 });
 

@@ -39,3 +39,11 @@ export async function deleteTenant(req: AuthRequest, res: Response, next: NextFu
     sendSuccess(res, null, 'Tenant deactivated');
   } catch (err) { next(err); }
 }
+
+export async function regenerateWidgetKey(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const tenant = await tenantService.regenerateWidgetKey(req.params.id);
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, { widgetKey: tenant.widget?.widgetKey }, 'Widget key regenerated');
+  } catch (err) { next(err); }
+}

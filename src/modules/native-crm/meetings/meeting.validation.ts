@@ -15,7 +15,7 @@ export const createMeetingSchema = z.object({
   // trio must accept '' as a real, savable value — that's how the frontend
   // clears a previously-set link via $set; transforming '' to undefined would
   // make Mongoose silently drop it from $set, leaving the stale link in place.
-  relatedModule: z.union([z.enum(['contact','company','deal','customer','quotation','workorder','contract']), z.literal('')]).optional(),
+  relatedModule: z.union([z.enum(['contact','company','deal','customer','quotation','workorder','contract','lead']), z.literal('')]).optional(),
   relatedId:     z.string().trim().optional(),
   relatedLabel:  z.string().trim().optional(),
   customFields,

@@ -23,6 +23,7 @@ import connectorRoutes from './modules/connectors/connector.routes';
 import analyticsRoutes from './modules/analytics/analytics.routes';
 import webhookRoutes from './modules/webhooks/webhook.routes';
 import automationWebhookRoutes from './modules/native-crm/automation-webhooks/automation-webhook.routes';
+import publicWidgetRoutes from './modules/public-widget/public-widget.routes';
 import notificationRoutes from './modules/notifications/notification.routes';
 import aiRoutes from './modules/ai/ai.routes';
 import adminRoutes from './modules/admin/admin.routes';
@@ -69,14 +70,32 @@ const allowedOrigins = [
   ...(config.app.env !== 'production' ? ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173'] : []),
 ].filter(Boolean) as string[];
 
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-tenant-id', 'X-Branch-Id'],
-  })
-);
+const fixedOriginCors = cors({
+  origin: allowedOrigins,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-tenant-id', 'X-Branch-Id'],
+});
+
+// The public widget module has its own tenant-aware, dynamic CORS handling
+// (public-widget.controller.ts's applyCorsHeader()/preflight() — origin is
+// checked against THAT tenant's own widget.allowedDomains, resolved from the
+// widgetKey in the request). It must never be intercepted by this
+// fixed-allowlist middleware, which only knows the first-party frontend's
+// own dev ports. Found via live-fire testing: the `cors` package terminates
+// an OPTIONS preflight itself by default (`preflightContinue` defaults to
+// false) — without this exemption, the widget's own preflight handler was
+// provably unreachable for any real tenant website's origin, only the
+// hardcoded frontend ports ever passed. A POST (the widget's /chat call)
+// always triggers a real preflight (JSON body), so this was silently
+// breaking every real cross-origin widget conversation while GET /config
+// (a "simple request", no preflight) happened to keep working — which is
+// exactly why this went unnoticed until a genuinely third-party test origin
+// was used.
+app.use((req, res, next) => {
+  if (req.path.startsWith(`/api/${config.app.apiVersion}/public/widget`)) { next(); return; }
+  fixedOriginCors(req, res, next);
+});
 
 const morganFormat = ':method :url :status :res[content-length]b - :response-time ms';
 app.use(morgan(morganFormat, { stream: { write: (msg) => logger.http(msg.trim()) } }));
@@ -105,6 +124,13 @@ if (config.app.env !== 'production') {
 // Static file serving for uploaded assets
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
+// The widget's own client script (leadryze-widget/'s build output, deployed
+// here) — served publicly, cached briefly. Not app-wide CORS-gated like
+// everything else in this file; a plain <script src="..."> tag load is
+// never subject to CORS in the first place (only the widget's own fetch()
+// calls to /public/widget/* are, handled by that module's own dynamic CORS).
+app.use('/widget', express.static(path.join(process.cwd(), 'public/widget'), { maxAge: '1h' }));
+
 // Health check
 app.get('/health', (_req, res) =>
   res.json({
@@ -126,6 +152,7 @@ app.use(`${V}/connectors`, connectorRoutes);
 app.use(`${V}/analytics`, analyticsRoutes);
 app.use(`${V}/webhooks`, webhookRoutes);
 app.use(`${V}/automation-webhooks`, automationWebhookRoutes); // public, unauthenticated — Webhook Trigger's entry point, deliberately outside /native-crm's own auth middleware
+app.use(`${V}/public/widget`, publicWidgetRoutes); // public, unauthenticated — the AI chatbot widget's entry point, own dynamic per-tenant CORS (see public-widget.routes.ts's own comment)
 app.use(`${V}/notifications`, notificationRoutes);
 app.use(`${V}/ai`, aiRoutes);
 app.use(`${V}/admin`, adminRoutes);

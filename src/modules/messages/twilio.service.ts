@@ -69,3 +69,16 @@ export function buildBookingConfirmationSms(customerName: string, dateTime: stri
 export function buildReminderSms(customerName: string, dateTime: string, details: string): string {
   return `Reminder: Hi ${customerName}, your appointment is tomorrow at ${dateTime} for ${details}. See you then! — LeadRyze AI`;
 }
+
+/** Real, side-effect-free reachability check — reads account info rather
+ * than sending anything. Used by /admin/system/health so "Twilio" means
+ * "actually reachable right now," not just "an API key is set". */
+export async function checkTwilioHealth(): Promise<boolean> {
+  if (!config.twilio.accountSid || !config.twilio.authToken) return false;
+  try {
+    await axios.get(`${TWILIO_API}/Accounts/${config.twilio.accountSid}.json`, { headers: authHeader(), timeout: 4000 });
+    return true;
+  } catch {
+    return false;
+  }
+}

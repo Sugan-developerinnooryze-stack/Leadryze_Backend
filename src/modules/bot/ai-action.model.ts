@@ -9,7 +9,8 @@ export type AIActionType =
   | 'escalation'    // AI escalated to human agent
   | 'email_sent'    // AI triggered an email
   | 'error'         // AI encountered an error
-  | 'general';      // General chat response
+  | 'general'       // General chat response
+  | 'tool_call';    // Public widget invoked one or more real tools (see metadata.toolCalls)
 
 export interface IAIAction extends Document {
   tenantId: mongoose.Types.ObjectId;
@@ -27,6 +28,11 @@ export interface IAIAction extends Document {
     leadEmail?: string;
     leadPhone?: string;
     errorMessage?: string;
+    toolCalls?: Array<{ name: string; ok: boolean; ms: number }>;
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+    estimatedCostUsd?: number;
   };
   createdAt: Date;
 }
@@ -40,7 +46,7 @@ const aiActionSchema = new Schema<IAIAction>(
       enum: ['crm_query', 'crm_filter', 'crm_search', 'lead_capture',
              'knowledge_query', 'escalation', 'email_sent', 'error', 'general',
              'schedule_meeting', 'reschedule_meeting', 'cancel_meeting',
-             'send_email', 'send_sms', 'meeting_reminder'],
+             'send_email', 'send_sms', 'meeting_reminder', 'tool_call'],
       default: 'general',
     },
     summary:     { type: String, required: true },

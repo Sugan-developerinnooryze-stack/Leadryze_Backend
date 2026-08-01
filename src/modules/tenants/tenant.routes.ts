@@ -41,6 +41,7 @@ router.post('/', authorize('SUPER_ADMIN'), controller.createTenant);
 router.get('/', authorize('SUPER_ADMIN'), controller.getTenants);
 router.get('/:id', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.getTenant);
 router.put('/:id', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.updateTenant);
+router.post('/:id/widget/regenerate-key', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.regenerateWidgetKey);
 router.delete('/:id', authorize('SUPER_ADMIN'), controller.deleteTenant);
 
 export default router;

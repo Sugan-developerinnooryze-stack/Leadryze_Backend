@@ -7,6 +7,7 @@ import { sendSuccess, sendError } from '../../utils/response';
 import { QnAPair } from './qna.model';
 import { AIAction } from './ai-action.model';
 import { ChatSession } from './chat-session.model';
+import { attachAiActionTrace } from './chat-trace.util';
 import { handleCrmChat } from './crm-chat';
 
 const router = Router();
@@ -73,12 +74,16 @@ router.get('/chat-history', async (req: AuthRequest, res: Response, next: NextFu
   } catch (err) { next(err); }
 });
 
-// GET /api/v1/bot/chat-history/:sessionId — single session detail
+// GET /api/v1/bot/chat-history/:sessionId — single session detail, each
+// assistant message enriched with its AI trace (source/confidence/tokens/
+// cost/tool calls) via the same correlation logic the Super Admin
+// Conversation Inspector uses — see attachAiActionTrace.
 router.get('/chat-history/:sessionId', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const session = await ChatSession.findOne({ sessionId: req.params.sessionId, tenantId: req.tenantId });
+    const session = await ChatSession.findOne({ sessionId: req.params.sessionId, tenantId: req.tenantId }).lean();
     if (!session) { sendError(res, 'Not found', 404); return; }
-    sendSuccess(res, session);
+    const messages = await attachAiActionTrace(session.sessionId, session.messages || []);
+    sendSuccess(res, { ...session, messages });
   } catch (err) { next(err); }
 });
 

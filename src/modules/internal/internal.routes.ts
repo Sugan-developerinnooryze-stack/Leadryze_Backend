@@ -17,6 +17,16 @@ import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { Activity } from '../activities/activity.model';
 import { AutomationRun } from '../automation/automation-run.model';
+import { captureLeadFromExternalSource } from '../native-crm/lead-capture/lead-capture.service';
+import { assignRoundRobin } from '../native-crm/staffs/round-robin.service';
+import { computeAvailableSlots, isSlotFree } from '../native-crm/meetings/availability.service';
+import { createMeeting } from '../native-crm/meetings/meeting.service';
+import { claimWidgetSession, resolveWidgetSessionClaim, releaseWidgetSessionClaim } from './widget-session-claim.service';
+import { trackAiTokenUsage, getTenantTokenUsageThisMonth } from '../admin/ai-token-usage.model';
+import {
+  searchCatalogItems, getCatalogItemBySku, upsertCatalogItemFromSource,
+  startKnowledgeSourceSync, finishKnowledgeSourceSync,
+} from '../native-crm/catalog/catalog-item.service';
 
 const router = Router();
 
@@ -780,6 +790,221 @@ router.post('/seed-templates/:tenantId', async (req: Request, res: Response, nex
   } catch (err) { next(err); }
 });
 
+/**
+ * POST /api/internal/widget-lead-capture
+ *
+ * The AI widget's own lead-capture call — reuses the SAME
+ * captureLeadFromExternalSource() the browser extension already calls
+ * (via its own authenticated HTTP route), just called in-process here since
+ * there's no real staff JWT for an anonymous public visitor. Round-robin
+ * assigns a staff owner BEFORE capture; an idempotency guard keyed on
+ * (tenantId, platform:'chatbot', sessionId) stops a retried/duplicate call
+ * for the same conversation from ever creating a second Lead.
+ */
+router.post('/widget-lead-capture', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, sessionId, visitorId, sourceUrl, firstName, lastName, email, phone, company } = req.body as {
+      tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
+      firstName: string; lastName?: string; email?: string; phone?: string; company?: string;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !sessionId || !firstName) {
+      sendError(res, 'tenantId, sessionId, firstName are required', 400);
+      return;
+    }
+    const tid = new mongoose.Types.ObjectId(tenantId);
+
+    // Atomic claim — a plain findOne-then-create check here was confirmed
+    // racy under real concurrent load (10 simultaneous calls for the same
+    // sessionId produced 10 Leads instead of 1); see widget-session-claim
+    // model/service for why this specific pattern is safe under a race.
+    const claim = await claimWidgetSession(tenantId, sessionId, 'lead');
+    if (!claim.claimed) {
+      if (claim.outcome?.status === 'done') {
+        sendSuccess(res, { ...claim.outcome.result, alreadyCreated: true }, 'Lead already created for this session');
+      } else {
+        sendError(res, 'Lead capture for this session is already in progress — please retry shortly', 409);
+      }
+      return;
+    }
+
+    const tenant = await Tenant.findById(tid).select('widget').lean();
+    const assigned = await assignRoundRobin(
+      tenantId,
+      tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
+    );
+
+    const { capture, lead } = await captureLeadFromExternalSource(
+      tenantId, null, 'system:ai-widget', 'ai-widget@leadryze.internal',
+      {
+        platform: 'chatbot',
+        sourceUrl: sourceUrl || 'widget-chat',
+        raw: { sessionId, visitorId, firstName, lastName, email, phone, company },
+        assignedStaffId: assigned?.staffId,
+        assignedStaffName: assigned?.staffName,
+      },
+    );
+
+    if (!lead) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'lead');
+      sendError(res, capture.failureReason || 'Could not create a lead from the captured fields', 422);
+      return;
+    }
+    const result = { leadId: lead._id, leadDisplayId: lead.leadId };
+    await resolveWidgetSessionClaim(tenantId, sessionId, 'lead', result);
+    sendSuccess(res, result, 'Lead created');
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/widget-crawl-complete
+ *
+ * Called by the AI service once a website crawl finishes — records
+ * lastCrawledAt/crawlPageCount onto the tenant's widget config. These two
+ * fields are deliberately absent from updateTenant()'s client-editable field
+ * allow-list; this internal, service-key-gated route is the only path that
+ * can set them, since the AI service (which actually ran the crawl) is the
+ * source of truth for what happened, not whatever a client claims.
+ */
+router.post('/widget-crawl-complete', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, pagesCrawled } = req.body as { tenantId: string; pagesCrawled: number };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || typeof pagesCrawled !== 'number') {
+      sendError(res, 'tenantId and pagesCrawled are required', 400);
+      return;
+    }
+    await Tenant.findByIdAndUpdate(tenantId, {
+      $set: { 'widget.lastCrawledAt': new Date(), 'widget.crawlPageCount': pagesCrawled },
+    });
+    sendSuccess(res, null, 'Crawl result recorded');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/widget-availability
+ *
+ * Tenant-wide business-hours availability for the widget's booking tool —
+ * see availability.service.ts for the single-capacity model this uses (no
+ * per-staff calendars exist anywhere in this codebase).
+ */
+router.get('/widget-availability', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, days, timeOfDay } = req.query as { tenantId: string; days?: string; timeOfDay?: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'tenantId is required', 400);
+      return;
+    }
+    const slots = await computeAvailableSlots(tenantId, {
+      days: days ? parseInt(days, 10) : undefined,
+      timeOfDay: (timeOfDay as 'morning' | 'afternoon' | 'any') || undefined,
+    });
+    sendSuccess(res, { slots });
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/widget-book-meeting
+ *
+ * Converts an offered slot into a real booking: re-checks the slot is still
+ * free, round-robin-assigns a staff owner, creates/reuses a Lead via the
+ * SAME captureLeadFromExternalSource() the plain widget-lead-capture route
+ * uses (so a booking visitor gets exactly one Lead, not two), then creates a
+ * real Meeting linked to it. Idempotent per session, same convention as
+ * widget-lead-capture: a session that already has a completed booking gets
+ * back its existing meeting rather than creating a second one.
+ */
+router.post('/widget-book-meeting', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const {
+      tenantId, sessionId, visitorId, sourceUrl, startIso, endIso, firstName, lastName, email, phone, topic,
+    } = req.body as {
+      tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
+      startIso: string; endIso: string; firstName: string; lastName?: string; email?: string; phone?: string; topic?: string;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !sessionId || !startIso || !endIso || !firstName) {
+      sendError(res, 'tenantId, sessionId, startIso, endIso, firstName are required', 400);
+      return;
+    }
+    const tid = new mongoose.Types.ObjectId(tenantId);
+
+    // Atomic claim — same race confirmed live for widget-lead-capture applies
+    // here too (a plain findOne-then-create check lets N concurrent requests
+    // for the identical session all pass before any of them finishes); see
+    // widget-session-claim model/service.
+    const claim = await claimWidgetSession(tenantId, sessionId, 'meeting');
+    if (!claim.claimed) {
+      if (claim.outcome?.status === 'done') {
+        sendSuccess(res, { ...claim.outcome.result, alreadyCreated: true }, 'Meeting already booked for this session');
+      } else {
+        sendError(res, 'This booking is already in progress — please retry shortly', 409);
+      }
+      return;
+    }
+
+    const free = await isSlotFree(tenantId, startIso, endIso);
+    if (!free) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
+      sendError(res, 'That time is no longer available — please pick another slot.', 409);
+      return;
+    }
+
+    const tenant = await Tenant.findById(tid).select('widget').lean();
+    const assigned = await assignRoundRobin(
+      tenantId,
+      tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
+    );
+
+    const { capture, lead } = await captureLeadFromExternalSource(
+      tenantId, null, 'system:ai-widget', 'ai-widget@leadryze.internal',
+      {
+        platform: 'chatbot',
+        sourceUrl: sourceUrl || 'widget-chat',
+        raw: { sessionId, visitorId, firstName, lastName, email, phone, topic },
+        assignedStaffId: assigned?.staffId,
+        assignedStaffName: assigned?.staffName,
+      },
+    );
+    if (!lead) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
+      sendError(res, capture.failureReason || 'Could not create a lead for this booking', 422);
+      return;
+    }
+
+    const fullName = `${firstName} ${lastName ?? ''}`.trim();
+    let meeting;
+    try {
+      meeting = await createMeeting(tenantId, {
+        title: `Call with ${fullName}`,
+        startDate: startIso,
+        endDate: endIso,
+        attendees: email ? [email] : undefined,
+        notes: topic ? `Booked via website widget. Topic: ${topic}` : 'Booked via website widget.',
+        relatedModule: 'lead',
+        relatedId: String(lead._id),
+        relatedLabel: fullName,
+        assignedStaffId: assigned?.staffId,
+        assignedStaffName: assigned?.staffName,
+        source: 'widget',
+      });
+    } catch (err: any) {
+      // Duplicate-key on the partial unique index — two requests raced past
+      // the isSlotFree check above for the identical slot. Rare, but a real
+      // possibility under concurrency; the Lead above still exists (harmless,
+      // same as any other captured-but-not-booked lead) — only the meeting
+      // creation itself needs to fail loudly here.
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
+      if (err?.code === 11000) {
+        sendError(res, 'That time was just booked by someone else — please pick another slot.', 409);
+        return;
+      }
+      throw err;
+    }
+
+    const result = { meetingId: meeting._id, startIso, endIso, staffName: assigned?.staffName, leadId: lead._id };
+    await resolveWidgetSessionClaim(tenantId, sessionId, 'meeting', result);
+    sendSuccess(res, result, 'Meeting booked');
+  } catch (err) { next(err); }
+});
+
 /* ── POST /api/internal/ai-action — log an AI action (fire-and-forget from AI service) ── */
 router.post('/ai-action', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -800,6 +1025,122 @@ router.post('/ai-action', async (req: Request, res: Response, next: NextFunction
       metadata: metadata || {},
     });
     sendSuccess(res, null, 'AI action logged');
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/ai-token-usage
+ * Records one turn's worth of LLM token usage/cost against a tenant's
+ * daily-bucketed counter (AiTokenUsage) — fire-and-forget from the AI
+ * service, same non-blocking convention as /logs and /ai-action above.
+ */
+router.post('/ai-token-usage', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, promptTokens, completionTokens, totalTokens, estimatedCostUsd, usedModerationFallback } = req.body as {
+      tenantId: string; promptTokens?: number; completionTokens?: number;
+      totalTokens?: number; estimatedCostUsd?: number; usedModerationFallback?: boolean;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Valid tenantId is required', 400);
+      return;
+    }
+    await trackAiTokenUsage(tenantId, {
+      promptTokens: promptTokens || 0,
+      completionTokens: completionTokens || 0,
+      totalTokens: totalTokens || 0,
+      estimatedCostUsd: estimatedCostUsd || 0,
+      usedModerationFallback,
+    });
+    sendSuccess(res, null, 'Token usage recorded');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/ai-token-usage/:tenantId
+ * Returns the tenant's month-to-date total token usage — the source of
+ * truth checkTenantTokenQuota() in the AI service briefly caches in Redis
+ * (see rate-limiter.ts) rather than calling this on every single message.
+ */
+router.get('/ai-token-usage/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Invalid tenantId', 400);
+      return;
+    }
+    const totalTokens = await getTenantTokenUsageThisMonth(tenantId);
+    sendSuccess(res, { totalTokens });
+  } catch (err) { next(err); }
+});
+
+/**
+ * Product Catalog — internal routes the AI service calls for the
+ * search_products/get_product_details tools and for the website crawler's
+ * JSON-LD → catalog upsert step (see ai/src/rag/website-ingest.service.ts).
+ */
+router.post('/catalog/search', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, query, category, limit } = req.body as {
+      tenantId: string; query?: string; category?: string; limit?: number;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Valid tenantId is required', 400);
+      return;
+    }
+    const items = await searchCatalogItems(tenantId, { query, category, limit });
+    sendSuccess(res, { items });
+  } catch (err) { next(err); }
+});
+
+router.get('/catalog/:tenantId/sku/:sku', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, sku } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Invalid tenantId', 400);
+      return;
+    }
+    const item = await getCatalogItemBySku(tenantId, sku);
+    sendSuccess(res, { item: item || null });
+  } catch (err) { next(err); }
+});
+
+router.post('/catalog/knowledge-source/start', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, type, label } = req.body as { tenantId: string; type: 'website' | 'excel' | 'csv' | 'json'; label: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !type || !label) {
+      sendError(res, 'tenantId, type and label are required', 400);
+      return;
+    }
+    const source = await startKnowledgeSourceSync(tenantId, type, label);
+    sendSuccess(res, { knowledgeSourceId: String(source._id) });
+  } catch (err) { next(err); }
+});
+
+router.post('/catalog/knowledge-source/finish', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { knowledgeSourceId, outcome, durationMs, error } = req.body as {
+      knowledgeSourceId: string; outcome: 'completed' | 'failed'; durationMs: number; error?: string;
+    };
+    if (!knowledgeSourceId || !outcome) {
+      sendError(res, 'knowledgeSourceId and outcome are required', 400);
+      return;
+    }
+    await finishKnowledgeSourceSync(knowledgeSourceId, outcome, durationMs || 0, error);
+    sendSuccess(res, null, 'Knowledge source sync finished');
+  } catch (err) { next(err); }
+});
+
+router.post('/catalog/upsert-from-crawl', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, knowledgeSourceId, sourceUrl, fields } = req.body as {
+      tenantId: string; knowledgeSourceId: string; sourceUrl: string; fields: Record<string, unknown>;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !knowledgeSourceId || !sourceUrl || !fields) {
+      sendError(res, 'tenantId, knowledgeSourceId, sourceUrl and fields are required', 400);
+      return;
+    }
+    const result = await upsertCatalogItemFromSource(tenantId, knowledgeSourceId, 'crawl', { sourceUrl }, fields as any);
+    sendSuccess(res, result);
   } catch (err) { next(err); }
 });
 

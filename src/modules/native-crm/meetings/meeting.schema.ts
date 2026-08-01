@@ -20,13 +20,20 @@ export const meetingSchema = new Schema(
     // — relatedId is the target's Mongo _id (not its human-facing *Id
     // string), matching the same convention already used by
     // lead-conversion/Timeline.
-    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract'] },
+    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract', 'lead'] },
     relatedId:     { type: String, trim: true },
     relatedLabel:  { type: String, trim: true },
     // Guard so the "upcoming meeting" reminder cron never emails/texts twice
     // for the same meeting — same shape as the pre-existing
     // Activity.reminderSentAt.
     reminderSentAt: { type: Date },
+    // Populated only for widget-booked meetings (bookWidgetMeeting()) — the
+    // round-robin-assigned rep and where the booking came from. Optional/
+    // additive, absent on every meeting created through the existing manual
+    // Meeting form or automation engine.
+    assignedStaffId:   { type: String, trim: true },
+    assignedStaffName: { type: String, trim: true },
+    source:            { type: String, enum: ['manual', 'widget'], default: 'manual' },
   },
   { timestamps: true }
 );
@@ -41,3 +48,12 @@ meetingSchema.index({ tenantId: 1 });
 meetingSchema.index({ tenantId: 1, meetingStatus: 1 });
 meetingSchema.index({ tenantId: 1, startDate: 1 });
 meetingSchema.index({ tenantId: 1, relatedModule: 1, relatedId: 1 });
+// Hard guarantee against double-booking the same widget slot under a race
+// (two visitors booking the identical startDate at once) — scoped to
+// scheduled widget bookings only, so staff manually double-booking
+// themselves via the normal Meeting form (a legitimate, common thing) is
+// completely unaffected.
+meetingSchema.index(
+  { tenantId: 1, startDate: 1 },
+  { unique: true, partialFilterExpression: { source: 'widget', meetingStatus: 'scheduled' } }
+);

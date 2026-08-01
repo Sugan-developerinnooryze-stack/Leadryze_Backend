@@ -1,4 +1,4 @@
-export type RelatedModule = 'contact' | 'company' | 'deal' | 'customer' | 'quotation' | 'workorder' | 'contract';
+export type RelatedModule = 'contact' | 'company' | 'deal' | 'customer' | 'quotation' | 'workorder' | 'contract' | 'lead';
 
 export interface IMeeting {
   _id: string;
@@ -15,6 +15,9 @@ export interface IMeeting {
   relatedId?: string;
   relatedLabel?: string;
   createdBy?: string;
+  assignedStaffId?: string;
+  assignedStaffName?: string;
+  source?: 'manual' | 'widget';
   createdAt: Date;
   updatedAt: Date;
 }
@@ -31,6 +34,9 @@ export interface CreateMeetingDTO {
   relatedModule?: RelatedModule;
   relatedId?: string;
   relatedLabel?: string;
+  assignedStaffId?: string;
+  assignedStaffName?: string;
+  source?: 'manual' | 'widget';
 }
 
 export type UpdateMeetingDTO = Partial<CreateMeetingDTO>;
