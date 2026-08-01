@@ -142,6 +142,15 @@ export interface ITenant extends Document {
      * subdomain wildcarding. */
     allowedDomains: string[];
     greeting?: string;
+    /** Server-uploaded via the dedicated logo endpoint only (multipart ->
+     * S3 -> URL saved here) — NEVER accepted from the generic tenant-update
+     * payload, same write-protection precedent as widgetKey, so a tenant
+     * admin can't just paste an arbitrary external image URL in. */
+    logoUrl?: string;
+    /** Which of the widget's built-in visual templates to render — purely a
+     * client-side (leadryze-widget) rendering choice, resolved from
+     * GET /public/widget/config like every other widget-facing field. */
+    template?: 'modern' | 'minimal' | 'chips' | 'dark';
     /** Round-robin assignment scope for a Lead captured via this widget —
      * null/absent means rotate across every active staff member tenant-wide. */
     defaultTeamId?: mongoose.Types.ObjectId | null;
@@ -236,6 +245,8 @@ const tenantSchema = new Schema<ITenant>(
       widgetKey:      { type: String, unique: true, sparse: true, index: true },
       allowedDomains: { type: [String], default: [] },
       greeting:       String,
+      logoUrl:        String,
+      template:       { type: String, enum: ['modern', 'minimal', 'chips', 'dark'], default: 'modern' },
       defaultTeamId:  { type: Schema.Types.ObjectId, ref: 'NativeTeam', default: null },
       websiteUrl:     String,
       lastCrawledAt:  Date,

@@ -55,10 +55,13 @@ export async function getConfig(req: Request, res: Response): Promise<void> {
   sendSuccess(res, {
     companyName:  tenant.branding?.companyName || tenant.name,
     agentName:    tenant.aiConfig?.agentName || 'Assistant',
-    logoUrl:      tenant.branding?.logoUrl,
+    // Widget-specific logo wins if set; falls back to the tenant's general
+    // branding logo, then to no logo at all (widget renders a letter avatar).
+    logoUrl:      tenant.widget?.logoUrl || tenant.branding?.logoUrl,
     primaryColor: tenant.branding?.primaryColor || '#00B8D9',
     greeting:     tenant.widget?.greeting || 'Hi! How can I help you today?',
     language:     tenant.aiConfig?.language || 'en',
+    template:     tenant.widget?.template || 'modern',
   });
 }
 

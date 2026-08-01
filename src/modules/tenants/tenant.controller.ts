@@ -47,3 +47,22 @@ export async function regenerateWidgetKey(req: AuthRequest, res: Response, next:
     sendSuccess(res, { widgetKey: tenant.widget?.widgetKey }, 'Widget key regenerated');
   } catch (err) { next(err); }
 }
+
+export async function uploadWidgetLogo(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    if (!req.file) { sendError(res, 'file is required', 400); return; }
+    const tenant = await tenantService.uploadWidgetLogo(req.params.id, {
+      originalname: req.file.originalname, mimetype: req.file.mimetype, buffer: req.file.buffer,
+    });
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, { logoUrl: tenant.widget?.logoUrl }, 'Widget logo uploaded');
+  } catch (err) { next(err); }
+}
+
+export async function removeWidgetLogo(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const tenant = await tenantService.removeWidgetLogo(req.params.id);
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, null, 'Widget logo removed');
+  } catch (err) { next(err); }
+}

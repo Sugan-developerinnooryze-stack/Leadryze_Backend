@@ -6,6 +6,7 @@ import { Tenant, DEFAULT_FEATURE_FLAGS } from './tenant.model';
 import { sendSuccess, sendError } from '../../utils/response';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { logSecurityEvent } from '../logs/security-event.model';
+import { upload } from '../../middlewares/upload.middleware';
 
 const router = Router();
 
@@ -42,6 +43,8 @@ router.get('/', authorize('SUPER_ADMIN'), controller.getTenants);
 router.get('/:id', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.getTenant);
 router.put('/:id', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.updateTenant);
 router.post('/:id/widget/regenerate-key', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.regenerateWidgetKey);
+router.post('/:id/widget/logo', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, upload.single('file'), controller.uploadWidgetLogo);
+router.delete('/:id/widget/logo', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.removeWidgetLogo);
 router.delete('/:id', authorize('SUPER_ADMIN'), controller.deleteTenant);
 
 export default router;

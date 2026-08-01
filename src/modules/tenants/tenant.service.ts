@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { Tenant, ITenant } from './tenant.model';
 import { parsePagination, buildSkip } from '../../utils/pagination';
+import { uploadToS3, deleteFromS3, keyFromUrl } from '../../services/s3.service';
 
 export async function createTenant(data: Partial<ITenant>): Promise<ITenant> {
   if (!data.slug && data.name) {
@@ -43,7 +44,7 @@ export async function updateTenant(
   const { widget, ...rest } = data as Partial<ITenant> & { widget?: Record<string, unknown> };
   const update: Record<string, unknown> = { ...rest };
   if (widget && typeof widget === 'object') {
-    for (const key of ['enabled', 'allowedDomains', 'greeting', 'defaultTeamId', 'websiteUrl', 'booking']) {
+    for (const key of ['enabled', 'allowedDomains', 'greeting', 'defaultTeamId', 'websiteUrl', 'booking', 'template']) {
       if (widget[key] !== undefined) update[`widget.${key}`] = widget[key];
     }
     // lastCrawledAt/crawlPageCount are deliberately NOT in the allow-list above —
@@ -71,4 +72,48 @@ export async function regenerateWidgetKey(id: string): Promise<ITenant | null> {
   }
   if (!widgetKey) throw new Error('Failed to generate a unique widget key — try again');
   return Tenant.findByIdAndUpdate(id, { $set: { 'widget.widgetKey': widgetKey } }, { new: true });
+}
+
+/** Uploads a new widget logo to S3 and saves its URL — the only way
+ * widget.logoUrl is ever set (see updateTenant()'s allow-list, which
+ * deliberately excludes it, same protection as widgetKey). Best-effort
+ * deletes the tenant's previous logo object from S3 so replacing a logo
+ * doesn't silently accumulate orphaned files. */
+export async function uploadWidgetLogo(
+  id: string,
+  file: { originalname: string; mimetype: string; buffer: Buffer }
+): Promise<ITenant | null> {
+  const existing = await Tenant.findById(id).select('widget.logoUrl').lean();
+  const previousUrl = existing?.widget?.logoUrl;
+
+  const url = await uploadToS3({
+    tenantId: id,
+    folder:   'widget-logo',
+    filename: file.originalname,
+    mimetype: file.mimetype,
+    buffer:   file.buffer,
+  });
+
+  const tenant = await Tenant.findByIdAndUpdate(id, { $set: { 'widget.logoUrl': url } }, { new: true });
+
+  if (previousUrl) {
+    try { await deleteFromS3(keyFromUrl(previousUrl)); } catch { /* best-effort cleanup */ }
+  }
+
+  return tenant;
+}
+
+/** Clears the widget logo (falls back to the letter-avatar in the widget
+ * UI). Best-effort deletes the S3 object. */
+export async function removeWidgetLogo(id: string): Promise<ITenant | null> {
+  const existing = await Tenant.findById(id).select('widget.logoUrl').lean();
+  const previousUrl = existing?.widget?.logoUrl;
+
+  const tenant = await Tenant.findByIdAndUpdate(id, { $unset: { 'widget.logoUrl': '' } }, { new: true });
+
+  if (previousUrl) {
+    try { await deleteFromS3(keyFromUrl(previousUrl)); } catch { /* best-effort cleanup */ }
+  }
+
+  return tenant;
 }
