@@ -11,6 +11,7 @@ export async function listTeams(tenantId: string, opts: TeamListOptions, branchI
 
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.name   = new RegExp(opts.search, 'i');
+  if (opts.showInWidget !== undefined) filter.showInWidget = opts.showInWidget;
 
   const [items, total] = await Promise.all([
     NativeTeam.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),

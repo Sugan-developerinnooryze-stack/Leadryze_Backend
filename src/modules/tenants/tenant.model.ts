@@ -119,6 +119,13 @@ export interface ITenant extends Document {
      * internal, staff-authenticated assistant (a different, unmetered
      * surface — see isPublicVisitor in base.agent.ts). */
     monthlyTokenLimit?: number;
+    /** Which already-integrated LLM provider/model powers RAG/catalog/
+     * booking tool-calling for the public widget specifically — undefined
+     * means "use the global primary/fallback pair" (today's unchanged
+     * default). Never applies to the internal, staff-authenticated
+     * assistant, which has no tools bound today. See ai/src/config/index.ts's
+     * TOOL_MODEL_PRESETS for what each value resolves to. */
+    toolModelPreset?: 'groq' | 'anthropic' | 'openai' | 'google';
   };
   /** Public embeddable chatbot widget — a tenant installs one <script> tag on
    * THEIR OWN website; an anonymous visitor's browser talks only to the
@@ -239,6 +246,7 @@ const tenantSchema = new Schema<ITenant>(
       fallbackToHuman: { type: Boolean, default: true },
       agentName: String,
       monthlyTokenLimit: Number,
+      toolModelPreset: { type: String, enum: ['groq', 'anthropic', 'openai', 'google'] },
     },
     widget: {
       enabled:        { type: Boolean, default: false },

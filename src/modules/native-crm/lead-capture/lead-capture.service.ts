@@ -23,6 +23,7 @@ export function normalizeCaptureRaw(raw: Record<string, any>): INormalizedCaptur
   const phone   = firstNonEmpty(raw.phone, raw.phoneNumber, raw.phone_number, raw.mobile);
   const company = firstNonEmpty(raw.company, raw.companyName, raw.company_name, raw.organization, raw.organization_name);
   const title   = firstNonEmpty(raw.title, raw.jobTitle, raw.job_title, raw.headline, raw.designation);
+  const service = firstNonEmpty(raw.service, raw.interestedService, raw.interested_service, raw.topic);
 
   let firstName = firstNonEmpty(raw.firstName, raw.first_name, raw.firstname);
   let lastName  = firstNonEmpty(raw.lastName, raw.last_name, raw.lastname);
@@ -37,7 +38,7 @@ export function normalizeCaptureRaw(raw: Record<string, any>): INormalizedCaptur
   }
 
   if (!firstName) return null;
-  return { firstName, lastName, email, phone, company, title };
+  return { firstName, lastName, email, phone, company, title, service };
 }
 
 export async function captureLeadFromExternalSource(
@@ -94,6 +95,7 @@ export async function captureLeadFromExternalSource(
     lastActivityAt: new Date(),
     leadOwnerStaffId: input.assignedStaffId,
     leadOwner:        input.assignedStaffName,
+    interestedServices: normalized.service ? [normalized.service] : undefined,
     customFields: {
       _leadCaptureId:   String(capture._id),
       _capturePlatform: input.platform,

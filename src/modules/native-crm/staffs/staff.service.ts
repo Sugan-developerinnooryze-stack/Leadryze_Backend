@@ -34,6 +34,19 @@ export async function getStaffById(id: string, tenantId: string) {
   return NativeStaff.findOne({ _id: id, tenantId: tid }).populate('teamId', 'name');
 }
 
+/** Resolves a staff doc by its business `staffId` string (e.g. "ACME-ST-0002"),
+ * not its Mongo `_id` — nothing else in this codebase does this today. Used
+ * by the department/doctor booking wizard: the widget carries a staffId
+ * string chosen by the visitor, never a raw Mongo id. Only ever returns an
+ * ACTIVE staff member — a stale/deleted/inactive selection resolves to
+ * `null`, letting the caller fail open to round-robin instead of blocking. */
+export async function getActiveStaffByStaffId(tenantId: string, staffId: string) {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  return NativeStaff.findOne({ tenantId: tid, staffId, status: 'active' })
+    .select('staffId firstName lastName teamId')
+    .lean();
+}
+
 export async function createStaff(data: any) {
   const doc = await NativeStaff.create(data);
   // Auto-generate staff-app login credentials — never blocks/breaks creation

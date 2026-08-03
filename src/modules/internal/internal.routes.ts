@@ -19,6 +19,9 @@ import { Activity } from '../activities/activity.model';
 import { AutomationRun } from '../automation/automation-run.model';
 import { captureLeadFromExternalSource } from '../native-crm/lead-capture/lead-capture.service';
 import { assignRoundRobin } from '../native-crm/staffs/round-robin.service';
+import { getActiveStaffByStaffId, listStaffs } from '../native-crm/staffs/staff.service';
+import { listTeams } from '../native-crm/teams/team.service';
+import { NativeTeam } from '../native-crm/teams/team.model';
 import { computeAvailableSlots, isSlotFree } from '../native-crm/meetings/availability.service';
 import { createMeeting } from '../native-crm/meetings/meeting.service';
 import { claimWidgetSession, resolveWidgetSessionClaim, releaseWidgetSessionClaim } from './widget-session-claim.service';
@@ -27,6 +30,7 @@ import {
   searchCatalogItems, getCatalogItemBySku, upsertCatalogItemFromSource,
   startKnowledgeSourceSync, finishKnowledgeSourceSync,
 } from '../native-crm/catalog/catalog-item.service';
+import { getWebsiteProfile, upsertWebsiteProfileFromCrawl } from '../native-crm/catalog/website-profile.service';
 
 const router = Router();
 
@@ -63,7 +67,7 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
 
     const tid = new mongoose.Types.ObjectId(tenantId);
 
-    const [tenant, connectors, recentCustomers, templates, crmModules, customerCounts, qnaPairs] = await Promise.all([
+    const [tenant, connectors, recentCustomers, templates, crmModules, customerCounts, qnaPairs, websiteProfile, hasWidgetDepartments] = await Promise.all([
       Tenant.findById(tid).select('name slug plan settings branding aiConfig'),
 
       Connector.find({ tenantId: tid, isActive: true })
@@ -97,6 +101,10 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
       QnAPair.find({ tenantId: tid, isActive: true })
         .select('question answer category')
         .limit(100),
+
+      getWebsiteProfile(tenantId),
+
+      NativeTeam.exists({ tenantId: tid, showInWidget: true, status: 'active' }),
     ]);
 
     if (!tenant) {
@@ -183,6 +191,15 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
         answer: q.answer,
         category: q.category,
       })),
+      websiteProfile: websiteProfile ? {
+        summary: websiteProfile.summary,
+        services: websiteProfile.services,
+        contact: websiteProfile.contact,
+        hours: websiteProfile.hours,
+        staff: websiteProfile.staff,
+        faqs: websiteProfile.faqs,
+      } : null,
+      hasWidgetDepartments: !!hasWidgetDepartments,
     }, 'Tenant context fetched');
   } catch (err) {
     next(err);
@@ -803,9 +820,9 @@ router.post('/seed-templates/:tenantId', async (req: Request, res: Response, nex
  */
 router.post('/widget-lead-capture', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, sessionId, visitorId, sourceUrl, firstName, lastName, email, phone, company } = req.body as {
+    const { tenantId, sessionId, visitorId, sourceUrl, firstName, lastName, email, phone, company, service } = req.body as {
       tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
-      firstName: string; lastName?: string; email?: string; phone?: string; company?: string;
+      firstName: string; lastName?: string; email?: string; phone?: string; company?: string; service?: string;
     };
     if (!tenantId || !mongoose.isValidObjectId(tenantId) || !sessionId || !firstName) {
       sendError(res, 'tenantId, sessionId, firstName are required', 400);
@@ -838,7 +855,7 @@ router.post('/widget-lead-capture', async (req: Request, res: Response, next: Ne
       {
         platform: 'chatbot',
         sourceUrl: sourceUrl || 'widget-chat',
-        raw: { sessionId, visitorId, firstName, lastName, email, phone, company },
+        raw: { sessionId, visitorId, firstName, lastName, email, phone, company, service },
         assignedStaffId: assigned?.staffId,
         assignedStaffName: assigned?.staffName,
       },
@@ -880,15 +897,56 @@ router.post('/widget-crawl-complete', async (req: Request, res: Response, next: 
 });
 
 /**
+ * GET /api/internal/widget-teams
+ *
+ * Departments a visitor may choose between when booking — only teams a
+ * tenant admin has explicitly marked showInWidget:true, and only active
+ * ones. Empty result means "no departments configured" — the AI reads that
+ * as "proceed straight to availability", not an error.
+ */
+router.get('/widget-teams', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.query as { tenantId: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'tenantId is required', 400);
+      return;
+    }
+    const { items } = await listTeams(tenantId, { status: 'active', showInWidget: true, limit: 100 });
+    sendSuccess(res, { teams: items.map((t: any) => ({ teamId: String(t._id), name: t.name })) });
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/widget-staff?teamId=
+ *
+ * Active staff (doctors) within one department a visitor already chose.
+ */
+router.get('/widget-staff', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, teamId } = req.query as { tenantId: string; teamId: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !teamId || !mongoose.isValidObjectId(teamId)) {
+      sendError(res, 'tenantId and teamId are required', 400);
+      return;
+    }
+    const { items } = await listStaffs(tenantId, { status: 'active', teamId, limit: 100 });
+    sendSuccess(res, {
+      staff: items.map((s: any) => ({ staffId: s.staffId, name: `${s.firstName} ${s.lastName}`.trim() })),
+    });
+  } catch (err) { next(err); }
+});
+
+/**
  * GET /api/internal/widget-availability
  *
  * Tenant-wide business-hours availability for the widget's booking tool —
  * see availability.service.ts for the single-capacity model this uses (no
- * per-staff calendars exist anywhere in this codebase).
+ * per-staff calendars exist anywhere in this codebase). An optional staffId
+ * narrows the capacity check to one doctor's own meetings, for tenants using
+ * the department/doctor booking wizard.
  */
 router.get('/widget-availability', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, days, timeOfDay } = req.query as { tenantId: string; days?: string; timeOfDay?: string };
+    const { tenantId, days, timeOfDay, staffId } = req.query as { tenantId: string; days?: string; timeOfDay?: string; staffId?: string };
     if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
       sendError(res, 'tenantId is required', 400);
       return;
@@ -896,6 +954,7 @@ router.get('/widget-availability', async (req: Request, res: Response, next: Nex
     const slots = await computeAvailableSlots(tenantId, {
       days: days ? parseInt(days, 10) : undefined,
       timeOfDay: (timeOfDay as 'morning' | 'afternoon' | 'any') || undefined,
+      staffId: staffId || undefined,
     });
     sendSuccess(res, { slots });
   } catch (err) { next(err); }
@@ -915,10 +974,11 @@ router.get('/widget-availability', async (req: Request, res: Response, next: Nex
 router.post('/widget-book-meeting', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
-      tenantId, sessionId, visitorId, sourceUrl, startIso, endIso, firstName, lastName, email, phone, topic,
+      tenantId, sessionId, visitorId, sourceUrl, startIso, endIso, firstName, lastName, email, phone, topic, staffId,
     } = req.body as {
       tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
       startIso: string; endIso: string; firstName: string; lastName?: string; email?: string; phone?: string; topic?: string;
+      staffId?: string;
     };
     if (!tenantId || !mongoose.isValidObjectId(tenantId) || !sessionId || !startIso || !endIso || !firstName) {
       sendError(res, 'tenantId, sessionId, startIso, endIso, firstName are required', 400);
@@ -940,18 +1000,29 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
       return;
     }
 
-    const free = await isSlotFree(tenantId, startIso, endIso);
+    // A chosen doctor (department/doctor wizard) resolves to a specific
+    // active staff member and skips round-robin entirely; a stale/deleted/
+    // wrong-tenant staffId falls open to round-robin rather than ever
+    // blocking a booking over a selection that's gone stale.
+    const chosenStaff = staffId ? await getActiveStaffByStaffId(tenantId, staffId) : null;
+
+    const free = await isSlotFree(tenantId, startIso, endIso, chosenStaff?.staffId);
     if (!free) {
       await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
       sendError(res, 'That time is no longer available — please pick another slot.', 409);
       return;
     }
 
-    const tenant = await Tenant.findById(tid).select('widget').lean();
-    const assigned = await assignRoundRobin(
-      tenantId,
-      tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
-    );
+    let assigned: { staffId: string; staffName: string } | null;
+    if (chosenStaff) {
+      assigned = { staffId: chosenStaff.staffId, staffName: `${chosenStaff.firstName} ${chosenStaff.lastName}`.trim() };
+    } else {
+      const tenant = await Tenant.findById(tid).select('widget').lean();
+      assigned = await assignRoundRobin(
+        tenantId,
+        tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
+      );
+    }
 
     const { capture, lead } = await captureLeadFromExternalSource(
       tenantId, null, 'system:ai-widget', 'ai-widget@leadryze.internal',
@@ -1140,6 +1211,25 @@ router.post('/catalog/upsert-from-crawl', async (req: Request, res: Response, ne
       return;
     }
     const result = await upsertCatalogItemFromSource(tenantId, knowledgeSourceId, 'crawl', { sourceUrl }, fields as any);
+    sendSuccess(res, result);
+  } catch (err) { next(err); }
+});
+
+/**
+ * Website Profile — one structured "who we are" document per tenant, built
+ * once per crawl (see ai/src/rag/website-profile-extractor.ts), read back
+ * into every chat turn via the tenant-context response above.
+ */
+router.post('/website-profile/upsert-from-crawl', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, knowledgeSourceId, fields } = req.body as {
+      tenantId: string; knowledgeSourceId: string; fields: Record<string, unknown>;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !knowledgeSourceId || !fields) {
+      sendError(res, 'tenantId, knowledgeSourceId and fields are required', 400);
+      return;
+    }
+    const result = await upsertWebsiteProfileFromCrawl(tenantId, knowledgeSourceId, fields as any);
     sendSuccess(res, result);
   } catch (err) { next(err); }
 });

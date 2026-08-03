@@ -34,14 +34,24 @@ export async function updateTenant(
   id: string,
   data: Partial<ITenant>
 ): Promise<ITenant | null> {
-  // `widget` is handled separately, via dot-notation, for two reasons: (1)
-  // security — widgetKey is server-generated only (regenerateWidgetKey()),
-  // never accepted from this generic update payload, no matter what a
-  // caller sends; (2) correctness — a plain top-level `$set: {widget:{...}}`
-  // would REPLACE the entire embedded subdocument, silently wiping out
-  // whichever widget fields the caller's partial payload didn't happen to
-  // include (e.g. saving just `allowedDomains` would erase `enabled`).
-  const { widget, ...rest } = data as Partial<ITenant> & { widget?: Record<string, unknown> };
+  // `widget` and `aiConfig` are both handled separately, via dot-notation,
+  // for the same correctness reason: a plain top-level `$set: {widget:{...}}`
+  // (or `{aiConfig:{...}}`) would REPLACE the entire embedded subdocument,
+  // silently wiping out whichever fields the caller's partial payload didn't
+  // happen to include (e.g. saving just `allowedDomains` would erase
+  // `enabled`). `widget` additionally has a security reason — widgetKey is
+  // server-generated only (regenerateWidgetKey()), never accepted from this
+  // generic update payload, no matter what a caller sends.
+  //
+  // This was a REAL, live bug for aiConfig specifically until this fix:
+  // confirmed SettingsPage.tsx's own saveAI() already sends a partial
+  // aiConfig ({agentName, language, systemPrompt} only) — every save from
+  // that existing page was silently wiping fallbackToHuman/monthlyTokenLimit
+  // back to their schema defaults before this dot-notation merge existed.
+  const { widget, aiConfig, ...rest } = data as Partial<ITenant> & {
+    widget?: Record<string, unknown>;
+    aiConfig?: Record<string, unknown>;
+  };
   const update: Record<string, unknown> = { ...rest };
   if (widget && typeof widget === 'object') {
     for (const key of ['enabled', 'allowedDomains', 'greeting', 'defaultTeamId', 'websiteUrl', 'booking', 'template']) {
@@ -50,6 +60,11 @@ export async function updateTenant(
     // lastCrawledAt/crawlPageCount are deliberately NOT in the allow-list above —
     // they're status fields written only by recordWebsiteCrawlResult() below,
     // never accepted from the generic tenant-update payload.
+  }
+  if (aiConfig && typeof aiConfig === 'object') {
+    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'toolModelPreset']) {
+      if (aiConfig[key] !== undefined) update[`aiConfig.${key}`] = aiConfig[key];
+    }
   }
   return Tenant.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });
 }

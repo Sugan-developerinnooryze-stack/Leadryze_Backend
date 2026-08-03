@@ -10,6 +10,11 @@ export interface ITeamDoc extends Document {
   name:        string;
   description?: string;
   status:      'active' | 'inactive';
+  /** Opt-in flag for the department/doctor booking wizard — a team must be
+   * explicitly marked before it appears as a bookable department to the
+   * public widget. Staff visibility is implied by team visibility +
+   * status:'active', no separate staff-level flag. */
+  showInWidget?: boolean;
   customFields?: Record<string, any>;
   createdBy?:  string;
   createdAt:   Date;
@@ -26,6 +31,7 @@ const schema = new Schema<ITeamDoc>(
     name:        { type: String, required: true, trim: true },
     description: { type: String, trim: true },
     status:      { type: String, enum: ['active', 'inactive'], default: 'active' },
+    showInWidget: { type: Boolean, default: false },
     customFields: { type: Schema.Types.Mixed, default: {} },
     createdBy:   { type: String },
   },

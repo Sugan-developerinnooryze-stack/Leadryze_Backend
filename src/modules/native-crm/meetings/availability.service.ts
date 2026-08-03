@@ -59,7 +59,7 @@ function formatLabel(date: Date, timeZone: string): string {
  * doesn't add a second, competing assignment concept. */
 export async function computeAvailableSlots(
   tenantId: string,
-  opts: { fromIso?: string; days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; limit?: number } = {}
+  opts: { fromIso?: string; days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; limit?: number; staffId?: string } = {}
 ): Promise<AvailableSlot[]> {
   const tenant = await Tenant.findById(tenantId).select('widget.booking').lean();
   const booking = tenant?.widget?.booking;
@@ -76,12 +76,17 @@ export async function computeAvailableSlots(
 
   // Pull every scheduled meeting inside the whole scan window ONCE, filter
   // candidate slots against it in memory — cheaper than one query per slot.
-  const existing = await Meeting.find({
+  // staffId narrows the capacity check to one doctor's own meetings when the
+  // department/doctor wizard is in use; omitted, this is byte-identical to
+  // the tenant-wide check every tenant without departments already gets.
+  const meetingFilter: Record<string, unknown> = {
     tenantId: new mongoose.Types.ObjectId(tenantId),
     meetingStatus: 'scheduled',
     startDate: { $lt: windowEnd },
     endDate: { $gt: windowStart },
-  }).select('startDate endDate').lean();
+  };
+  if (opts.staffId) meetingFilter.assignedStaffId = opts.staffId;
+  const existing = await Meeting.find(meetingFilter).select('startDate endDate').lean();
 
   const overlaps = (start: Date, end: Date) =>
     existing.some((m) => m.startDate && m.endDate && start < m.endDate && end > m.startDate);

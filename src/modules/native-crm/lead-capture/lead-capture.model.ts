@@ -25,6 +25,9 @@ export interface INormalizedCaptureFields {
   phone?:     string;
   company?:   string;
   title?:     string;
+  /** What they're contacting about / interested in — maps onto
+   * Lead.interestedServices. */
+  service?:   string;
 }
 
 export interface ILeadCaptureDoc extends Document {
@@ -69,6 +72,7 @@ const normalizedSchema = new Schema<INormalizedCaptureFields>(
     phone:     { type: String, trim: true },
     company:   { type: String, trim: true },
     title:     { type: String, trim: true },
+    service:   { type: String, trim: true },
   },
   { _id: false },
 );

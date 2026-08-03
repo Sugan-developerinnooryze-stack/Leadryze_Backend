@@ -53,7 +53,17 @@ meetingSchema.index({ tenantId: 1, relatedModule: 1, relatedId: 1 });
 // scheduled widget bookings only, so staff manually double-booking
 // themselves via the normal Meeting form (a legitimate, common thing) is
 // completely unaffected.
+//
+// Includes assignedStaffId in the key (not just tenantId+startDate) so the
+// department/doctor booking wizard can legitimately book two DIFFERENT
+// doctors at the identical time — every widget booking already sets
+// assignedStaffId via round-robin (with or without departments configured),
+// so this stays a real guarantee rather than a no-op: a tenant with only one
+// active staff member (or zero, the rare case where assignedStaffId is
+// absent on every widget meeting) still collapses back to one shared key per
+// startDate, preserving today's exact tenant-wide protection for tenants not
+// using departments.
 meetingSchema.index(
-  { tenantId: 1, startDate: 1 },
+  { tenantId: 1, assignedStaffId: 1, startDate: 1 },
   { unique: true, partialFilterExpression: { source: 'widget', meetingStatus: 'scheduled' } }
 );

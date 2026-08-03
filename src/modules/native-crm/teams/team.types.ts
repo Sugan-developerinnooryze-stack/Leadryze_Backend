@@ -6,6 +6,7 @@ export interface ITeam {
   name:         string;
   description?: string;
   status:       'active' | 'inactive';
+  showInWidget?: boolean;
   createdBy?:   string;
   createdAt:    string;
   updatedAt:    string;
@@ -16,4 +17,5 @@ export interface TeamListOptions {
   limit?:  number | string;
   search?: string;
   status?: string;
+  showInWidget?: boolean;
 }
