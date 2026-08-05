@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { authenticate } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { resolveBranch } from '../../middlewares/branch.middleware';
+import { resolveDataScopeMiddleware } from './shared/data-scope';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
 
@@ -72,6 +73,7 @@ import mongoose from 'mongoose';
 
 const router = Router();
 router.use(authenticate, requireTenant, resolveBranch);
+router.use(resolveDataScopeMiddleware);
 router.use(nativeCrmLog);
 
 /* ── Native CRM logs ─────────────────────────────────────────────────────── */

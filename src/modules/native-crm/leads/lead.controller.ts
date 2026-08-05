@@ -16,7 +16,6 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
   return (settings as any)?.piiConfig?.find((p: any) => p.module === 'leads')?.viewRoles ?? [];
 }
 import { Lead }            from './lead.model';
-import { NativeCustomer }  from '../customers/customer.model';
 import { NativeTimeline }  from '../timeline/timeline.model';
 import {
   convertLeadToContact,
@@ -26,10 +25,11 @@ import {
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
+import { applyDataScopeToFilter } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listLeads(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listLeads(req.tenantId!, req.query as any, req.branchId, req.dataScope);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'leads', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 50));
@@ -67,7 +67,7 @@ const LEAD_EXPORT_COLUMNS: CsvColumn[] = [
  * can never leak a field the requesting role isn't allowed to see. */
 export async function exportCsv(req: AuthRequest, res: Response) {
   try {
-    const items = await listLeadsForExport(req.tenantId!, req.query as any, req.branchId);
+    const items = await listLeadsForExport(req.tenantId!, req.query as any, req.branchId, req.dataScope);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'leads', req.user!.role, viewRoles) as any[];
 
@@ -89,7 +89,7 @@ export async function exportCsv(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getLeadById(req.params.id, req.tenantId!);
+    const item = await getLeadById(req.params.id, req.tenantId!, req.dataScope);
     if (!item) return sendError(res, 'Lead not found', 404);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     sendSuccess(res, transformPIIResponse(item, 'leads', req.user!.role, viewRoles));
@@ -125,8 +125,8 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const prev = await getLeadRaw(req.params.id, req.tenantId!);
-    const item = await updateLead(req.params.id, req.tenantId!, req.body);
+    const prev = await getLeadRaw(req.params.id, req.tenantId!, req.dataScope);
+    const item = await updateLead(req.params.id, req.tenantId!, req.body, req.dataScope);
     if (!item) return sendError(res, 'Lead not found', 404);
 
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
@@ -162,8 +162,8 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function updateStage(req: AuthRequest, res: Response) {
   try {
-    const prev = await getLeadRaw(req.params.id, req.tenantId!);
-    const item = await updateLeadStage(req.params.id, req.tenantId!, req.body.status);
+    const prev = await getLeadRaw(req.params.id, req.tenantId!, req.dataScope);
+    const item = await updateLeadStage(req.params.id, req.tenantId!, req.body.status, req.dataScope);
     if (!item) return sendError(res, 'Lead not found', 404);
 
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
@@ -189,7 +189,7 @@ export async function updateStage(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteLead(req.params.id, req.tenantId!);
+    const item = await deleteLead(req.params.id, req.tenantId!, req.dataScope);
     if (!item) return sendError(res, 'Lead not found', 404);
     runAutomationsOnDelete(req.tenantId!, 'lead', item.toObject()).catch(() => {});
     sendSuccess(res, null, 'Deleted successfully');
@@ -201,13 +201,15 @@ export async function remove(req: AuthRequest, res: Response) {
 export async function stats(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
+    const matchFilter: Record<string, unknown> = { tenantId: tid };
+    applyDataScopeToFilter(matchFilter, req.dataScope, 'leadOwnerStaffId');
     const [pipeline, total, converted] = await Promise.all([
       Lead.aggregate([
-        { $match: { tenantId: tid } },
+        { $match: matchFilter },
         { $group: { _id: '$status', count: { $sum: 1 }, revenue: { $sum: '$expectedRevenue' } } },
       ]),
-      Lead.countDocuments({ tenantId: tid }),
-      Lead.countDocuments({ tenantId: tid, isConverted: true }),
+      Lead.countDocuments(matchFilter),
+      Lead.countDocuments({ ...matchFilter, isConverted: true }),
     ]);
     const totalRevenue    = (pipeline as any[]).reduce((s: number, p: any) => s + (p.revenue ?? 0), 0);
     const conversionRate  = total > 0 ? Math.round((converted / total) * 100) : 0;
@@ -249,7 +251,7 @@ export async function convertToCustomer(req: AuthRequest, res: Response) {
 
 export async function getConversions(req: AuthRequest, res: Response) {
   try {
-    const lead = await getLeadById(req.params.id, req.tenantId!);
+    const lead = await getLeadById(req.params.id, req.tenantId!, req.dataScope);
     if (!lead) return sendError(res, 'Lead not found', 404);
     sendSuccess(res, (lead as any).conversionHistory ?? []);
   } catch (err: any) {
@@ -257,52 +259,18 @@ export async function getConversions(req: AuthRequest, res: Response) {
   }
 }
 
+/** Same canonical path as convertToCustomer below — this route used to have
+ * its own separate, incomplete inline implementation (set the Lead's stage
+ * to "won" but never recorded the Customer's back-references, while the
+ * dedicated /:id/convert/customer route did the reverse). Now a thin
+ * wrapper delegating to the one, fixed convertLeadToCustomerSvc — kept as
+ * its own exported controller function only because lead.routes.ts still
+ * exposes this legacy path separately from /:id/convert/customer. */
 export async function convertLead(req: AuthRequest, res: Response) {
   try {
-    const tid  = new mongoose.Types.ObjectId(req.tenantId!);
-    const lead = await getLeadRaw(req.params.id, req.tenantId!);
-    if (!lead) return sendError(res, 'Lead not found', 404);
-    if (lead.isConverted) return sendError(res, 'Lead is already converted', 400);
-
-    const customer = await NativeCustomer.create({
-      tenantId:    tid,
-      name:        [lead.firstName, lead.lastName].filter(Boolean).join(' '),
-      company:     lead.company,
-      designation: lead.designation,
-      email:       lead.email,
-      phone:       lead.phone,
-      mobile:      lead.mobile,
-      website:     lead.website,
-      address:     lead.address,
-      city:        lead.city,
-      state:       lead.state,
-      country:     lead.country,
-      postcode:    lead.postalCode,
-      notes:       `Converted from Lead ${lead.leadId}`,
-      tags:        lead.tags ?? [],
-      status:      'active',
-      createdBy:   req.user?.userId,
-    });
-
-    lead.isConverted         = true;
-    lead.convertedCustomerId = customer.customerId;
-    lead.convertedAt         = new Date();
-    lead.status              = await getOutcomeStageKey(req.tenantId!, 'lead', 'won', 'won');
-    lead.lastActivityAt      = new Date();
-    await lead.save();
-
-    await NativeTimeline.create({
-      tenantId:     tid,
-      entityModule: 'leads',
-      entityId:     lead._id.toString(),
-      action:       'status_changed',
-      description:  `Lead converted to Customer ${customer.customerId}`,
-      performedBy:  req.user?.userId,
-      metadata:     { customerId: customer.customerId, customerObjectId: customer._id },
-    });
-
-    runAutomations(req.tenantId!, 'lead', lead.toObject(), lead.status).catch(() => {});
-    sendSuccess(res, { lead, customer });
+    const tid = new mongoose.Types.ObjectId(req.tenantId!);
+    const result = await convertLeadToCustomerSvc(tid, req.params.id, req.user?.userId ?? '');
+    sendSuccess(res, result);
   } catch (err: any) {
     sendError(res, err.message, 400);
   }

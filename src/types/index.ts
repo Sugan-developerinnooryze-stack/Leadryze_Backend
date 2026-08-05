@@ -13,10 +13,30 @@ export interface JwtPayload {
   exp?:     number;
 }
 
+/** Row-level data-scoping decision for the 5 modules that opt into it
+ * (leads/meetings/customers/teams/staffs) — set once per request by
+ * native-crm/shared/data-scope.ts's resolveDataScope middleware, additive
+ * alongside (not a replacement for) the existing branchId scoping. */
+export interface DataScope {
+  kind: 'all' | 'team' | 'self';
+  /** Populated for 'team' (every staffId across every team this MANAGER
+   * manages) and for 'self' (a single-entry array with the requester's own
+   * linked staffId) — empty for 'all', and empty for 'self' when the
+   * requester has no linked Staff profile (deliberately matches nothing,
+   * never falls back to showing everything). */
+  staffIds: string[];
+  /** Which NativeTeam _ids this scope covers — 'team' (MANAGER): every team
+   * they manage; 'self' (AGENT): the single team their own linked Staff
+   * profile belongs to, if any. Used only by the Teams list's own scoping
+   * (Leads/Meetings/Customers/Staffs all key off staffIds instead). */
+  teamIds: string[];
+}
+
 export interface AuthRequest extends Request {
   user?: JwtPayload;
   tenantId?: string;
   branchId?: string;
+  dataScope?: DataScope;
 }
 
 export interface ApiResponse<T = unknown> {

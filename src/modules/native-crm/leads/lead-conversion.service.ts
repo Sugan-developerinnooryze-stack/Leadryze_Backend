@@ -4,6 +4,9 @@ import { Contact }        from '../contacts/contact.model';
 import { Deal }           from '../deals/deal.model';
 import { NativeCustomer } from '../customers/customer.model';
 import { logTimeline }    from '../timeline/timeline.service';
+import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { autoLockIfConfigured } from '../record-lock/record-lock.service';
+import { runAutomations } from '../automation-rules/automation-rule.service';
 
 const CONTACT_SOURCE_MAP: Record<string, string> = {
   website: 'website', referral: 'referral', social: 'social',
@@ -126,15 +129,33 @@ export async function convertLeadToCustomer(
     status:      'active',
     leadId:      lead._id.toString(),
     opportunityId: lead.opportunityId ?? '',
+    // Auto-carries the Lead's own owner forward so the new Customer starts
+    // out correctly scoped for the same Manager/Agent who already had this
+    // Lead in their filtered view — not required, a Customer created some
+    // other way just has no owner until one is explicitly set.
+    assignedStaffId: lead.leadOwnerStaffId,
     createdBy:   performedBy,
   });
 
+  // The single, canonical conversion path — also moves the Lead's own
+  // pipeline stage to "won" and fires the exact same side effects (auto-lock
+  // if configured, automation rules) the dedicated PATCH .../stage endpoint
+  // already produces for a manual drag-to-Won, so a full conversion behaves
+  // identically from a side-effects standpoint either way. Previously this
+  // was a separate, incomplete implementation (lead.controller.ts's own
+  // convertLead()) that set the stage but never these back-references —
+  // that duplicate now delegates here instead of re-implementing any of it.
+  const wonKey = await getOutcomeStageKey(tenantId.toString(), 'lead', 'won', 'won');
   lead.isConverted         = true;
   lead.convertedCustomerId = customer.customerId;
   lead.convertedAt         = new Date();
+  lead.status              = wonKey;
   lead.lastActivityAt      = new Date();
   (lead.conversionHistory as any[]).push({ type: 'customer', entityId: customer._id.toString(), name: customer.name, createdAt: new Date(), createdBy: performedBy });
   await lead.save();
+
+  autoLockIfConfigured(tenantId.toString(), 'leads', lead._id.toString(), wonKey, performedBy).catch(() => {});
+  runAutomations(tenantId.toString(), 'lead', lead.toObject(), wonKey).catch(() => {});
 
   logTimeline(tenantId, 'leads', lead._id.toString(), 'status_changed',
     `Converted to Customer: ${customer.customerId}`, performedBy,

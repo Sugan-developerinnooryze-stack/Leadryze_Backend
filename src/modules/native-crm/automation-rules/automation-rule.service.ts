@@ -12,6 +12,7 @@ import { sendSmsNow } from '../../messages/twilio.service';
 import { sendWhatsAppNow } from '../../messages/whatsapp.service';
 import { NativeCustomer } from '../customers/customer.model';
 import { NativeStaff } from '../staffs/staff.model';
+import { NativeTeam } from '../teams/team.model';
 import { User } from '../../auth/auth.model';
 import { CustomModuleDef, CustomRecord } from '../../custom-modules/custom-module.model';
 import { listCustomFields } from '../custom-fields/custom-field.service';
@@ -345,9 +346,26 @@ export async function resolveAutomationRecipient(
   }
 
   if (strategy === 'manager') {
-    // Same shape as tenant_admin, one level down the hierarchy (Approval
-    // node's own "notify a Manager" case) — arbitrary pick if multiple
-    // MANAGER users exist, same simplification tenant_admin already made.
+    // Team-aware first: the record's own assigned staff -> that staff's
+    // team -> that team's manager, when the whole chain resolves. Falls
+    // back to today's arbitrary tenant-wide pick (same shape as
+    // tenant_admin, one level down the hierarchy — Approval node's own
+    // "notify a Manager" case) whenever any link in that chain is missing —
+    // fully backward-compatible for any tenant that never sets a
+    // NativeTeam.managerUserId anywhere.
+    const staffId = record.staffId || record.staffIds?.[0] || record.leadOwnerStaffId || record.assignedStaffId;
+    if (staffId) {
+      const staff = await NativeStaff.findOne({ tenantId: tid, staffId }).select('teamId').lean();
+      if (staff?.teamId) {
+        const team = await NativeTeam.findOne({ tenantId: tid, _id: staff.teamId }).select('managerUserId').lean();
+        if (team?.managerUserId) {
+          const teamManager = await User.findOne({ _id: team.managerUserId, tenantId: tid, isActive: true }).lean();
+          if (teamManager) {
+            return { email: teamManager.email, phone: undefined, name: `${teamManager.firstName ?? ''} ${teamManager.lastName ?? ''}`.trim() || 'there' };
+          }
+        }
+      }
+    }
     const manager = await User.findOne({ tenantId: tid, role: 'MANAGER', isActive: true }).lean();
     if (!manager) return null;
     return { email: manager.email, phone: undefined, name: `${manager.firstName ?? ''} ${manager.lastName ?? ''}`.trim() || 'there' };

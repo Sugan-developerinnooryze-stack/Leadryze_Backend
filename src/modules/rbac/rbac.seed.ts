@@ -139,6 +139,16 @@ const AGENT_PERMISSIONS = [
   'native_crm.leads.view',    'native_crm.leads.create',
   'native_crm.tasks.view',    'native_crm.tasks.create',    'native_crm.tasks.edit',
   'native_crm.meetings.view', 'native_crm.calendar.view',
+  // Added when native_crm.leads/meetings/fs.customers/fs.teams/fs.staffs
+  // permission checks were first actually wired up on their routes — this
+  // one, specifically, mirrors the legacy 'customers.view' grant just above
+  // (the same concept, the native-crm Customers module) so an existing
+  // Agent isn't unexpectedly locked out of a Customer view they already had
+  // access to under the old, unenforced grant. fs.teams.*/fs.staffs.* are
+  // deliberately NOT added here — those were never granted to Agents even
+  // before enforcement existed, so this is enforcement catching up to
+  // already-expressed intent, not a new restriction.
+  'fs.customers.view',
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────

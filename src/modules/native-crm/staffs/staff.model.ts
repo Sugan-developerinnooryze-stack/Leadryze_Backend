@@ -14,6 +14,14 @@ export interface IStaffDoc extends Document {
   phone?:     string;
   teamId?:    mongoose.Types.ObjectId;
   role?:      string;
+  /** Optional link to the login User this Staff profile also corresponds
+   * to — e.g. a doctor who ALSO logs into the CRM back office as an Agent.
+   * Never required: a Staff record with no linked User (the common,
+   * mobile-app-only case) is completely unaffected by anything that reads
+   * this field. Distinct from the Staff's own separate mobile-app
+   * credentials (appUsername/appPasswordHash below) — this is about the
+   * main platform's User/RBAC login, not the mobile app's. */
+  userId?:    mongoose.Types.ObjectId | null;
   status:     'active' | 'inactive' | 'onleave';
   skills?:    string[];
   location?:  { lat: number; lng: number; updatedAt: Date };
@@ -41,6 +49,7 @@ const schema = new Schema<IStaffDoc>(
     email:     { type: String, trim: true, lowercase: true },
     phone:     { type: String, trim: true },
     teamId:    { type: Schema.Types.ObjectId, ref: 'NativeTeam' },
+    userId:    { type: Schema.Types.ObjectId, ref: 'User', default: null },
     role:      { type: String, trim: true },
     status:    { type: String, enum: ['active', 'inactive', 'onleave'], default: 'active' },
     skills:    [{ type: String }],
@@ -86,6 +95,16 @@ schema.index({ tenantId: 1, teamId: 1 });
 schema.index(
   { tenantId: 1, appUsername: 1 },
   { unique: true, partialFilterExpression: { appUsername: { $type: 'string' } } }
+);
+// At most one Staff profile per linked User — partial (not schema-level
+// sparse) so it correctly excludes null/undefined, matching this codebase's
+// own established fix for the exact same sparse-vs-partial pitfall found
+// earlier in the Product Catalog task (a plain sparse index still indexes
+// explicit nulls, which would collide the moment a second unlinked Staff
+// record was created).
+schema.index(
+  { tenantId: 1, userId: 1 },
+  { unique: true, partialFilterExpression: { userId: { $type: 'objectId' } } }
 );
 
 export const NativeStaff = mongoose.model<IStaffDoc>(

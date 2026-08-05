@@ -5,7 +5,7 @@ import { listTeams, getTeamById, createTeam, updateTeam, deleteTeam } from './te
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listTeams(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listTeams(req.tenantId!, req.query as any, req.branchId, req.dataScope);
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) {
     sendError(res, err.message, 500);

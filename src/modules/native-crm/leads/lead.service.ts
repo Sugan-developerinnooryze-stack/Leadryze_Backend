@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 import { Lead } from './lead.model';
 import { LeadListOptions } from './lead.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -10,10 +12,11 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: string | null): Record<string, any> {
+function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope): Record<string, any> {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
 
   if (opts.status)     filter.status   = opts.status;
   if (opts.source)     filter.source   = opts.source;
@@ -33,10 +36,10 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
   return filter;
 }
 
-export async function listLeads(tenantId: string, opts: LeadListOptions, branchId?: string | null) {
+export async function listLeads(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope) {
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 50);
-  const filter = buildLeadFilter(tenantId, opts, branchId);
+  const filter = buildLeadFilter(tenantId, opts, branchId, scope);
 
   const [items, total] = await Promise.all([
     Lead.find(filter)
@@ -51,14 +54,16 @@ export async function listLeads(tenantId: string, opts: LeadListOptions, branchI
 
 /** Same filters as listLeads, no pagination — for CSV export, which must
  * return every matching record rather than one page of results. */
-export async function listLeadsForExport(tenantId: string, opts: LeadListOptions, branchId?: string | null) {
-  const filter = buildLeadFilter(tenantId, opts, branchId);
+export async function listLeadsForExport(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope) {
+  const filter = buildLeadFilter(tenantId, opts, branchId, scope);
   return Lead.find(filter).sort({ lastActivityAt: -1, createdAt: -1 }).lean();
 }
 
-export async function getLeadById(id: string, tenantId: string) {
+export async function getLeadById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Lead.findOne({ $or: [{ _id: mongoose.isValidObjectId(id) ? id : null }, { leadId: id }], tenantId: tid });
+  const filter: any = { $or: [{ _id: mongoose.isValidObjectId(id) ? id : null }, { leadId: id }], tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  return Lead.findOne(filter);
 }
 
 export async function createLead(data: any) {
@@ -66,32 +71,40 @@ export async function createLead(data: any) {
   return Lead.create(data);
 }
 
-export async function updateLead(id: string, tenantId: string, data: any) {
+export async function updateLead(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
   return Lead.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     { ...data, lastActivityAt: new Date() },
     { new: true, runValidators: true }
   );
 }
 
-export async function updateLeadStage(id: string, tenantId: string, status: string) {
+export async function updateLeadStage(id: string, tenantId: string, status: string, scope?: DataScope) {
   await assertValidStatus(tenantId, status);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
   return Lead.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     { status, lastActivityAt: new Date() },
     { new: true }
   );
 }
 
-export async function deleteLead(id: string, tenantId: string) {
+export async function deleteLead(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Lead.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  return Lead.findOneAndDelete(filter);
 }
 
-export async function getLeadRaw(id: string, tenantId: string) {
+export async function getLeadRaw(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Lead.findOne({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  return Lead.findOne(filter);
 }

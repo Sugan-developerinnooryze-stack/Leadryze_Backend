@@ -18,7 +18,7 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listCustomers(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listCustomers(req.tenantId!, req.query as any, req.branchId, req.dataScope);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'customers', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 20));
@@ -29,7 +29,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getCustomerById(req.params.id, req.tenantId!);
+    const item = await getCustomerById(req.params.id, req.tenantId!, req.dataScope);
     if (!item) return sendError(res, 'Customer not found', 404);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     sendSuccess(res, transformPIIResponse(item, 'customers', req.user!.role, viewRoles));
@@ -54,7 +54,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateCustomer(req.params.id, req.tenantId!, req.body);
+    const item = await updateCustomer(req.params.id, req.tenantId!, req.body, req.dataScope);
     if (!item) return sendError(res, 'Customer not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -64,7 +64,7 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteCustomer(req.params.id, req.tenantId!);
+    const item = await deleteCustomer(req.params.id, req.tenantId!, req.dataScope);
     if (!item) return sendError(res, 'Customer not found', 404);
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

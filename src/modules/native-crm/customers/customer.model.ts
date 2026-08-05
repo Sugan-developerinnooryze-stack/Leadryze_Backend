@@ -32,6 +32,13 @@ export interface ICustomerDoc extends Document {
   createdBy?:     string;
   leadId?:        string;
   opportunityId?: string;
+  /** NativeStaff.staffId of whoever owns this customer — used for
+   * role-based data scoping (a Manager/Agent's filtered Customers view).
+   * Auto-populated from the source Lead's leadOwnerStaffId on conversion;
+   * editable afterward like any other field. No field existed here before
+   * this was added — a Customer created directly (not via conversion) has
+   * no owner until one is explicitly set. */
+  assignedStaffId?: string;
   isLocked?:    boolean;
   lockedAt?:    Date;
   lockedBy?:    string;
@@ -79,6 +86,7 @@ const schema = new Schema<ICustomerDoc>(
     createdBy:     { type: String },
     leadId:        { type: String },
     opportunityId: { type: String },
+    assignedStaffId: { type: String, index: true },
     isLocked:    { type: Boolean, default: false, index: true },
     lockedAt:    { type: Date },
     lockedBy:    { type: String },

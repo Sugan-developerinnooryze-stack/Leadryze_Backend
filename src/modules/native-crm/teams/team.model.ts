@@ -15,6 +15,14 @@ export interface ITeamDoc extends Document {
    * public widget. Staff visibility is implied by team visibility +
    * status:'active', no separate staff-level flag. */
   showInWidget?: boolean;
+  /** The login User who manages this team — optional; a team with none set
+   * has no manager-level data scoping and automation's 'manager' recipient
+   * strategy falls back to its existing arbitrary tenant-wide pick. */
+  managerUserId?: mongoose.Types.ObjectId | null;
+  /** Which NativeService entries this team handles — used to route a
+   * chatbot-captured free-text service mention to the right team's
+   * round-robin roster instead of the tenant's single default team. */
+  serviceIds?: mongoose.Types.ObjectId[];
   customFields?: Record<string, any>;
   createdBy?:  string;
   createdAt:   Date;
@@ -32,6 +40,8 @@ const schema = new Schema<ITeamDoc>(
     description: { type: String, trim: true },
     status:      { type: String, enum: ['active', 'inactive'], default: 'active' },
     showInWidget: { type: Boolean, default: false },
+    managerUserId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    serviceIds:  [{ type: Schema.Types.ObjectId, ref: 'NativeService' }],
     customFields: { type: Schema.Types.Mixed, default: {} },
     createdBy:   { type: String },
   },
@@ -54,6 +64,7 @@ schema.pre('save', async function (next) {
 
 schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
+schema.index({ tenantId: 1, managerUserId: 1 });
 
 export const NativeTeam = mongoose.model<ITeamDoc>(
   'NativeTeam',

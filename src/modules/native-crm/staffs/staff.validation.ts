@@ -7,6 +7,7 @@ export const createStaffSchema = z.object({
   email:     z.string().trim().email().optional().or(z.literal('')),
   phone:     z.string().trim().optional(),
   teamId:    optionalObjectId,
+  userId:    optionalObjectId.nullable(),
   role:      z.string().trim().optional(),
   status:    z.enum(['active','inactive','onleave']).optional(),
   customFields,

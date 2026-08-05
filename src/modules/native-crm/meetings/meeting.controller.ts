@@ -9,14 +9,14 @@ export async function list(req: AuthRequest, res: Response) {
     const result = await svc.listMeetings(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
       relatedModule, relatedId, upcoming: upcoming === 'true',
-    });
+    }, req.dataScope);
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch meetings', 500); }
 }
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.getMeetingById(req.tenantId!, req.params.id);
+    const record = await svc.getMeetingById(req.tenantId!, req.params.id, req.dataScope);
     if (!record) return void sendError(res, 'Meeting not found', 404);
     sendSuccess(res, record);
   } catch { sendError(res, 'Failed to fetch meeting', 500); }
@@ -31,7 +31,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.updateMeeting(req.tenantId!, req.params.id, req.body);
+    const record = await svc.updateMeeting(req.tenantId!, req.params.id, req.body, req.dataScope);
     if (!record) return void sendError(res, 'Meeting not found', 404);
     sendSuccess(res, record, 'Meeting updated');
   } catch { sendError(res, 'Failed to update meeting', 500); }
@@ -39,13 +39,13 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const ok = await svc.deleteMeeting(req.tenantId!, req.params.id);
+    const ok = await svc.deleteMeeting(req.tenantId!, req.params.id, req.dataScope);
     if (!ok) return void sendError(res, 'Meeting not found', 404);
     sendSuccess(res, null, 'Meeting deleted');
   } catch { sendError(res, 'Failed to delete meeting', 500); }
 }
 
 export async function stats(req: AuthRequest, res: Response) {
-  try { sendSuccess(res, await svc.getMeetingStats(req.tenantId!)); }
+  try { sendSuccess(res, await svc.getMeetingStats(req.tenantId!, req.dataScope)); }
   catch { sendError(res, 'Failed to fetch stats', 500); }
 }

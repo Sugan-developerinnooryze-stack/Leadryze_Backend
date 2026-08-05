@@ -2,13 +2,16 @@ import mongoose from 'mongoose';
 import { NativeStaff } from './staff.model';
 import { StaffListOptions } from './staff.types';
 import { ensureCredentials } from '../shared/app-credentials.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToFilter } from '../shared/data-scope';
 
-export async function listStaffs(tenantId: string, opts: StaffListOptions, branchId?: string | null) {
+export async function listStaffs(tenantId: string, opts: StaffListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToFilter(filter, scope, 'staffId');
 
   if (opts.status) filter.status = opts.status;
   if (opts.teamId) filter.teamId = new mongoose.Types.ObjectId(opts.teamId);

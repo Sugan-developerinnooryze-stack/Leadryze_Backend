@@ -14,7 +14,7 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listStaffs(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listStaffs(req.tenantId!, req.query as any, req.branchId, req.dataScope);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'staffs', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 20));

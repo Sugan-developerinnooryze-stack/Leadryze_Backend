@@ -18,7 +18,7 @@ import { sendSmsNow } from '../messages/twilio.service';
 import { Activity } from '../activities/activity.model';
 import { AutomationRun } from '../automation/automation-run.model';
 import { captureLeadFromExternalSource } from '../native-crm/lead-capture/lead-capture.service';
-import { assignRoundRobin } from '../native-crm/staffs/round-robin.service';
+import { assignRoundRobin, resolveTeamForService } from '../native-crm/staffs/round-robin.service';
 import { getActiveStaffByStaffId, listStaffs } from '../native-crm/staffs/staff.service';
 import { listTeams } from '../native-crm/teams/team.service';
 import { NativeTeam } from '../native-crm/teams/team.model';
@@ -845,9 +845,14 @@ router.post('/widget-lead-capture', async (req: Request, res: Response, next: Ne
     }
 
     const tenant = await Tenant.findById(tid).select('widget').lean();
+    // Route to the team that actually handles the captured service, when one
+    // matches (resolveTeamForService) — before falling back to the tenant's
+    // one fixed default team, then fully tenant-wide. assignRoundRobin()
+    // itself is unchanged; this only changes which teamId gets passed in.
+    const routedTeamId = await resolveTeamForService(tenantId, service);
     const assigned = await assignRoundRobin(
       tenantId,
-      tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
+      routedTeamId ?? (tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined),
     );
 
     const { capture, lead } = await captureLeadFromExternalSource(
@@ -1017,10 +1022,14 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
     if (chosenStaff) {
       assigned = { staffId: chosenStaff.staffId, staffName: `${chosenStaff.firstName} ${chosenStaff.lastName}`.trim() };
     } else {
+      // No explicit doctor chosen — try routing by the booking's own topic
+      // before falling back to the tenant's fixed default team, same
+      // resolveTeamForService()-first order as widget-lead-capture.
       const tenant = await Tenant.findById(tid).select('widget').lean();
+      const routedTeamId = await resolveTeamForService(tenantId, topic);
       assigned = await assignRoundRobin(
         tenantId,
-        tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
+        routedTeamId ?? (tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined),
       );
     }
 

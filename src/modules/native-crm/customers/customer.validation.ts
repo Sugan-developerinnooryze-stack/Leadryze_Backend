@@ -22,6 +22,7 @@ export const createCustomerSchema = z.object({
   notes:    z.string().optional(),
   tags:     z.array(z.string()).optional(),
   status:   z.enum(['active','inactive']).optional(),
+  assignedStaffId: z.string().trim().optional(),
   customFields,
 });
 
