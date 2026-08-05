@@ -4,6 +4,7 @@ import { writeLog } from './email-log.service';
 import { getOrCreateSettings } from '../native-crm/notification-settings/notification-settings.service';
 import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
+import { Tenant } from '../tenants/tenant.model';
 // This module only ever handles the 4 "scheduled item" sources — the wider
 // EmailLogSourceModule (which also covers automation-rule sources like
 // 'lead'/'deal'/'quotation') is a storage-level type, not this file's scope.
@@ -28,11 +29,23 @@ function titleOf(sourceModule: ConfirmationSourceModule, r: SourceRecord): strin
   return String(r.title ?? `your ${NOUN[sourceModule]}`);
 }
 
-function whenFmt(sourceModule: ConfirmationSourceModule, r: SourceRecord): string | null {
+// `timeZone` matters specifically for meetings: without it, toLocaleString()
+// falls back to whatever system timezone the Node process happens to be
+// running in (Render's containers default to UTC, but a local dev machine —
+// or any future host — can be set to anything), which has nothing to do
+// with the tenant's own configured booking timezone. A meeting's startDate
+// is a real UTC instant; formatting it without the tenant's timezone can
+// silently show the wrong wall-clock time to the recipient (confirmed live:
+// a UTC-configured tenant's 10:00 AM booking rendered as 3:30 PM on an
+// IST-local machine — exactly the +5:30 offset). Call/task/ticket records
+// have no per-tenant timezone concept to draw from, so they're left exactly
+// as before — this fix is scoped to what's actually wrong.
+function whenFmt(sourceModule: ConfirmationSourceModule, r: SourceRecord, timeZone?: string): string | null {
   const raw = sourceModule === 'call' ? r.date : sourceModule === 'meeting' ? r.startDate : sourceModule === 'task' ? r.dueDate : null;
   if (!raw) return null;
   const d = new Date(raw as string);
-  return isNaN(d.getTime()) ? null : d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short', ...(timeZone ? { timeZone } : {}) });
 }
 
 /**
@@ -69,7 +82,10 @@ export async function sendOnCreateConfirmation(
       return;
     }
 
-    const when = whenFmt(sourceModule, record);
+    const meetingTimezone = sourceModule === 'meeting'
+      ? (await Tenant.findById(tenantId).select('widget.booking.timezone').lean())?.widget?.booking?.timezone || 'UTC'
+      : undefined;
+    const when = whenFmt(sourceModule, record, meetingTimezone);
     const whenLine = when ? ` scheduled for <strong>${when}</strong>` : '';
     const subject = `Confirmed: ${title} — new ${noun}`;
     const htmlContent = `<p>Hi <strong>${recipient.name}</strong>,</p><p>This confirms a new ${noun} — <strong>${title}</strong>${whenLine}.</p><p>We'll follow up ahead of time if it's coming up soon.</p><p>Best regards,<br/>LeadRyze AI</p>`;
