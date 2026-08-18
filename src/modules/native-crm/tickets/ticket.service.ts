@@ -4,6 +4,8 @@ import { CreateTicketDTO, UpdateTicketDTO } from './ticket.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -12,10 +14,11 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listTickets(tenantId: string, opts: ListOptions = {}): Promise<PaginatedResult<unknown>> {
+export async function listTickets(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status, relatedModule, relatedId } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   if (status) filter.ticketStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (search) {
@@ -29,9 +32,11 @@ export async function listTickets(tenantId: string, opts: ListOptions = {}): Pro
   return { items, total, page, pages: Math.ceil(total / limit) };
 }
 
-export async function getTicketById(tenantId: string, id: string) {
+export async function getTicketById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Ticket.findOne({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Ticket.findOne(filter).lean();
 }
 
 export async function createTicket(tenantId: string, dto: CreateTicketDTO) {
@@ -42,22 +47,28 @@ export async function createTicket(tenantId: string, dto: CreateTicketDTO) {
   return created;
 }
 
-export async function updateTicket(tenantId: string, id: string, dto: UpdateTicketDTO) {
+export async function updateTicket(tenantId: string, id: string, dto: UpdateTicketDTO, scope?: DataScope) {
   await assertValidStatus(tenantId, dto.ticketStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Ticket.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: dto }, { new: true }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Ticket.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
 }
 
-export async function deleteTicket(tenantId: string, id: string) {
+export async function deleteTicket(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Ticket.findOneAndDelete({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Ticket.findOneAndDelete(filter).lean();
 }
 
-export async function getTicketStats(tenantId: string) {
+export async function getTicketStats(tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   const [total, byStatus] = await Promise.all([
-    Ticket.countDocuments({ tenantId: tid }),
-    Ticket.aggregate([{ $match: { tenantId: tid } }, { $group: { _id: '$ticketStatus', count: { $sum: 1 } } }]),
+    Ticket.countDocuments(filter),
+    Ticket.aggregate([{ $match: filter }, { $group: { _id: '$ticketStatus', count: { $sum: 1 } } }]),
   ]);
   return { total, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
 }

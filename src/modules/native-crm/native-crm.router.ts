@@ -2,7 +2,7 @@ import { Router, Response } from 'express';
 import { authenticate } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { resolveBranch } from '../../middlewares/branch.middleware';
-import { resolveDataScopeMiddleware } from './shared/data-scope';
+import { resolveDataScopeMiddleware, applyDataScopeToFilter, applyDataScopeToCreatedByFilter, resolveEffectiveScope } from './shared/data-scope';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
 
@@ -69,6 +69,7 @@ import { Task }     from './tasks/task.model';
 import { Ticket }   from './tickets/ticket.model';
 import { Call }     from './calls/call.model';
 import { Meeting }  from './meetings/meeting.model';
+import { Lead }     from './leads/lead.model';
 import mongoose from 'mongoose';
 
 const router = Router();
@@ -136,22 +137,76 @@ router.use('/automation-flows',        automationFlowRoutes);
 /* ── GET /fs-counts — field service module record counts ─────────────────── */
 router.get('/fs-counts', fsCounts);
 
-/* ── GET /stats — all module counts for sidebar badges ───────────────────── */
+/* ── GET /stats — all module counts for sidebar badges. Respects the same
+   per-module Data Visibility toggle every list/stats endpoint already does
+   — without this, a Manager/Agent's sidebar showed the raw tenant-wide
+   count even when the module's own page correctly showed their scoped
+   subset (e.g. "Meetings 7" in the sidebar with 0 actually visible). ───── */
 router.get('/stats', async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
+    const createdByAnchored = (moduleKey: string) => {
+      const f: Record<string, unknown> = { tenantId: tid };
+      applyDataScopeToCreatedByFilter(f, resolveEffectiveScope(req, moduleKey));
+      return f;
+    };
+    const staffAnchored = (moduleKey: string, field: string) => {
+      const f: Record<string, unknown> = { tenantId: tid };
+      applyDataScopeToFilter(f, resolveEffectiveScope(req, moduleKey), field);
+      return f;
+    };
     const [contacts, companies, deals, tasks, tickets, calls, meetings] = await Promise.all([
-      Contact.countDocuments({ tenantId: tid }),
-      Company.countDocuments({ tenantId: tid }),
-      Deal.countDocuments({ tenantId: tid }),
-      Task.countDocuments({ tenantId: tid }),
-      Ticket.countDocuments({ tenantId: tid }),
-      Call.countDocuments({ tenantId: tid }),
-      Meeting.countDocuments({ tenantId: tid }),
+      Contact.countDocuments(createdByAnchored('contacts')),
+      Company.countDocuments(createdByAnchored('companies')),
+      Deal.countDocuments(staffAnchored('deals', 'assignedStaffId')),
+      Task.countDocuments(createdByAnchored('tasks')),
+      Ticket.countDocuments(createdByAnchored('tickets')),
+      Call.countDocuments(createdByAnchored('calls')),
+      Meeting.countDocuments(staffAnchored('meetings', 'assignedStaffId')),
     ]);
     sendSuccess(res, { contacts, companies, deals, tasks, tickets, calls, meetings });
   } catch {
     sendError(res, 'Failed to fetch stats', 500);
+  }
+});
+
+/* ── GET /dashboard-stats — role-scoped Lead/Meeting summary for the main
+   landing Dashboard. Reuses req.dataScope exactly like Lead.stats()/
+   Meeting.stats() already do — a MANAGER sees only their own team's
+   numbers here, an AGENT only their own, SUPER_ADMIN/TENANT_ADMIN see the
+   full tenant. Deliberately separate from Lead's own /leads/stats (which
+   is shaped for the Leads pipeline page) — this is a different, broader
+   shape combining Leads + Meetings for one summary view. ────────────── */
+router.get('/dashboard-stats', async (req: AuthRequest, res: Response) => {
+  try {
+    const tid = new mongoose.Types.ObjectId(req.tenantId!);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const leadFilter: Record<string, unknown> = { tenantId: tid };
+    applyDataScopeToFilter(leadFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    const meetingFilter: Record<string, unknown> = { tenantId: tid };
+    applyDataScopeToFilter(meetingFilter, resolveEffectiveScope(req, 'meetings'), 'assignedStaffId');
+
+    const [totalLeads, newToday, converted, appointments, sourceAgg, statusAgg] = await Promise.all([
+      Lead.countDocuments(leadFilter),
+      Lead.countDocuments({ ...leadFilter, createdAt: { $gte: today } }),
+      Lead.countDocuments({ ...leadFilter, isConverted: true }),
+      Meeting.countDocuments(meetingFilter),
+      Lead.aggregate([{ $match: leadFilter }, { $group: { _id: '$source', count: { $sum: 1 } } }]),
+      Lead.aggregate([{ $match: leadFilter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    ]);
+
+    const bySource: Record<string, number> = {};
+    (sourceAgg as any[]).forEach((r) => { bySource[r._id ?? 'other'] = r.count; });
+    const byStatus: Record<string, number> = {};
+    (statusAgg as any[]).forEach((r) => { byStatus[r._id ?? 'new'] = r.count; });
+
+    const conversionRate = totalLeads > 0 ? (converted / totalLeads) * 100 : 0;
+
+    sendSuccess(res, { totalLeads, newToday, appointments, conversionRate, bySource, byStatus });
+  } catch {
+    sendError(res, 'Failed to fetch dashboard stats', 500);
   }
 });
 

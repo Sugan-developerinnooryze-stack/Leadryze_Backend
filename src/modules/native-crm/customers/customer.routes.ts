@@ -13,6 +13,7 @@ const router = Router();
 const cred = makeCredentialHandlers(NativeCustomer, (d) => d.name ?? '');
 
 router.get('/',       requirePermission('fs.customers.view'),   ctrl.list);
+router.get('/stats',  requirePermission('fs.customers.view'),   ctrl.stats);
 router.post('/',      requirePermission('fs.customers.create'), validate({ body: createCustomerSchema }),                        ctrl.create);
 router.get('/:id/credentials',              requirePermission('fs.customers.edit'), validate({ params: idParam }),                                cred.getCredentials);
 router.patch('/:id/credentials',            requirePermission('fs.customers.edit'), validate({ params: idParam, body: credentialsUpdateSchema }), cred.updateCredentials);

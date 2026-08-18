@@ -10,6 +10,13 @@ export interface IChatMessage {
 export interface IChatSession extends Document {
   tenantId: mongoose.Types.ObjectId;
   sessionId: string;
+  /** The widget's own client-side visitor identity (localStorage-persisted
+   * crypto.randomUUID(), survives across sessions/reloads) — parallel to
+   * visitorName/visitorEmail/visitorPhone, but a stable anonymous handle
+   * rather than PII. Used by GET /public/widget/history as a second
+   * ownership factor alongside sessionId, narrowing a session-guessing
+   * attack surface beyond sessionId's own already-high entropy. */
+  visitorId?: string;
   visitorName?: string;
   visitorEmail?: string;
   visitorPhone?: string;
@@ -35,6 +42,7 @@ const chatSessionSchema = new Schema<IChatSession>(
   {
     tenantId:     { type: Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
     sessionId:    { type: String, required: true, unique: true, index: true },
+    visitorId:    { type: String },
     visitorName:  { type: String },
     visitorEmail: { type: String },
     visitorPhone: { type: String },

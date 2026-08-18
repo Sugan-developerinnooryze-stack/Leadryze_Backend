@@ -3,6 +3,8 @@ import { Deal } from './deal.model';
 import { CreateDealDTO, UpdateDealDTO } from './deal.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToFilter } from '../shared/data-scope';
 
 async function assertValidStage(tenantId: string, stage: string | undefined): Promise<void> {
   if (!stage) return;
@@ -11,11 +13,12 @@ async function assertValidStage(tenantId: string, stage: string | undefined): Pr
   }
 }
 
-export async function listDeals(tenantId: string, opts: ListOptions = {}, branchId?: string | null): Promise<PaginatedResult<unknown>> {
+export async function listDeals(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   if (status) filter.stage = status;
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
@@ -28,9 +31,11 @@ export async function listDeals(tenantId: string, opts: ListOptions = {}, branch
   return { items, total, page, pages: Math.ceil(total / limit) };
 }
 
-export async function getDealById(tenantId: string, id: string) {
+export async function getDealById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Deal.findOne({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  return Deal.findOne(filter).lean();
 }
 
 export async function createDeal(tenantId: string, dto: CreateDealDTO) {
@@ -39,23 +44,29 @@ export async function createDeal(tenantId: string, dto: CreateDealDTO) {
   return Deal.create({ tenantId: tid, ...dto });
 }
 
-export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDTO) {
+export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDTO, scope?: DataScope) {
   await assertValidStage(tenantId, dto.stage);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Deal.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: dto }, { new: true }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  return Deal.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
 }
 
-export async function deleteDeal(tenantId: string, id: string) {
+export async function deleteDeal(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Deal.findOneAndDelete({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  return Deal.findOneAndDelete(filter).lean();
 }
 
-export async function getDealStats(tenantId: string) {
+export async function getDealStats(tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   const [total, byStage, totalValue] = await Promise.all([
-    Deal.countDocuments({ tenantId: tid }),
-    Deal.aggregate([{ $match: { tenantId: tid } }, { $group: { _id: '$stage', count: { $sum: 1 } } }]),
-    Deal.aggregate([{ $match: { tenantId: tid } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Deal.countDocuments(filter),
+    Deal.aggregate([{ $match: filter }, { $group: { _id: '$stage', count: { $sum: 1 } } }]),
+    Deal.aggregate([{ $match: filter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
   ]);
   return {
     total,

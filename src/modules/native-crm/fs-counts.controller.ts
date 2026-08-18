@@ -19,34 +19,60 @@ import { NativeActivity }  from './activities/activity.model';
 import { NativeProduct }   from './products/product.model';
 import { NativeAsset }     from './assets/asset.model';
 import { NativeVehicle }   from './vehicles/vehicle.model';
+import {
+  resolveEffectiveScope, applyDataScopeToFilter, applyDataScopeToCreatedByFilter, applyDataScopeToTeamFilter,
+} from './shared/data-scope';
 
+/** Sidebar badge counts — same tenant-scoped shape as before, now ALSO
+ * respecting the per-module Data Visibility toggle (native-crm/shared/
+ * data-scope.ts), same as every list/stats endpoint. Without this, a
+ * Manager/Agent's sidebar badge showed the raw tenant-wide count even
+ * though the module's own list page correctly showed their scoped subset —
+ * a real, confusing mismatch (e.g. "Teams 2" in the sidebar, but only 1
+ * team actually visible on the Teams page). */
 export async function fsCounts(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
-    const q   = { tenantId: tid };
+    const base = () => ({ tenantId: tid }) as Record<string, unknown>;
+
+    const staffAnchored = (moduleKey: string, field: string) => {
+      const f = base();
+      applyDataScopeToFilter(f, resolveEffectiveScope(req, moduleKey), field);
+      return f;
+    };
+    const createdByAnchored = (moduleKey: string) => {
+      const f = base();
+      applyDataScopeToCreatedByFilter(f, resolveEffectiveScope(req, moduleKey));
+      return f;
+    };
+    const teamFilter = (() => {
+      const f = base();
+      applyDataScopeToTeamFilter(f, resolveEffectiveScope(req, 'teams'));
+      return f;
+    })();
 
     const [
       categories, services, teams, staffs, customers, sites, parts,
       workorders, quotations, contracts, invoices, receipts,
       expenses, activities, products, assets, vehicles,
     ] = await Promise.all([
-      NativeCategory.countDocuments(q),
-      NativeService.countDocuments(q),
-      NativeTeam.countDocuments(q),
-      NativeStaff.countDocuments(q),
-      NativeCustomer.countDocuments(q),
-      NativeSite.countDocuments(q),
-      NativePart.countDocuments(q),
-      NativeWorkorder.countDocuments(q),
-      NativeQuotation.countDocuments(q),
-      NativeContract.countDocuments(q),
-      NativeInvoice.countDocuments(q),
-      NativeReceipt.countDocuments(q),
-      NativeExpense.countDocuments(q),
-      NativeActivity.countDocuments(q),
-      NativeProduct.countDocuments(q),
-      NativeAsset.countDocuments(q),
-      NativeVehicle.countDocuments(q),
+      NativeCategory.countDocuments(createdByAnchored('categories')),
+      NativeService.countDocuments(createdByAnchored('services')),
+      NativeTeam.countDocuments(teamFilter),
+      NativeStaff.countDocuments(staffAnchored('staffs', 'staffId')),
+      NativeCustomer.countDocuments(staffAnchored('customers', 'assignedStaffId')),
+      NativeSite.countDocuments(createdByAnchored('sites')),
+      NativePart.countDocuments(createdByAnchored('parts')),
+      NativeWorkorder.countDocuments(staffAnchored('workorders', 'staffIds')),
+      NativeQuotation.countDocuments(createdByAnchored('quotations')),
+      NativeContract.countDocuments(staffAnchored('contracts', 'staffIds')),
+      NativeInvoice.countDocuments(createdByAnchored('invoices')),
+      NativeReceipt.countDocuments(createdByAnchored('receipts')),
+      NativeExpense.countDocuments(createdByAnchored('expenses')),
+      NativeActivity.countDocuments(createdByAnchored('activities')),
+      NativeProduct.countDocuments(createdByAnchored('products')),
+      NativeAsset.countDocuments(createdByAnchored('assets')),
+      NativeVehicle.countDocuments(createdByAnchored('vehicles')),
     ]);
 
     sendSuccess(res, {

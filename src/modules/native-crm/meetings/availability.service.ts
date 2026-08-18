@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { Meeting } from './meeting.model';
 import { Tenant } from '../../tenants/tenant.model';
+import { NativeStaff } from '../staffs/staff.model';
 
 export interface AvailableSlot {
   startIso: string;
@@ -59,20 +60,48 @@ function formatLabel(date: Date, timeZone: string): string {
  * doesn't add a second, competing assignment concept. */
 export async function computeAvailableSlots(
   tenantId: string,
-  opts: { fromIso?: string; days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; limit?: number; staffId?: string } = {}
+  opts: {
+    fromIso?: string; days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; limit?: number; staffId?: string;
+    /** A visitor-requested calendar date (YYYY-MM-DD), interpreted as that
+     * date's local midnight in the TENANT'S OWN configured timezone (`tz`
+     * below) — not UTC midnight, which would be wrong for any tenant not on
+     * UTC. Distinct from `fromIso` (an already-absolute instant) because a
+     * plain date needs this function's own tz to resolve correctly, and
+     * `fromIso` was never actually wired from any real caller. */
+    forDate?: string;
+  } = {}
 ): Promise<AvailableSlot[]> {
   const tenant = await Tenant.findById(tenantId).select('widget.booking').lean();
   const booking = tenant?.widget?.booking;
   if (!booking?.enabled || !booking.hours?.length) return [];
 
   const tz = booking.timezone || 'UTC';
-  const limit = Math.min(opts.limit ?? 10, 50);
+  // Real, confirmed bug this fixes: a caller asking for a specific future
+  // date (e.g. "tomorrow") got the default 10-slot cap filled entirely by
+  // TODAY's own slots before the old day-scan loop (which always started at
+  // `now`, ignoring windowStart) ever reached that date — so the requested
+  // day's slots were silently never even generated. A date-scoped request
+  // gets a generous cap instead of the tenant-wide default, since it's
+  // asking for one specific day's real slots, not "the next few open times
+  // company-wide."
+  const limit = Math.min(opts.limit ?? (opts.forDate ? 50 : 10), 50);
   const now = new Date();
-  const earliest = opts.fromIso ? new Date(opts.fromIso) : now;
+  let earliest = now;
+  if (opts.forDate) {
+    const [y, m, d] = opts.forDate.split('-').map(Number);
+    if (y && m && d) earliest = zonedTimeToUtc(y, m - 1, d, 0, 0, tz);
+  } else if (opts.fromIso) {
+    earliest = new Date(opts.fromIso);
+  }
   const leadTimeFloor = new Date(now.getTime() + booking.leadTimeHours * 3600_000);
   const windowStart = earliest > leadTimeFloor ? earliest : leadTimeFloor;
-  const scanDays = Math.min(opts.days ?? booking.horizonDays, booking.horizonDays);
   const windowEnd = new Date(now.getTime() + booking.horizonDays * 86_400_000);
+  // Scan starts at windowStart's own day, not always `now`'s day — the core
+  // of the fix above. scanDays is capped so the scan never runs past the
+  // configured book-ahead horizon, regardless of where it starts from.
+  const scanStartMs = windowStart.getTime();
+  const maxScanDaysFromStart = Math.max(0, Math.ceil((windowEnd.getTime() - scanStartMs) / 86_400_000));
+  const scanDays = Math.min(opts.days ?? booking.horizonDays, maxScanDaysFromStart);
 
   // Pull every scheduled meeting inside the whole scan window ONCE, filter
   // candidate slots against it in memory — cheaper than one query per slot.
@@ -93,7 +122,7 @@ export async function computeAvailableSlots(
 
   const results: AvailableSlot[] = [];
   for (let dayOffset = 0; dayOffset <= scanDays && results.length < limit; dayOffset++) {
-    const probe = new Date(now.getTime() + dayOffset * 86_400_000);
+    const probe = new Date(scanStartMs + dayOffset * 86_400_000);
     const { year, month0, day, weekday } = localDateParts(probe, tz);
     const dayHours = booking.hours.filter((h: any) => h.day === weekday);
 
@@ -123,12 +152,63 @@ export async function computeAvailableSlots(
   return results;
 }
 
+/** Team-wide availability union — a slot is offered if AT LEAST ONE active
+ * member of the team is free then, not just one fixed staffId. This is the
+ * direct fix for the reported "A is busy at 2:30 -> B should be offered
+ * instead" gap: without this, check_meeting_availability either checked one
+ * hardcoded staff member or the whole tenant as a single shared calendar,
+ * with no notion of "someone on this team can still take it." Reuses
+ * computeAvailableSlots() once per roster member (100% of the existing
+ * business-hours/conflict logic) and unions the results — the only new code
+ * is the fan-out + union + per-slot "who's actually free" tagging, which
+ * assignRoundRobin's own time-aware walk (round-robin.service.ts) consumes
+ * to decide WHO gets assigned once a visitor picks a unioned slot. */
+export async function computeTeamAvailableSlots(
+  tenantId: string,
+  teamId: string,
+  opts: { fromIso?: string; forDate?: string; days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; limit?: number } = {}
+): Promise<AvailableSlot[]> {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const roster = await NativeStaff.find({ tenantId: tid, teamId: new mongoose.Types.ObjectId(teamId), status: 'active' })
+    .select('staffId')
+    .sort({ _id: 1 })
+    .lean();
+  if (!roster.length) return [];
+
+  // Same date-scoped-request bump as computeAvailableSlots — otherwise the
+  // outer union still gets sliced back down to 10 even though each per-staff
+  // call below correctly returns a full day's worth for a specific date.
+  const limit = Math.min(opts.limit ?? (opts.forDate ? 50 : 10), 50);
+  // Ask for slightly more than the final cap per member so the union still
+  // has `limit` distinct slots even when members' free times only partially
+  // overlap — cheap, since each call is already a single in-memory scan over
+  // one pre-fetched meeting window (see computeAvailableSlots' own comment).
+  const perStaffLimit = Math.min(limit * 3, 50);
+
+  const perStaffResults = await Promise.all(
+    roster.map((s) => computeAvailableSlots(tenantId, { ...opts, limit: perStaffLimit, staffId: s.staffId })),
+  );
+
+  const byStartIso = new Map<string, AvailableSlot>();
+  for (const slots of perStaffResults) {
+    for (const slot of slots) {
+      if (!byStartIso.has(slot.startIso)) byStartIso.set(slot.startIso, slot);
+    }
+  }
+
+  return Array.from(byStartIso.values())
+    .sort((a, b) => a.startIso.localeCompare(b.startIso))
+    .slice(0, limit);
+}
+
 /** Re-check used right before actually booking — same overlap logic as
  * computeAvailableSlots, scoped to one candidate range instead of scanning a
  * whole window. Deliberately tenant-wide (no staffId filter by default,
  * matching the single-capacity model above) — the optional staffId param
  * exists for a future per-staff model, unused by bookWidgetMeeting today. */
-export async function isSlotFree(tenantId: string, startIso: string, endIso: string, staffId?: string): Promise<boolean> {
+export async function isSlotFree(
+  tenantId: string, startIso: string, endIso: string, staffId?: string, excludeMeetingId?: string,
+): Promise<boolean> {
   const filter: Record<string, unknown> = {
     tenantId: new mongoose.Types.ObjectId(tenantId),
     meetingStatus: 'scheduled',
@@ -136,6 +216,11 @@ export async function isSlotFree(tenantId: string, startIso: string, endIso: str
     endDate: { $gt: new Date(startIso) },
   };
   if (staffId) filter.assignedStaffId = staffId;
+  // Excludes the meeting being reassigned from its own conflict check — used
+  // by the reassignment candidate list, where the currently-assigned staff
+  // member's own meeting would otherwise always show as "busy" against
+  // itself.
+  if (excludeMeetingId) filter._id = { $ne: new mongoose.Types.ObjectId(excludeMeetingId) };
   const conflict = await Meeting.exists(filter);
   return !conflict;
 }

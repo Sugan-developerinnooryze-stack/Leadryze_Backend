@@ -11,6 +11,7 @@ export const createTeamSchema = z.object({
   // (same convention already established for Tenant.widget.defaultTeamId).
   managerUserId: optionalObjectId.nullable(),
   serviceIds:  z.array(z.string().trim().min(1)).optional(),
+  source:      z.enum(['manual', 'supervisor_flow']).optional(),
   customFields,
 });
 

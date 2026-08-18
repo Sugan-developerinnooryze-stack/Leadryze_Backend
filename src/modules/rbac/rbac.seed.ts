@@ -84,7 +84,7 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
   ),
 
   // Native CRM modules (seeded for structure — actual routes built in Phase 3)
-  ...(['contacts', 'leads', 'deals', 'tasks', 'meetings', 'calendar', 'notes', 'companies', 'activities'] as const).flatMap(
+  ...(['contacts', 'leads', 'deals', 'tasks', 'meetings', 'calendar', 'notes', 'companies', 'activities', 'tickets', 'calls'] as const).flatMap(
     (mod) => ([
       { key: `native_crm.${mod}.view`,   module: 'native_crm', resource: mod, action: 'view',   label: `CRM ${mod} — View`   },
       { key: `native_crm.${mod}.create`, module: 'native_crm', resource: mod, action: 'create', label: `CRM ${mod} — Create` },
@@ -97,7 +97,7 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
   // Field Service modules
   ...(['workorders', 'quotations', 'contracts', 'invoices', 'receipts', 'expenses',
        'customers', 'sites', 'teams', 'staffs', 'parts', 'categories', 'services',
-       'products', 'assets', 'vehicles', 'activities'] as const).flatMap(
+       'products', 'assets', 'vehicles', 'activities', 'catalog'] as const).flatMap(
     (mod) => ([
       { key: `fs.${mod}.view`,   module: 'fs', resource: mod, action: 'view',   label: `FS ${mod} — View`   },
       { key: `fs.${mod}.create`, module: 'fs', resource: mod, action: 'create', label: `FS ${mod} — Create` },
@@ -149,6 +149,19 @@ const AGENT_PERMISSIONS = [
   // before enforcement existed, so this is enforcement catching up to
   // already-expressed intent, not a new restriction.
   'fs.customers.view',
+  // Added when Companies/Deals/Tickets/Calls first got a real
+  // requirePermission gate (previously wide open to any authenticated
+  // user) — mirrors the exact same view/create/edit level already granted
+  // to Contacts/Tasks above, so an existing Agent isn't unexpectedly locked
+  // out of routine day-to-day CRM work they could already freely do. The
+  // fs.* catalog/asset/vehicle/site/receipt/expense/activity/product
+  // modules deliberately stay Manager+Admin-only for Agent, same posture
+  // as fs.teams.*/fs.staffs.* above — those are configuration/reference/
+  // financial data, not an Agent's own day-to-day record-keeping.
+  'native_crm.companies.view', 'native_crm.companies.create', 'native_crm.companies.edit',
+  'native_crm.deals.view',     'native_crm.deals.create',     'native_crm.deals.edit',
+  'native_crm.tickets.view',   'native_crm.tickets.create',   'native_crm.tickets.edit',
+  'native_crm.calls.view',     'native_crm.calls.create',     'native_crm.calls.edit',
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -273,9 +286,14 @@ async function _backfillUserRoles(tenantId: string): Promise<void> {
   const tidObj = new mongoose.Types.ObjectId(tenantId);
 
   const roleMap: Record<string, string | null> = {};
+  const systemRoleIdSet = new Set<string>();
   for (const roleName of ['Admin', 'Manager', 'Agent']) {
     const r = await Role.findOne({ tenantId: tidObj, name: roleName }, '_id').lean();
-    if (r) roleMap[roleName] = (r._id as mongoose.Types.ObjectId).toString();
+    if (r) {
+      const id = (r._id as mongoose.Types.ObjectId).toString();
+      roleMap[roleName] = id;
+      systemRoleIdSet.add(id);
+    }
   }
 
   const legacyToSystem: Record<string, string> = {
@@ -285,8 +303,28 @@ async function _backfillUserRoles(tenantId: string): Promise<void> {
     USER:         'Agent',
   };
 
-  const usersWithoutRole = await User.find({ tenantId: tidObj, roleId: null, role: { $ne: 'SUPER_ADMIN' } }, '_id role').lean();
-  for (const u of usersWithoutRole) {
+  // Two cases get repaired here, not just one: (1) roleId was never set at
+  // all, and (2) roleId is set but DANGLING — points at a Role document
+  // that no longer exists for this tenant (e.g. left behind by an earlier
+  // role reseed/migration). Case (2) would otherwise silently deny every
+  // permission check forever, since requirePermission() fails closed on an
+  // unresolvable roleId and this backfill's own original query (roleId:
+  // null) never matched a non-null-but-dangling value.
+  const candidateUsers = await User.find(
+    { tenantId: tidObj, role: { $ne: 'SUPER_ADMIN' } },
+    '_id role roleId'
+  ).lean();
+
+  for (const u of candidateUsers) {
+    const hasDanglingRoleId = u.roleId && !systemRoleIdSet.has(u.roleId.toString());
+    // A dangling roleId might legitimately point at a real, still-existing
+    // CUSTOM (non-system) role — only repair when it points at NOTHING.
+    if (u.roleId && !hasDanglingRoleId) continue;
+    if (u.roleId && hasDanglingRoleId) {
+      const stillExists = await Role.exists({ _id: u.roleId, tenantId: tidObj });
+      if (stillExists) continue;
+    }
+
     const systemRoleName = legacyToSystem[u.role as string];
     const systemRoleId   = systemRoleName ? roleMap[systemRoleName] : null;
     if (systemRoleId) {

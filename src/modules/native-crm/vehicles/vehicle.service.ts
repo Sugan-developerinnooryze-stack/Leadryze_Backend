@@ -1,12 +1,15 @@
 import mongoose from 'mongoose';
 import { NativeVehicle } from './vehicle.model';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
-export async function listVehicles(tenantId: string, opts: any, branchId?: string | null) {
+export async function listVehicles(tenantId: string, opts: any, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToCreatedByFilter(filter, scope);
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.$or = [
     { name:               new RegExp(opts.search, 'i') },
@@ -20,21 +23,27 @@ export async function listVehicles(tenantId: string, opts: any, branchId?: strin
   return { items, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export async function getVehicleById(id: string, tenantId: string) {
+export async function getVehicleById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeVehicle.findOne({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeVehicle.findOne(filter);
 }
 
 export async function createVehicle(data: any) {
   return NativeVehicle.create(data);
 }
 
-export async function updateVehicle(id: string, tenantId: string, data: any) {
+export async function updateVehicle(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeVehicle.findOneAndUpdate({ _id: id, tenantId: tid }, data, { new: true, runValidators: true });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeVehicle.findOneAndUpdate(filter, data, { new: true, runValidators: true });
 }
 
-export async function deleteVehicle(id: string, tenantId: string) {
+export async function deleteVehicle(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeVehicle.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeVehicle.findOneAndDelete(filter);
 }

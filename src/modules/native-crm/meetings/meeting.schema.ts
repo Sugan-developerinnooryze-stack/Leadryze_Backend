@@ -34,6 +34,15 @@ export const meetingSchema = new Schema(
     assignedStaffId:   { type: String, trim: true },
     assignedStaffName: { type: String, trim: true },
     source:            { type: String, enum: ['manual', 'widget'], default: 'manual' },
+    // Denormalized display convenience, same convention as
+    // assignedStaffId/assignedStaffName above — populated from
+    // NativeStaff.teamId -> NativeTeam.name whenever assignedStaffId is set
+    // (round robin, department/doctor wizard, or a manual reassignment).
+    // Supervisor is deliberately NOT stored here — resolved live from
+    // teamId at read time instead, since a team's manager can change
+    // independently of any given Meeting.
+    teamId:            { type: String, trim: true },
+    teamName:          { type: String, trim: true },
   },
   { timestamps: true }
 );
@@ -48,11 +57,18 @@ meetingSchema.index({ tenantId: 1 });
 meetingSchema.index({ tenantId: 1, meetingStatus: 1 });
 meetingSchema.index({ tenantId: 1, startDate: 1 });
 meetingSchema.index({ tenantId: 1, relatedModule: 1, relatedId: 1 });
-// Hard guarantee against double-booking the same widget slot under a race
-// (two visitors booking the identical startDate at once) — scoped to
-// scheduled widget bookings only, so staff manually double-booking
-// themselves via the normal Meeting form (a legitimate, common thing) is
-// completely unaffected.
+// Hard guarantee against double-booking the same slot for the same staff
+// member under a race. Previously scoped to `source: 'widget'` only — real,
+// confirmed gap: a widget booking racing a simultaneous MANUAL/admin booking
+// for the identical staff+startDate wasn't covered at all (the manual doc,
+// defaulting to source:'manual', fell outside the old partial filter, so
+// both inserts could succeed). Scoped to meetingStatus:'scheduled' only now,
+// regardless of source, so a widget booking and a manual booking can never
+// collide on the same staff+exact-slot either. Trade-off, noted explicitly:
+// a staff member manually double-booking themselves via the normal Meeting
+// form at the exact identical startDate — previously allowed on purpose —
+// now also hits this constraint; if that's ever needed again, use two
+// slightly different startDate values or reach for a different mechanism.
 //
 // Includes assignedStaffId in the key (not just tenantId+startDate) so the
 // department/doctor booking wizard can legitimately book two DIFFERENT
@@ -65,5 +81,5 @@ meetingSchema.index({ tenantId: 1, relatedModule: 1, relatedId: 1 });
 // using departments.
 meetingSchema.index(
   { tenantId: 1, assignedStaffId: 1, startDate: 1 },
-  { unique: true, partialFilterExpression: { source: 'widget', meetingStatus: 'scheduled' } }
+  { unique: true, partialFilterExpression: { meetingStatus: 'scheduled' } }
 );

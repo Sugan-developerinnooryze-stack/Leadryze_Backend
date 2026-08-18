@@ -2,10 +2,11 @@ import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../utils/response';
 import { listParts, getPartById, createPart, updatePart, deletePart } from './part.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listParts(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listParts(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'parts'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) {
     sendError(res, err.message, 500);
@@ -14,7 +15,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getPartById(req.params.id, req.tenantId!);
+    const item = await getPartById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'parts'));
     if (!item) return sendError(res, 'Part not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -38,7 +39,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updatePart(req.params.id, req.tenantId!, req.body);
+    const item = await updatePart(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'parts'));
     if (!item) return sendError(res, 'Part not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -48,7 +49,7 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deletePart(req.params.id, req.tenantId!);
+    const item = await deletePart(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'parts'));
     if (!item) return sendError(res, 'Part not found', 404);
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

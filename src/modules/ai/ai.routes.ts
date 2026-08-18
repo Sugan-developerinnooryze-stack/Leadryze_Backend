@@ -1,9 +1,10 @@
 import { Router, Response, NextFunction } from 'express';
 import axios from 'axios';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, authorize } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { uploadAudio } from '../../middlewares/upload.middleware';
 import { AuthRequest } from '../../types';
-import { sendSuccess } from '../../utils/response';
+import { sendSuccess, sendError } from '../../utils/response';
 import { config } from '../../config';
 
 const router = Router();
@@ -163,6 +164,62 @@ router.post('/followup', async (req: AuthRequest, res: Response, next: NextFunct
     next(err);
   }
 });
+
+/**
+ * @swagger
+ * /ai/voice/chat:
+ *   post:
+ *     tags: [AI]
+ *     summary: Admin-only voice playground — same combined transcribe/respond/
+ *       synthesize turn the public widget uses, but authenticated (a staff
+ *       JWT resolves the tenant, not a widgetKey) so it can be tested without
+ *       a live embedded widget on a real website.
+ */
+router.post(
+  '/voice/chat', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), uploadAudio.single('audio'),
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
+      if (!file) { sendError(res, 'audio file is required', 400); return; }
+
+      const form = new FormData();
+      form.append('audio', new Blob([file.buffer], { type: file.mimetype }), file.originalname || 'audio');
+      form.append('tenantId', req.tenantId!);
+      form.append('sessionId', (req.body?.sessionId as string) || `playground-${req.user!.userId}-${Date.now()}`);
+      if (req.body?.durationSeconds) form.append('durationSeconds', String(req.body.durationSeconds));
+
+      const response = await axios.post(`${AI_URL}/api/voice/chat`, form, { headers: aiHeaders, timeout: 100000 });
+      sendSuccess(res, response.data.data, 'Voice response generated');
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
+ * @swagger
+ * /ai/voice/preview:
+ *   post:
+ *     tags: [AI]
+ *     summary: Test Voice preview — synthesizes a short sample sentence
+ *       with a given Cartesia voice so a tenant admin can confirm it sounds
+ *       right before it's used on a real continuous-voice call.
+ */
+router.post(
+  '/voice/preview', authorize('SUPER_ADMIN', 'TENANT_ADMIN'),
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const response = await axios.post(
+        `${AI_URL}/api/voice/preview`,
+        { voiceId: req.body?.voiceId, text: req.body?.text },
+        { headers: aiHeaders, timeout: 20000 },
+      );
+      sendSuccess(res, response.data.data, 'Voice preview generated');
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 /**
  * @swagger

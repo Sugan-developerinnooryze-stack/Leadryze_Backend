@@ -18,6 +18,17 @@ export const createMeetingSchema = z.object({
   relatedModule: z.union([z.enum(['contact','company','deal','customer','quotation','workorder','contract','lead']), z.literal('')]).optional(),
   relatedId:     z.string().trim().optional(),
   relatedLabel:  z.string().trim().optional(),
+  // Assignment fields — accepted so a staff-authenticated reassignment
+  // (Meeting reassignment UI) can PUT a new assignedStaffId/teamId directly
+  // through this same, unmodified endpoint. Not required on create (the
+  // widget-booking path populates them internally, bypassing this Zod
+  // schema entirely — see internal.routes.ts's own direct createMeeting()
+  // call).
+  assignedStaffId:   z.string().trim().optional(),
+  assignedStaffName: z.string().trim().optional(),
+  teamId:            z.string().trim().optional(),
+  teamName:          z.string().trim().optional(),
+  source:            z.enum(['manual', 'widget']).optional(),
   customFields,
 });
 

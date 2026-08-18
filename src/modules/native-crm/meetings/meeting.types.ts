@@ -17,6 +17,8 @@ export interface IMeeting {
   createdBy?: string;
   assignedStaffId?: string;
   assignedStaffName?: string;
+  teamId?: string;
+  teamName?: string;
   source?: 'manual' | 'widget';
   createdAt: Date;
   updatedAt: Date;
@@ -36,6 +38,8 @@ export interface CreateMeetingDTO {
   relatedLabel?: string;
   assignedStaffId?: string;
   assignedStaffName?: string;
+  teamId?: string;
+  teamName?: string;
   source?: 'manual' | 'widget';
 }
 

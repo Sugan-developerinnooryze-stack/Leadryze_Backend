@@ -1,13 +1,16 @@
 import mongoose from 'mongoose';
 import { NativeSite } from './site.model';
 import { SiteListOptions } from './site.types';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
-export async function listSites(tenantId: string, opts: SiteListOptions, branchId?: string | null) {
+export async function listSites(tenantId: string, opts: SiteListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToCreatedByFilter(filter, scope);
 
   if (opts.status)     filter.status     = opts.status;
   if (opts.customerId) filter.customerId = new mongoose.Types.ObjectId(opts.customerId);
@@ -27,25 +30,31 @@ export async function listSites(tenantId: string, opts: SiteListOptions, branchI
   return { items, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export async function getSiteById(id: string, tenantId: string) {
+export async function getSiteById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeSite.findOne({ _id: id, tenantId: tid }).populate('customerId', 'name phone email');
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeSite.findOne(filter).populate('customerId', 'name phone email');
 }
 
 export async function createSite(data: any) {
   return NativeSite.create(data);
 }
 
-export async function updateSite(id: string, tenantId: string, data: any) {
+export async function updateSite(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   return NativeSite.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     data,
     { new: true, runValidators: true }
   );
 }
 
-export async function deleteSite(id: string, tenantId: string) {
+export async function deleteSite(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeSite.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeSite.findOneAndDelete(filter);
 }

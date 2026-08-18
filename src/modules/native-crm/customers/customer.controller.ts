@@ -7,9 +7,11 @@ import {
   createCustomer,
   updateCustomer,
   deleteCustomer,
+  getCustomerStats,
 } from './customer.service';
 import { getSettings } from '../fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../../platform/pii/pii.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
@@ -18,7 +20,7 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listCustomers(req.tenantId!, req.query as any, req.branchId, req.dataScope);
+    const { items, total, page } = await listCustomers(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'customers'));
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'customers', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 20));
@@ -29,7 +31,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getCustomerById(req.params.id, req.tenantId!, req.dataScope);
+    const item = await getCustomerById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'customers'));
     if (!item) return sendError(res, 'Customer not found', 404);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     sendSuccess(res, transformPIIResponse(item, 'customers', req.user!.role, viewRoles));
@@ -54,7 +56,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateCustomer(req.params.id, req.tenantId!, req.body, req.dataScope);
+    const item = await updateCustomer(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'customers'));
     if (!item) return sendError(res, 'Customer not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -64,10 +66,15 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteCustomer(req.params.id, req.tenantId!, req.dataScope);
+    const item = await deleteCustomer(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'customers'));
     if (!item) return sendError(res, 'Customer not found', 404);
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);
   }
+}
+
+export async function stats(req: AuthRequest, res: Response) {
+  try { sendSuccess(res, await getCustomerStats(req.tenantId!, resolveEffectiveScope(req, 'customers'))); }
+  catch (err: any) { sendError(res, err.message, 500); }
 }

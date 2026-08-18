@@ -2,16 +2,17 @@ import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../utils/response';
 import { listProducts, getProductById, createProduct, updateProduct, deleteProduct } from './product.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listProducts(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listProducts(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'products'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) { sendError(res, err.message, 500); }
 }
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getProductById(req.params.id, req.tenantId!);
+    const item = await getProductById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'products'));
     if (!item) return sendError(res, 'Product not found', 404);
     sendSuccess(res, item);
   } catch (err: any) { sendError(res, err.message, 500); }
@@ -24,14 +25,14 @@ export async function create(req: AuthRequest, res: Response) {
 }
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateProduct(req.params.id, req.tenantId!, req.body);
+    const item = await updateProduct(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'products'));
     if (!item) return sendError(res, 'Product not found', 404);
     sendSuccess(res, item);
   } catch (err: any) { sendError(res, err.message, 400); }
 }
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteProduct(req.params.id, req.tenantId!);
+    const item = await deleteProduct(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'products'));
     if (!item) return sendError(res, 'Product not found', 404);
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) { sendError(res, err.message, 500); }

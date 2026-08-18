@@ -25,6 +25,10 @@ export interface IStaffDoc extends Document {
   status:     'active' | 'inactive' | 'onleave';
   skills?:    string[];
   location?:  { lat: number; lng: number; updatedAt: Date };
+  /** Which UI flow created this record — 'supervisor_flow' when created via
+   * the Supervisors page's inline "Add Staff" form, 'manual' (default) for
+   * the standalone Staffs page. Provenance tag only, mirrors Team.source. */
+  source?: 'manual' | 'supervisor_flow';
   customFields?: Record<string, any>;
   createdBy?: string;
   // Staff mobile-app credentials (never plaintext; managed via app-credentials.service)
@@ -58,6 +62,7 @@ const schema = new Schema<IStaffDoc>(
       lng:       { type: Number },
       updatedAt: { type: Date },
     },
+    source:    { type: String, enum: ['manual', 'supervisor_flow'], default: 'manual' },
     customFields: { type: Schema.Types.Mixed, default: {} },
     createdBy: { type: String },
     // App credentials — select:false keeps secrets out of every list/get response

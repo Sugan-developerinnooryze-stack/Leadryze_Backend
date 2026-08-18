@@ -23,6 +23,18 @@ const videoFilter = (_req: any, file: Express.Multer.File, cb: multer.FileFilter
   }
 };
 
+const audioFilter = (_req: any, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  // Covers MediaRecorder's actual cross-browser output (chiefly webm/opus on
+  // Chrome/Firefox, mp4/aac on Safari) plus a few generic fallbacks.
+  const allowed = /webm|mp4|ogg|wav|m4a|mpeg|mpga/;
+  const ext = path.extname(file.originalname).toLowerCase().replace('.', '');
+  if (allowed.test(ext) || file.mimetype.startsWith('audio/')) {
+    cb(null, true);
+  } else {
+    cb(new Error(`Only audio files are allowed. Received: ${file.mimetype}`));
+  }
+};
+
 const mediaFilter = (_req: any, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
   const imgAllowed = /jpeg|jpg|png|gif|webp|svg|pdf/;
   const vidAllowed = /mp4|webm|ogg|mov|quicktime/;
@@ -60,4 +72,13 @@ export const uploadMedia = multer({
   storage:    multer.memoryStorage(),
   limits:     { fileSize: 10 * 1024 * 1024 },
   fileFilter: mediaFilter,
+});
+
+// Voice-widget recordings — 5 MB limit (comfortably covers a 60s clip at
+// typical opus bitrates; the widget's own recorder additionally auto-stops
+// at 60s client-side as the primary duration guard, this is defense-in-depth).
+export const uploadAudio = multer({
+  storage:    multer.memoryStorage(),
+  limits:     { fileSize: 5 * 1024 * 1024 },
+  fileFilter: audioFilter,
 });

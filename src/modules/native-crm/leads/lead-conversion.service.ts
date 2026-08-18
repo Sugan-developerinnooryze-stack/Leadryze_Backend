@@ -157,8 +157,12 @@ export async function convertLeadToCustomer(
   autoLockIfConfigured(tenantId.toString(), 'leads', lead._id.toString(), wonKey, performedBy).catch(() => {});
   runAutomations(tenantId.toString(), 'lead', lead.toObject(), wonKey).catch(() => {});
 
-  logTimeline(tenantId, 'leads', lead._id.toString(), 'status_changed',
-    `Converted to Customer: ${customer.customerId}`, performedBy,
+  // 'converted' — a distinct action from 'status_changed', so the Lead's own
+  // Assignment/Activity History reads as a clear, final "Lead converted ->
+  // Customer" step (per the requested AI Widget -> Team -> Staff ->
+  // ... -> Converted trail), not lumped in with an ordinary stage move.
+  logTimeline(tenantId, 'leads', lead._id.toString(), 'converted',
+    `Lead converted → Customer: ${customer.customerId}`, performedBy,
     { type: 'customer', entityId: customer._id.toString(), customerId: customer.customerId },
   ).catch(() => {});
 

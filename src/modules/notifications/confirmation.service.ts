@@ -88,7 +88,23 @@ export async function sendOnCreateConfirmation(
     const when = whenFmt(sourceModule, record, meetingTimezone);
     const whenLine = when ? ` scheduled for <strong>${when}</strong>` : '';
     const subject = `Confirmed: ${title} — new ${noun}`;
-    const htmlContent = `<p>Hi <strong>${recipient.name}</strong>,</p><p>This confirms a new ${noun} — <strong>${title}</strong>${whenLine}.</p><p>We'll follow up ahead of time if it's coming up soon.</p><p>Best regards,<br/>LeadRyze AI</p>`;
+
+    // Meeting-specific enrichment — team/assigned staff/timezone/service are
+    // all real fields already on the Meeting document (createMeeting()
+    // passes the full saved doc as `record`), just never surfaced in this
+    // shared, generic confirmation email before now.
+    let meetingDetailLines = '';
+    if (sourceModule === 'meeting') {
+      const details: string[] = [];
+      if (record.teamName) details.push(`<strong>Team:</strong> ${record.teamName}`);
+      if (record.assignedStaffName) details.push(`<strong>With:</strong> ${record.assignedStaffName}`);
+      const topicMatch = typeof record.notes === 'string' ? record.notes.match(/Topic:\s*(.+)$/) : null;
+      if (topicMatch) details.push(`<strong>Reason:</strong> ${topicMatch[1]}`);
+      if (meetingTimezone) details.push(`<strong>Timezone:</strong> ${meetingTimezone}`);
+      if (details.length) meetingDetailLines = `<p>${details.join('<br/>')}</p>`;
+    }
+
+    const htmlContent = `<p>Hi <strong>${recipient.name}</strong>,</p><p>This confirms a new ${noun} — <strong>${title}</strong>${whenLine}.</p>${meetingDetailLines}<p>We'll follow up ahead of time if it's coming up soon.</p><p>Best regards,<br/>LeadRyze AI</p>`;
     const smsText = `Hi ${recipient.name}, confirming your new ${noun} "${title}"${when ? ` on ${when}` : ''}.`;
 
     if (settings.emailEnabled && recipient.email) {

@@ -15,10 +15,11 @@ import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { uploadToS3 } from '../../../services/s3.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listWorkorders(req.tenantId!, req.query, req.branchId);
+    const { items, total, page } = await listWorkorders(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'workorders'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) {
     sendError(res, err.message, 500);
@@ -27,7 +28,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getWorkorderById(req.params.id, req.tenantId!);
+    const item = await getWorkorderById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'workorders'));
     if (!item) return sendError(res, 'Work order not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -53,8 +54,8 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const prev = await getWorkorderById(req.params.id, req.tenantId!);
-    const item = await updateWorkorder(req.params.id, req.tenantId!, req.body);
+    const prev = await getWorkorderById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'workorders'));
+    const item = await updateWorkorder(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'workorders'));
     if (!item) return sendError(res, 'Work order not found', 404);
     const action = req.body.status ? 'status_changed' : 'updated';
     const desc   = req.body.status
@@ -77,7 +78,7 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteWorkorder(req.params.id, req.tenantId!);
+    const item = await deleteWorkorder(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'workorders'));
     if (!item) return sendError(res, 'Work order not found', 404);
     logTimeline(req.tenantId!, 'workorder', req.params.id, 'deleted', `Work order deleted`, req.user?.userId).catch(() => {});
     runAutomationsOnDelete(req.tenantId!, 'workorder', item as any).catch(() => {});
@@ -139,7 +140,7 @@ export async function uploadFiles(req: AuthRequest, res: Response) {
         mimetype: f.mimetype,
         buffer:   f.buffer,
       });
-      await updateWorkorder(id, req.tenantId!, { signatureUrl: url });
+      await updateWorkorder(id, req.tenantId!, { signatureUrl: url }, resolveEffectiveScope(req, 'workorders'));
       results.signatureUrl = url;
       logTimeline(req.tenantId!, 'workorder', id, 'uploaded', 'Signature uploaded', req.user?.userId).catch(() => {});
     }
@@ -156,9 +157,9 @@ export async function uploadFiles(req: AuthRequest, res: Response) {
           })
         )
       );
-      const current  = await getWorkorderById(id, req.tenantId!);
+      const current  = await getWorkorderById(id, req.tenantId!, resolveEffectiveScope(req, 'workorders'));
       const existing = (current as any)?.photos ?? [];
-      await updateWorkorder(id, req.tenantId!, { photos: [...existing, ...urls] });
+      await updateWorkorder(id, req.tenantId!, { photos: [...existing, ...urls] }, resolveEffectiveScope(req, 'workorders'));
       results.photos = urls;
       logTimeline(req.tenantId!, 'workorder', id, 'uploaded', `${photos.length} photo(s) uploaded`, req.user?.userId).catch(() => {});
     }

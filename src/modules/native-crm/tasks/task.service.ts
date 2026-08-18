@@ -4,6 +4,8 @@ import { CreateTaskDTO, UpdateTaskDTO } from './task.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -12,10 +14,11 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listTasks(tenantId: string, opts: ListOptions = {}): Promise<PaginatedResult<unknown>> {
+export async function listTasks(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   if (status) filter.taskStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (upcoming) filter.dueDate = { $gte: new Date() };
@@ -30,9 +33,11 @@ export async function listTasks(tenantId: string, opts: ListOptions = {}): Promi
   return { items, total, page, pages: Math.ceil(total / limit) };
 }
 
-export async function getTaskById(tenantId: string, id: string) {
+export async function getTaskById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Task.findOne({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Task.findOne(filter).lean();
 }
 
 export async function createTask(tenantId: string, dto: CreateTaskDTO) {
@@ -43,24 +48,30 @@ export async function createTask(tenantId: string, dto: CreateTaskDTO) {
   return created;
 }
 
-export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDTO) {
+export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDTO, scope?: DataScope) {
   await assertValidStatus(tenantId, dto.taskStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Task.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: dto }, { new: true }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Task.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
 }
 
-export async function deleteTask(tenantId: string, id: string) {
+export async function deleteTask(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Task.findOneAndDelete({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Task.findOneAndDelete(filter).lean();
 }
 
-export async function getTaskStats(tenantId: string) {
+export async function getTaskStats(tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const now = new Date();
+  const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   const [total, byStatus, overdue] = await Promise.all([
-    Task.countDocuments({ tenantId: tid }),
-    Task.aggregate([{ $match: { tenantId: tid } }, { $group: { _id: '$taskStatus', count: { $sum: 1 } } }]),
-    Task.countDocuments({ tenantId: tid, dueDate: { $lt: now }, taskStatus: { $nin: ['done', 'cancelled'] } }),
+    Task.countDocuments(filter),
+    Task.aggregate([{ $match: filter }, { $group: { _id: '$taskStatus', count: { $sum: 1 } } }]),
+    Task.countDocuments({ ...filter, dueDate: { $lt: now }, taskStatus: { $nin: ['done', 'cancelled'] } }),
   ]);
   return { total, overdue, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
 }

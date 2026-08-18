@@ -2,11 +2,14 @@ import mongoose from 'mongoose';
 import { Company } from './company.model';
 import { CreateCompanyDTO, UpdateCompanyDTO } from './company.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
-export async function listCompanies(tenantId: string, opts: ListOptions = {}): Promise<PaginatedResult<unknown>> {
+export async function listCompanies(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   if (status) filter.companyStatus = status;
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
@@ -19,9 +22,11 @@ export async function listCompanies(tenantId: string, opts: ListOptions = {}): P
   return { items, total, page, pages: Math.ceil(total / limit) };
 }
 
-export async function getCompanyById(tenantId: string, id: string) {
+export async function getCompanyById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Company.findOne({ _id: id, tenantId: tid }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Company.findOne(filter).lean();
 }
 
 export async function createCompany(tenantId: string, dto: CreateCompanyDTO) {
@@ -29,22 +34,28 @@ export async function createCompany(tenantId: string, dto: CreateCompanyDTO) {
   return Company.create({ tenantId: tid, ...dto });
 }
 
-export async function updateCompany(tenantId: string, id: string, dto: UpdateCompanyDTO) {
+export async function updateCompany(tenantId: string, id: string, dto: UpdateCompanyDTO, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Company.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: dto }, { new: true }).lean();
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return Company.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
 }
 
-export async function deleteCompany(tenantId: string, id: string): Promise<boolean> {
+export async function deleteCompany(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const res = await Company.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  const res = await Company.findOneAndDelete(filter);
   return !!res;
 }
 
-export async function getCompanyStats(tenantId: string) {
+export async function getCompanyStats(tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   const [total, byStatus] = await Promise.all([
-    Company.countDocuments({ tenantId: tid }),
-    Company.aggregate([{ $match: { tenantId: tid } }, { $group: { _id: '$companyStatus', count: { $sum: 1 } } }]),
+    Company.countDocuments(filter),
+    Company.aggregate([{ $match: filter }, { $group: { _id: '$companyStatus', count: { $sum: 1 } } }]),
   ]);
   return { total, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
 }

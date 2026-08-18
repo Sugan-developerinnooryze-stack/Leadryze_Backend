@@ -6,6 +6,7 @@ import { listStaffs, getStaffById, createStaff, updateStaff, deleteStaff } from 
 import { NativeStaff } from './staff.model';
 import { getSettings } from '../fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../../platform/pii/pii.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
@@ -14,7 +15,7 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listStaffs(req.tenantId!, req.query as any, req.branchId, req.dataScope);
+    const { items, total, page } = await listStaffs(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'staffs'));
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'staffs', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 20));

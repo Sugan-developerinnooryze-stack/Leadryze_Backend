@@ -6,6 +6,8 @@ import { NativeWorkorder } from '../workorders/workorder.model';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeContract }  from '../contracts/contract.model';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -14,12 +16,13 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listInvoices(tenantId: string, opts: InvoiceListOptions, branchId?: string | null) {
+export async function listInvoices(tenantId: string, opts: InvoiceListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToCreatedByFilter(filter, scope);
 
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.$or = [
@@ -34,9 +37,11 @@ export async function listInvoices(tenantId: string, opts: InvoiceListOptions, b
   return { items, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export async function getInvoiceById(id: string, tenantId: string) {
+export async function getInvoiceById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeInvoice.findOne({ _id: id, tenantId: tid });
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeInvoice.findOne(filter);
 }
 
 export async function createInvoice(data: any) {
@@ -68,11 +73,13 @@ export async function createInvoice(data: any) {
   return doc;
 }
 
-export async function updateInvoice(id: string, tenantId: string, data: any) {
+export async function updateInvoice(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined || data.gstPercentage !== undefined) {
-    const existing = await NativeInvoice.findOne({ _id: id, tenantId: tid }).lean();
+    const existing = await NativeInvoice.findOne(filter).lean();
     const services  = data.services        ?? (existing as any)?.services        ?? [];
     const parts     = data.parts           ?? (existing as any)?.parts           ?? [];
     const discount  = Number(data.discount      ?? (existing as any)?.discount      ?? 0);
@@ -85,13 +92,15 @@ export async function updateInvoice(id: string, tenantId: string, data: any) {
     data.servicesAmountWithTax = after + (after * gst) / 100;
   }
   return NativeInvoice.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     data,
     { new: true, runValidators: true }
   );
 }
 
-export async function deleteInvoice(id: string, tenantId: string) {
+export async function deleteInvoice(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeInvoice.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeInvoice.findOneAndDelete(filter);
 }

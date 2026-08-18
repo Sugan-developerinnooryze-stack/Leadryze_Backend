@@ -5,6 +5,8 @@ import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { generateVisits, computeBalance, serviceRangeSummary } from './schedule.engine';
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -18,12 +20,13 @@ function hasScheduleRules(services: any[]): boolean {
   return Array.isArray(services) && services.some((s) => s?.scheduleRule?.frequency);
 }
 
-export async function listContracts(tenantId: string, opts: ContractListOptions, branchId?: string | null) {
+export async function listContracts(tenantId: string, opts: ContractListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToFilter(filter, scope, 'staffIds');
 
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.$or = [
@@ -45,9 +48,11 @@ export async function listContracts(tenantId: string, opts: ContractListOptions,
   return { items, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export async function getContractById(id: string, tenantId: string) {
+export async function getContractById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const doc = await NativeContract.findOne({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffIds');
+  const doc = await NativeContract.findOne(filter);
   if (!doc) return null;
   const obj: any = doc.toObject();
   obj.serviceBalance      = computeBalance(obj.visits);
@@ -86,15 +91,17 @@ export async function createContract(data: any) {
   return doc;
 }
 
-export async function updateContract(id: string, tenantId: string, data: any) {
+export async function updateContract(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffIds');
   const touchesSchedule =
     data.services !== undefined || data.startDate !== undefined || data.endDate !== undefined;
 
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined
       || data.gstPercentage !== undefined || touchesSchedule) {
-    const existing: any = await NativeContract.findOne({ _id: id, tenantId: tid }).lean();
+    const existing: any = await NativeContract.findOne(filter).lean();
     const services  = data.services        ?? existing?.services        ?? [];
     const parts     = data.parts           ?? existing?.parts           ?? [];
     const discount  = Number(data.discount      ?? existing?.discount      ?? 0);
@@ -120,15 +127,17 @@ export async function updateContract(id: string, tenantId: string, data: any) {
     }
   }
   return NativeContract.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     data,
     { new: true, runValidators: true }
   );
 }
 
-export async function deleteContract(id: string, tenantId: string) {
+export async function deleteContract(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeContract.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffIds');
+  return NativeContract.findOneAndDelete(filter);
 }
 
 /** Patch one visit in place (positional operator — never rewrites the array). */

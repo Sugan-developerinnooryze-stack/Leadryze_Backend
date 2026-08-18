@@ -8,10 +8,11 @@ import {
   updateReceipt,
   deleteReceipt,
 } from './receipt.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listReceipts(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listReceipts(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'receipts'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) {
     sendError(res, err.message, 500);
@@ -20,7 +21,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getReceiptById(req.params.id, req.tenantId!);
+    const item = await getReceiptById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'receipts'));
     if (!item) return sendError(res, 'Receipt not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -44,7 +45,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateReceipt(req.params.id, req.tenantId!, req.body);
+    const item = await updateReceipt(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'receipts'));
     if (!item) return sendError(res, 'Receipt not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -54,7 +55,7 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteReceipt(req.params.id, req.tenantId!);
+    const item = await deleteReceipt(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'receipts'));
     if (!item) return sendError(res, 'Receipt not found', 404);
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

@@ -79,6 +79,11 @@ export const config = {
     level: process.env.LOG_LEVEL || 'info',
     dir: process.env.LOG_DIR || './logs',
   },
+  livekit: {
+    url:       process.env.LIVEKIT_URL || '',
+    apiKey:    process.env.LIVEKIT_API_KEY || '',
+    apiSecret: process.env.LIVEKIT_API_SECRET || '',
+  },
   s3: {
     endpoint:   process.env.SUPABASE_S3_ENDPOINT  || '',
     region:     process.env.SUPABASE_S3_REGION    || 'ap-northeast-1',

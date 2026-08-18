@@ -1,11 +1,12 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../utils/response';
-import { listTeams, getTeamById, createTeam, updateTeam, deleteTeam } from './team.service';
+import { listTeams, getTeamById, createTeam, updateTeam, deleteTeam, getTeamStats } from './team.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listTeams(req.tenantId!, req.query as any, req.branchId, req.dataScope);
+    const { items, total, page } = await listTeams(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'teams'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) {
     sendError(res, err.message, 500);
@@ -43,6 +44,16 @@ export async function update(req: AuthRequest, res: Response) {
     sendSuccess(res, item);
   } catch (err: any) {
     sendError(res, err.message, 400);
+  }
+}
+
+export async function stats(req: AuthRequest, res: Response) {
+  try {
+    const result = await getTeamStats(req.params.id, req.tenantId!);
+    if (!result) return sendError(res, 'Team not found', 404);
+    sendSuccess(res, result);
+  } catch (err: any) {
+    sendError(res, err.message, 500);
   }
 }
 

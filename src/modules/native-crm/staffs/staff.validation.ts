@@ -10,6 +10,7 @@ export const createStaffSchema = z.object({
   userId:    optionalObjectId.nullable(),
   role:      z.string().trim().optional(),
   status:    z.enum(['active','inactive','onleave']).optional(),
+  source:    z.enum(['manual', 'supervisor_flow']).optional(),
   customFields,
 });
 

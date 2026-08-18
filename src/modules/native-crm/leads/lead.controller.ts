@@ -26,10 +26,12 @@ import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { resolveTeamFromStaffId, resolveSupervisorName } from '../shared/team-resolution';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listLeads(req.tenantId!, req.query as any, req.branchId, req.dataScope);
+    const { items, total, page } = await listLeads(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'leads'));
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'leads', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 50));
@@ -67,7 +69,7 @@ const LEAD_EXPORT_COLUMNS: CsvColumn[] = [
  * can never leak a field the requesting role isn't allowed to see. */
 export async function exportCsv(req: AuthRequest, res: Response) {
   try {
-    const items = await listLeadsForExport(req.tenantId!, req.query as any, req.branchId, req.dataScope);
+    const items = await listLeadsForExport(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'leads'));
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'leads', req.user!.role, viewRoles) as any[];
 
@@ -89,10 +91,14 @@ export async function exportCsv(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getLeadById(req.params.id, req.tenantId!, req.dataScope);
+    const item = await getLeadById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
     if (!item) return sendError(res, 'Lead not found', 404);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
-    sendSuccess(res, transformPIIResponse(item, 'leads', req.user!.role, viewRoles));
+    const safeItem = transformPIIResponse(item, 'leads', req.user!.role, viewRoles) as Record<string, unknown>;
+    // Live-resolved, never stored — same rule as the Meeting detail response
+    // (a team's manager can change independently of any given Lead).
+    safeItem.supervisorName = await resolveSupervisorName(req.tenantId!, (item as any).teamId);
+    sendSuccess(res, safeItem);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }
@@ -125,11 +131,36 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const prev = await getLeadRaw(req.params.id, req.tenantId!, req.dataScope);
-    const item = await updateLead(req.params.id, req.tenantId!, req.body, req.dataScope);
+    const prev = await getLeadRaw(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
+
+    // A real staff-owner reassignment (Manager/Admin picking a different
+    // owner) — resolve the new teamId/teamName server-side, same authority
+    // rule as the Meeting reassignment path, before the update is applied.
+    const isReassignment = prev && req.body.leadOwnerStaffId !== undefined
+      && req.body.leadOwnerStaffId !== prev.leadOwnerStaffId;
+    if (isReassignment) {
+      const { teamId, teamName } = await resolveTeamFromStaffId(req.tenantId!, req.body.leadOwnerStaffId);
+      req.body.teamId = teamId ?? undefined;
+      req.body.teamName = teamName ?? undefined;
+    }
+
+    const item = await updateLead(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'leads'));
     if (!item) return sendError(res, 'Lead not found', 404);
 
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
+    if (isReassignment) {
+      const prevOwner = prev!.leadOwner || prev!.leadOwnerStaffId || 'Unassigned';
+      const newOwner = item.leadOwner || req.body.leadOwnerStaffId || 'Unassigned';
+      await NativeTimeline.create({
+        tenantId:     tid,
+        entityModule: 'leads',
+        entityId:     item._id.toString(),
+        action:       'reassigned',
+        description:  `Reassigned from ${prevOwner} to ${newOwner} by ${req.user?.userId ?? 'system'}`,
+        performedBy:  req.user?.userId,
+        metadata:     { previousStaffId: prev!.leadOwnerStaffId, newStaffId: req.body.leadOwnerStaffId, teamId: req.body.teamId, teamName: req.body.teamName },
+      });
+    }
     if (prev && req.body.status && req.body.status !== prev.status) {
       await NativeTimeline.create({
         tenantId:     tid,
@@ -162,8 +193,8 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function updateStage(req: AuthRequest, res: Response) {
   try {
-    const prev = await getLeadRaw(req.params.id, req.tenantId!, req.dataScope);
-    const item = await updateLeadStage(req.params.id, req.tenantId!, req.body.status, req.dataScope);
+    const prev = await getLeadRaw(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
+    const item = await updateLeadStage(req.params.id, req.tenantId!, req.body.status, resolveEffectiveScope(req, 'leads'));
     if (!item) return sendError(res, 'Lead not found', 404);
 
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
@@ -189,7 +220,7 @@ export async function updateStage(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteLead(req.params.id, req.tenantId!, req.dataScope);
+    const item = await deleteLead(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
     if (!item) return sendError(res, 'Lead not found', 404);
     runAutomationsOnDelete(req.tenantId!, 'lead', item.toObject()).catch(() => {});
     sendSuccess(res, null, 'Deleted successfully');
@@ -202,7 +233,7 @@ export async function stats(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const matchFilter: Record<string, unknown> = { tenantId: tid };
-    applyDataScopeToFilter(matchFilter, req.dataScope, 'leadOwnerStaffId');
+    applyDataScopeToFilter(matchFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
     const [pipeline, total, converted] = await Promise.all([
       Lead.aggregate([
         { $match: matchFilter },
@@ -251,7 +282,7 @@ export async function convertToCustomer(req: AuthRequest, res: Response) {
 
 export async function getConversions(req: AuthRequest, res: Response) {
   try {
-    const lead = await getLeadById(req.params.id, req.tenantId!, req.dataScope);
+    const lead = await getLeadById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
     if (!lead) return sendError(res, 'Lead not found', 404);
     sendSuccess(res, (lead as any).conversionHistory ?? []);
   } catch (err: any) {

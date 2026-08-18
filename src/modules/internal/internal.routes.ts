@@ -22,15 +22,20 @@ import { assignRoundRobin, resolveTeamForService } from '../native-crm/staffs/ro
 import { getActiveStaffByStaffId, listStaffs } from '../native-crm/staffs/staff.service';
 import { listTeams } from '../native-crm/teams/team.service';
 import { NativeTeam } from '../native-crm/teams/team.model';
-import { computeAvailableSlots, isSlotFree } from '../native-crm/meetings/availability.service';
+import { computeAvailableSlots, computeTeamAvailableSlots, isSlotFree } from '../native-crm/meetings/availability.service';
 import { createMeeting } from '../native-crm/meetings/meeting.service';
 import { claimWidgetSession, resolveWidgetSessionClaim, releaseWidgetSessionClaim } from './widget-session-claim.service';
-import { trackAiTokenUsage, getTenantTokenUsageThisMonth } from '../admin/ai-token-usage.model';
+import {
+  trackAiTokenUsage, getTenantTokenUsageThisMonth,
+  trackContinuousVoiceUsage, getTenantVoiceMinutesUsageThisMonth,
+} from '../admin/ai-token-usage.model';
 import {
   searchCatalogItems, getCatalogItemBySku, upsertCatalogItemFromSource,
   startKnowledgeSourceSync, finishKnowledgeSourceSync,
 } from '../native-crm/catalog/catalog-item.service';
 import { getWebsiteProfile, upsertWebsiteProfileFromCrawl } from '../native-crm/catalog/website-profile.service';
+import { resolveTeamFromStaffId } from '../native-crm/shared/team-resolution';
+import { NativeTimeline } from '../native-crm/timeline/timeline.model';
 
 const router = Router();
 
@@ -68,7 +73,7 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
     const tid = new mongoose.Types.ObjectId(tenantId);
 
     const [tenant, connectors, recentCustomers, templates, crmModules, customerCounts, qnaPairs, websiteProfile, hasWidgetDepartments] = await Promise.all([
-      Tenant.findById(tid).select('name slug plan settings branding aiConfig'),
+      Tenant.findById(tid).select('name slug plan settings branding aiConfig widget.greeting widget.voice.maxSessionMinutes widget.voice.allowTextDuringVoice widget.voice.voiceName widget.voice.sttLanguage widget.voice.voicePreset widget.booking.requireTeam widget.booking.requireService widget.booking.requireName widget.booking.contactRequirement widget.booking.staffLabel widget.booking.timezone'),
 
       Connector.find({ tenantId: tid, isActive: true })
         .select('type name isActive lastSyncAt syncStatus'),
@@ -155,6 +160,25 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
         branding: tenant.branding,
         aiConfig: tenant.aiConfig,
       },
+      // Only the fields the continuous-voice worker actually needs (the
+      // greeting for its deterministic session.say() opener, and the
+      // per-call duration cap) — deliberately not the whole widget
+      // sub-document, matching this endpoint's own existing "keep the
+      // response small, select only what's used" discipline.
+      widget: {
+        greeting: tenant.widget?.greeting,
+        voice: {
+          maxSessionMinutes: tenant.widget?.voice?.maxSessionMinutes,
+          allowTextDuringVoice: tenant.widget?.voice?.allowTextDuringVoice,
+          // voiceName (push-to-talk free-text override) / sttLanguage (a
+          // Whisper/Deepgram language hint) / voicePreset (continuous-voice
+          // Cartesia selection) — all previously saved but never consumed
+          // by continuous voice's own worker.ts, the real gap this closes.
+          voiceName: tenant.widget?.voice?.voiceName,
+          sttLanguage: tenant.widget?.voice?.sttLanguage,
+          voicePreset: tenant.widget?.voice?.voicePreset,
+        },
+      },
       connectors: connectors.map((c) => ({
         type: c.type,
         name: c.name,
@@ -200,6 +224,17 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
         faqs: websiteProfile.faqs,
       } : null,
       hasWidgetDepartments: !!hasWidgetDepartments,
+      // requireTeam/requireService deliberately pass through as-is
+      // (undefined | true | false), NOT coerced to a boolean here — the AI
+      // side resolves `requireTeam ?? hasWidgetDepartments` so an untouched
+      // tenant keeps today's exact behavior; coercing to false here would
+      // make "never configured" indistinguishable from "explicitly off".
+      bookingRequireTeam:        tenant.widget?.booking?.requireTeam,
+      bookingRequireService:     tenant.widget?.booking?.requireService,
+      bookingRequireName:        tenant.widget?.booking?.requireName ?? true,
+      bookingContactRequirement: tenant.widget?.booking?.contactRequirement ?? 'email_or_phone',
+      bookingStaffLabel:         tenant.widget?.booking?.staffLabel || 'team member',
+      bookingTimezone:           tenant.widget?.booking?.timezone || 'UTC',
     }, 'Tenant context fetched');
   } catch (err) {
     next(err);
@@ -433,10 +468,11 @@ router.get('/sync-status/:tenantId', async (req: Request, res: Response, next: N
  */
 router.post('/chat-session', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, sessionId, role, content, metadata, visitorName, visitorEmail, visitorPhone, escalated } = req.body as {
+    const { tenantId, sessionId, role, content, metadata, visitorId, visitorName, visitorEmail, visitorPhone, escalated, channel } = req.body as {
       tenantId: string; sessionId: string; role: 'user' | 'assistant';
       content: string; metadata?: Record<string, unknown>;
-      visitorName?: string; visitorEmail?: string; visitorPhone?: string; escalated?: boolean;
+      visitorId?: string; visitorName?: string; visitorEmail?: string; visitorPhone?: string; escalated?: boolean;
+      channel?: 'text' | 'push_to_talk' | 'continuous_voice';
     };
     if (!tenantId || !sessionId || !role || !content) {
       sendError(res, 'tenantId, sessionId, role, content are required', 400);
@@ -449,12 +485,19 @@ router.post('/chat-session', async (req: Request, res: Response, next: NextFunct
     if (visitorPhone) setFields.visitorPhone = visitorPhone;
     if (escalated)    setFields.escalated    = true;
 
+    // channel/visitorId default at creation (today's exact prior behavior
+    // for channel) — only ever supplied on a NEW session; an existing
+    // session's channel/visitorId never flip mid-conversation. $setOnInsert
+    // only, matching every other per-session-identity field here.
     await ChatSession.findOneAndUpdate(
       { sessionId },
       {
         $push: { messages: msg },
         ...(Object.keys(setFields).length ? { $set: setFields } : {}),
-        $setOnInsert: { tenantId: new mongoose.Types.ObjectId(tenantId), sessionId, channel: 'web' },
+        $setOnInsert: {
+          tenantId: new mongoose.Types.ObjectId(tenantId), sessionId, channel: channel || 'web',
+          ...(visitorId ? { visitorId } : {}),
+        },
       },
       { upsert: true, new: true }
     );
@@ -902,22 +945,34 @@ router.post('/widget-crawl-complete', async (req: Request, res: Response, next: 
 });
 
 /**
- * GET /api/internal/widget-teams
+ * GET /api/internal/widget-teams?serviceHint=
  *
  * Departments a visitor may choose between when booking — only teams a
  * tenant admin has explicitly marked showInWidget:true, and only active
  * ones. Empty result means "no departments configured" — the AI reads that
- * as "proceed straight to availability", not an error.
+ * as "proceed straight to availability", not an error. When serviceHint is
+ * given, pre-filters to the team(s) resolveTeamForService() confidently
+ * matches (reusing the SAME matcher already used post-booking, not new
+ * matching logic) — falling back to the full list when nothing matches, so
+ * an unconfident/unstated need still shows every option rather than none.
  */
 router.get('/widget-teams', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId } = req.query as { tenantId: string };
+    const { tenantId, serviceHint } = req.query as { tenantId: string; serviceHint?: string };
     if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
       sendError(res, 'tenantId is required', 400);
       return;
     }
     const { items } = await listTeams(tenantId, { status: 'active', showInWidget: true, limit: 100 });
-    sendSuccess(res, { teams: items.map((t: any) => ({ teamId: String(t._id), name: t.name })) });
+    let filtered = items;
+    if (serviceHint) {
+      const matchedTeamId = await resolveTeamForService(tenantId, serviceHint);
+      if (matchedTeamId) {
+        const narrowed = items.filter((t: any) => String(t._id) === matchedTeamId);
+        if (narrowed.length) filtered = narrowed;
+      }
+    }
+    sendSuccess(res, { teams: filtered.map((t: any) => ({ teamId: String(t._id), name: t.name })) });
   } catch (err) { next(err); }
 });
 
@@ -947,20 +1002,31 @@ router.get('/widget-staff', async (req: Request, res: Response, next: NextFuncti
  * see availability.service.ts for the single-capacity model this uses (no
  * per-staff calendars exist anywhere in this codebase). An optional staffId
  * narrows the capacity check to one doctor's own meetings, for tenants using
- * the department/doctor booking wizard.
+ * the department/doctor booking wizard. An optional teamId (used only when
+ * staffId is absent — a specific doctor choice always wins) unions the whole
+ * team's availability instead, via computeTeamAvailableSlots — the direct
+ * fix for "everyone shown as busy just because one team member is" when no
+ * one doctor has been chosen yet.
  */
 router.get('/widget-availability', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, days, timeOfDay, staffId } = req.query as { tenantId: string; days?: string; timeOfDay?: string; staffId?: string };
+    const { tenantId, days, timeOfDay, staffId, teamId, date } = req.query as { tenantId: string; days?: string; timeOfDay?: string; staffId?: string; teamId?: string; date?: string };
     if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
       sendError(res, 'tenantId is required', 400);
       return;
     }
-    const slots = await computeAvailableSlots(tenantId, {
+    const opts = {
       days: days ? parseInt(days, 10) : undefined,
       timeOfDay: (timeOfDay as 'morning' | 'afternoon' | 'any') || undefined,
-      staffId: staffId || undefined,
-    });
+      // Real, confirmed bug this closes: a visitor-requested date (e.g.
+      // "tomorrow") never reached the availability calculation at all — see
+      // availability.service.ts's own comment on computeAvailableSlots for
+      // the full root cause.
+      forDate: (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : undefined,
+    };
+    const slots = (!staffId && teamId && mongoose.isValidObjectId(teamId))
+      ? await computeTeamAvailableSlots(tenantId, teamId, opts)
+      : await computeAvailableSlots(tenantId, { ...opts, staffId: staffId || undefined });
     sendSuccess(res, { slots });
   } catch (err) { next(err); }
 });
@@ -1011,11 +1077,22 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
     // blocking a booking over a selection that's gone stale.
     const chosenStaff = staffId ? await getActiveStaffByStaffId(tenantId, staffId) : null;
 
-    const free = await isSlotFree(tenantId, startIso, endIso, chosenStaff?.staffId);
-    if (!free) {
-      await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
-      sendError(res, 'That time is no longer available — please pick another slot.', 409);
-      return;
+    // Only pre-check availability HERE when a SPECIFIC doctor was chosen —
+    // that's a real, single-capacity check (is THIS person free). When no
+    // doctor is chosen, a blind tenant-wide isSlotFree(..., undefined) check
+    // would incorrectly reject a slot just because SOME unrelated staff
+    // member (possibly not even on the relevant team) has a conflict at that
+    // time — defeating the whole point of team-wide availability/time-aware
+    // round robin below, which is the real, correct authority for "is
+    // SOMEONE on this team free" in that case. A confirmed, real bug found
+    // via live-fire testing, not a hypothetical.
+    if (chosenStaff) {
+      const free = await isSlotFree(tenantId, startIso, endIso, chosenStaff.staffId);
+      if (!free) {
+        await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
+        sendError(res, 'That time is no longer available — please pick another slot.', 409);
+        return;
+      }
     }
 
     let assigned: { staffId: string; staffName: string } | null;
@@ -1024,13 +1101,38 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
     } else {
       // No explicit doctor chosen — try routing by the booking's own topic
       // before falling back to the tenant's fixed default team, same
-      // resolveTeamForService()-first order as widget-lead-capture.
+      // resolveTeamForService()-first order as widget-lead-capture. The
+      // resolved slot is now passed through so assignRoundRobin can skip a
+      // roster member who's actually busy at this exact time (the direct
+      // fix for "A busy -> B should be offered instead") rather than
+      // blindly assigning whoever the plain rotation cursor points at.
       const tenant = await Tenant.findById(tid).select('widget').lean();
       const routedTeamId = await resolveTeamForService(tenantId, topic);
-      assigned = await assignRoundRobin(
-        tenantId,
-        routedTeamId ?? (tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined),
-      );
+      const resolvedTeamId = routedTeamId ?? (tenant?.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined);
+      assigned = await assignRoundRobin(tenantId, resolvedTeamId, { startIso, endIso });
+      // Real, confirmed production bug this closes: neither routedTeamId nor
+      // defaultTeamId is a team the VISITOR actually chose — chosenStaff
+      // being falsy is exactly what put us in this branch. If that guessed
+      // team happens to have nobody active/free on it (e.g. a tenant's
+      // configured default team is short-staffed), a real staff member could
+      // still be free elsewhere in the company — verified live: a tenant
+      // whose default team had ZERO active staff got "no staff available"
+      // on every single booking attempt, regardless of the real slot being
+      // completely open. One retry, company-wide, before ever telling the
+      // visitor nothing is free.
+      if (!assigned && resolvedTeamId) {
+        assigned = await assignRoundRobin(tenantId, undefined, { startIso, endIso });
+      }
+      if (!assigned) {
+        // Every candidate (or the whole tenant, if no team scoping applies)
+        // is genuinely busy at this exact slot — a real, possible race since
+        // the offered times came from a slightly earlier availability check.
+        // Never fall back to a random/unassigned booking — tell the visitor
+        // plainly so the AI can offer fresh times instead.
+        await releaseWidgetSessionClaim(tenantId, sessionId, 'meeting');
+        sendError(res, 'No staff member is available at this time — please pick another slot.', 409);
+        return;
+      }
     }
 
     const { capture, lead } = await captureLeadFromExternalSource(
@@ -1050,6 +1152,7 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
     }
 
     const fullName = `${firstName} ${lastName ?? ''}`.trim();
+    const { teamId: resolvedTeamId2, teamName: resolvedTeamName2 } = await resolveTeamFromStaffId(tenantId, assigned?.staffId);
     let meeting;
     try {
       meeting = await createMeeting(tenantId, {
@@ -1063,8 +1166,23 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
         relatedLabel: fullName,
         assignedStaffId: assigned?.staffId,
         assignedStaffName: assigned?.staffName,
+        teamId: resolvedTeamId2 ?? undefined,
+        teamName: resolvedTeamName2 ?? undefined,
         source: 'widget',
       });
+      if (assigned) {
+        await NativeTimeline.create({
+          tenantId: tid,
+          entityModule: 'meetings',
+          entityId: String(meeting._id),
+          action: 'assigned',
+          description: resolvedTeamName2
+            ? `AI Widget → ${resolvedTeamName2} → ${assigned.staffName}`
+            : `AI Widget → Round Robin → ${assigned.staffName}`,
+          performedBy: 'system:ai-widget',
+          metadata: { staffId: assigned.staffId, staffName: assigned.staffName, teamId: resolvedTeamId2, teamName: resolvedTeamName2 },
+        });
+      }
     } catch (err: any) {
       // Duplicate-key on the partial unique index — two requests raced past
       // the isSlotFree check above for the identical slot. Rare, but a real
@@ -1078,6 +1196,14 @@ router.post('/widget-book-meeting', async (req: Request, res: Response, next: Ne
       }
       throw err;
     }
+
+    // No separate booking-confirmation email needed here — createMeeting()
+    // above already triggers meeting.service.ts's own sendOnCreateConfirmation()
+    // (backend/src/modules/notifications/confirmation.service.ts), a fuller,
+    // already-built, tenant-configurable on-create email/SMS system with its
+    // own EmailLog audit trail. Confirmed live: a direct booking test sent a
+    // real "Confirmed: Call with ... — new meeting" email via Brevo with no
+    // extra code — this route was already covered before this pass.
 
     const result = { meetingId: meeting._id, startIso, endIso, staffName: assigned?.staffName, leadId: lead._id };
     await resolveWidgetSessionClaim(tenantId, sessionId, 'meeting', result);
@@ -1116,9 +1242,13 @@ router.post('/ai-action', async (req: Request, res: Response, next: NextFunction
  */
 router.post('/ai-token-usage', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, promptTokens, completionTokens, totalTokens, estimatedCostUsd, usedModerationFallback } = req.body as {
+    const {
+      tenantId, promptTokens, completionTokens, totalTokens, estimatedCostUsd, usedModerationFallback,
+      sttSeconds, ttsCharacters, voiceCostUsd, isVoiceRequest,
+    } = req.body as {
       tenantId: string; promptTokens?: number; completionTokens?: number;
       totalTokens?: number; estimatedCostUsd?: number; usedModerationFallback?: boolean;
+      sttSeconds?: number; ttsCharacters?: number; voiceCostUsd?: number; isVoiceRequest?: boolean;
     };
     if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
       sendError(res, 'Valid tenantId is required', 400);
@@ -1130,6 +1260,7 @@ router.post('/ai-token-usage', async (req: Request, res: Response, next: NextFun
       totalTokens: totalTokens || 0,
       estimatedCostUsd: estimatedCostUsd || 0,
       usedModerationFallback,
+      sttSeconds, ttsCharacters, voiceCostUsd, isVoiceRequest,
     });
     sendSuccess(res, null, 'Token usage recorded');
   } catch (err) { next(err); }
@@ -1150,6 +1281,50 @@ router.get('/ai-token-usage/:tenantId', async (req: Request, res: Response, next
     }
     const totalTokens = await getTenantTokenUsageThisMonth(tenantId);
     sendSuccess(res, { totalTokens });
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/continuous-voice-usage
+ * Records one completed continuous-voice (LiveKit) session's real usage —
+ * called by the voice-agent worker process (ai/src/voice-agent/worker.ts) at
+ * session close, using AgentSession's own real usage summary
+ * (session.usage.modelUsage), not client-side estimates.
+ */
+router.post('/continuous-voice-usage', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, minutes, deepgramSttSeconds, cartesiaTtsCharacters, estimatedCostUsd } = req.body as {
+      tenantId: string; minutes?: number; deepgramSttSeconds?: number;
+      cartesiaTtsCharacters?: number; estimatedCostUsd?: number;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Valid tenantId is required', 400);
+      return;
+    }
+    await trackContinuousVoiceUsage(tenantId, {
+      minutes: minutes || 0,
+      deepgramSttSeconds: deepgramSttSeconds || 0,
+      cartesiaTtsCharacters: cartesiaTtsCharacters || 0,
+      estimatedCostUsd: estimatedCostUsd || 0,
+    });
+    sendSuccess(res, null, 'Continuous voice usage recorded');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/continuous-voice-usage/:tenantId
+ * Month-to-date continuous-voice minutes — the source of truth
+ * checkTenantVoiceMinutesQuota() in the AI service briefly caches in Redis.
+ */
+router.get('/continuous-voice-usage/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Invalid tenantId', 400);
+      return;
+    }
+    const minutes = await getTenantVoiceMinutesUsageThisMonth(tenantId);
+    sendSuccess(res, { minutes });
   } catch (err) { next(err); }
 });
 

@@ -3,6 +3,7 @@ import { NativeStaff } from './staff.model';
 import { RoundRobinCursor } from './round-robin-cursor.model';
 import { NativeTeam } from '../teams/team.model';
 import { NativeService } from '../services/service.model';
+import { isSlotFree } from '../meetings/availability.service';
 
 /** Rotates through a tenant's active staff roster (optionally scoped to one
  * team) and returns the next one in line — used to auto-assign a Lead
@@ -20,6 +21,7 @@ import { NativeService } from '../services/service.model';
 export async function assignRoundRobin(
   tenantId: string,
   teamId?: string | null,
+  slot?: { startIso: string; endIso: string },
 ): Promise<{ staffId: string; staffName: string } | null> {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid, status: 'active' };
@@ -38,8 +40,35 @@ export async function assignRoundRobin(
     { upsert: true, new: true },
   );
 
-  const idx = ((doc.cursor - 1) % roster.length + roster.length) % roster.length;
-  const staff = roster[idx];
+  const startIdx = ((doc.cursor - 1) % roster.length + roster.length) % roster.length;
+
+  // Time-slot-aware path: walk the roster starting from the cursor position,
+  // skipping anyone with a real conflicting Meeting at this exact slot,
+  // assigning the FIRST free candidate — the direct fix for "A is busy at
+  // 2:30 -> B should be offered instead" (previously assignRoundRobin had no
+  // time parameter at all and could land the cursor on a busy candidate).
+  // The cursor itself already advanced above regardless of who ends up
+  // assigned, so the NEXT booking continues rotating from here, not from
+  // whoever was skipped.
+  if (slot) {
+    for (let i = 0; i < roster.length; i++) {
+      const candidate = roster[(startIdx + i) % roster.length];
+      // eslint-disable-next-line no-await-in-loop -- sequential by design: stop at the first free candidate, don't check the whole roster when the first one already works
+      const free = await isSlotFree(tenantId, slot.startIso, slot.endIso, candidate.staffId);
+      if (free) {
+        return { staffId: candidate.staffId, staffName: `${candidate.firstName} ${candidate.lastName}`.trim() };
+      }
+    }
+    // Every roster member has a conflict at this exact slot — a real,
+    // possible race (the visitor was shown this time via
+    // computeTeamAvailableSlots, which should already exclude a fully-booked
+    // slot, but time may have passed since). The caller must treat null as
+    // "that time is no longer available", never fall back to a random/busy
+    // assignment.
+    return null;
+  }
+
+  const staff = roster[startIdx];
   return { staffId: staff.staffId, staffName: `${staff.firstName} ${staff.lastName}`.trim() };
 }
 

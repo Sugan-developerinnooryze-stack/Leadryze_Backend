@@ -119,6 +119,14 @@ export interface ITenant extends Document {
      * internal, staff-authenticated assistant (a different, unmetered
      * surface — see isPublicVisitor in base.agent.ts). */
     monthlyTokenLimit?: number;
+    /** Monthly minute budget for CONTINUOUS voice conversations specifically
+     * (LiveKit room-minutes) — a completely separate meter from
+     * monthlyTokenLimit above (which covers LLM tokens across every channel,
+     * text included). Undefined = fall back to a plan-tier default, same
+     * "explicit value is a per-tenant override" convention as
+     * monthlyTokenLimit. Never applies to push-to-talk voice (a different,
+     * per-turn-charged capability) or the internal staff assistant. */
+    monthlyVoiceMinutesLimit?: number;
     /** Which already-integrated LLM provider/model powers RAG/catalog/
      * booking tool-calling for the public widget specifically — undefined
      * means "use the global primary/fallback pair" (today's unchanged
@@ -126,6 +134,14 @@ export interface ITenant extends Document {
      * assistant, which has no tools bound today. See ai/src/config/index.ts's
      * TOOL_MODEL_PRESETS for what each value resolves to. */
     toolModelPreset?: 'groq' | 'anthropic' | 'openai' | 'google';
+    /** Opt-in — when true, a Meeting linked to a Lead (relatedModule:'lead')
+     * that gets marked meetingStatus:'completed' automatically converts that
+     * Lead to a Customer (via the same, unified convertLeadToCustomer() the
+     * manual "Convert" button already uses). Default false/undefined —
+     * conversion stays a manual action unless a tenant explicitly turns this
+     * on. Idempotent: an already-converted Lead (isConverted:true) is never
+     * re-converted, checked before ever attempting it. */
+    autoConvertLeadOnMeetingCompleted?: boolean;
   };
   /** Public embeddable chatbot widget — a tenant installs one <script> tag on
    * THEIR OWN website; an anonymous visitor's browser talks only to the
@@ -182,8 +198,82 @@ export interface ITenant extends Document {
       leadTimeHours: number;
       horizonDays: number;
       hours: Array<{ day: 0 | 1 | 2 | 3 | 4 | 5 | 6; start: string; end: string }>;
+      /** Tenant-configurable required-field toggles for the AI booking
+       * flow — previously the widget always asked about a department/team
+       * whenever one existed (showInWidget:true), even for tenants where
+       * that step made no sense. requireTeam/requireService are left
+       * genuinely undefined unless a tenant explicitly sets them — resolved
+       * as `requireTeam ?? hasWidgetDepartments` so an untouched tenant
+       * keeps today's exact behavior, and only an EXPLICIT false suppresses
+       * the department question for a tenant that does have teams visible. */
+      requireTeam?: boolean;
+      requireService?: boolean;
+      requireName?: boolean;
+      /** Replaces the old implicit "email OR phone" assumption with an
+       * explicit choice — assessBookingReadiness() reads this directly.
+       * Defaults to 'email_or_phone', the exact behavior every booking
+       * already had before this field existed. */
+      contactRequirement?: 'email_only' | 'phone_only' | 'email_or_phone' | 'email_and_phone';
+      /** Generic term substituted wherever the AI would otherwise say
+       * "staff member" — lets a tenant say "Doctor", "Stylist",
+       * "Consultant", etc. without the codebase hardcoding any of them.
+       * Defaults to 'team member'. */
+      staffLabel?: string;
+    };
+    /** Browser-microphone voice input/output for the widget — push-to-talk
+     * only in this pass (no streaming/continuous mode). Reply LANGUAGE
+     * deliberately reuses aiConfig.language above rather than a second field
+     * here, to avoid the two ever drifting out of sync; sttLanguage is the
+     * one genuinely voice-specific setting (a Whisper language hint, or
+     * omitted for auto-detect). */
+    voice?: {
+      enabled: boolean;
+      sttProvider: 'groq';
+      ttsProvider: 'groq';
+      voiceName?: string;
+      sttLanguage?: string;
+      autoPlay: boolean;
+      /** Continuous, hands-free voice conversation (LiveKit) — separate from
+       * `enabled` above (push-to-talk) so a tenant can run either, both, or
+       * neither independently; higher real per-minute cost (LiveKit +
+       * Deepgram + Cartesia), so this is never implied by `enabled`. */
+      continuousModeEnabled?: boolean;
+      /** Hard per-call duration cap (minutes) for continuous voice —
+       * independent of aiConfig.monthlyVoiceMinutesLimit (a monthly
+       * aggregate) — protects against one runaway/stuck call consuming a
+       * tenant's whole monthly budget alone. Undefined/0 = no per-call cap. */
+      maxSessionMinutes?: number;
+      /** Whether the widget's text input stays usable while a continuous
+       * voice call is active (default true — hybrid mode). A tenant can
+       * turn this off to force "one active conversational channel at a
+       * time" if simultaneous voice+text ever proves confusing for their
+       * own visitors. */
+      allowTextDuringVoice?: boolean;
+      /** Structured Cartesia voice preset for CONTINUOUS voice specifically
+       * (push-to-talk's own Groq/Orpheus voiceName above is unaffected —
+       * Orpheus's valid voice names remain unverified pending the account
+       * accepting that model's terms). Kept alongside, not replacing,
+       * voiceName — worker.ts prefers voicePreset.voiceId when set, falling
+       * back to voiceName, then a default. Storing `provider` now (even
+       * though Cartesia is the only one wired up) means a second TTS
+       * provider later is a new preset-map entry, not a schema migration. */
+      voicePreset?: {
+        provider: 'cartesia';
+        voiceId: string;
+        displayName: string;
+        gender: 'male' | 'female';
+        language: string;
+      };
     };
   };
+  /** Per-module "is row-level Supervisor/Agent data scoping enforced, or is
+   * everyone shown full tenant-wide access" toggle — read via
+   * native-crm/shared/data-scope.ts's resolveEffectiveScope(), merged over
+   * DEFAULT_DATA_SCOPE_CONFIG there so an unset key still resolves to a
+   * sensible default (catalog/reference modules off, everything
+   * transactional on) rather than needing every key explicitly present.
+   * Never affects SUPER_ADMIN/TENANT_ADMIN, who are always unscoped. */
+  dataScopeConfig?: Record<string, boolean>;
 }
 
 const tenantSchema = new Schema<ITenant>(
@@ -246,7 +336,9 @@ const tenantSchema = new Schema<ITenant>(
       fallbackToHuman: { type: Boolean, default: true },
       agentName: String,
       monthlyTokenLimit: Number,
+      monthlyVoiceMinutesLimit: Number,
       toolModelPreset: { type: String, enum: ['groq', 'anthropic', 'openai', 'google'] },
+      autoConvertLeadOnMeetingCompleted: { type: Boolean, default: false },
     },
     widget: {
       enabled:        { type: Boolean, default: false },
@@ -279,8 +371,43 @@ const tenantSchema = new Schema<ITenant>(
             { day: 5, start: '09:00', end: '17:00' },
           ],
         },
+        // No `default` on requireTeam/requireService — deliberately left
+        // undefined unless a tenant explicitly sets one, so the resolution
+        // logic (internal.routes.ts / context.builder.ts) can distinguish
+        // "never configured, fall back to today's hasWidgetDepartments
+        // behavior" from "explicitly set to false, never ask" — a plain
+        // `default: false` would make both cases indistinguishable and
+        // silently break every tenant with showInWidget teams already set.
+        requireTeam:    { type: Boolean },
+        requireService: { type: Boolean },
+        requireName:    { type: Boolean, default: true },
+        contactRequirement: {
+          type: String,
+          enum: ['email_only', 'phone_only', 'email_or_phone', 'email_and_phone'],
+          default: 'email_or_phone',
+        },
+        staffLabel: { type: String, default: 'team member' },
+      },
+      voice: {
+        enabled:      { type: Boolean, default: false },
+        sttProvider:  { type: String, enum: ['groq'], default: 'groq' },
+        ttsProvider:  { type: String, enum: ['groq'], default: 'groq' },
+        voiceName:    String,
+        sttLanguage:  String,
+        autoPlay:     { type: Boolean, default: true },
+        continuousModeEnabled: { type: Boolean, default: false },
+        maxSessionMinutes:     Number,
+        allowTextDuringVoice:  { type: Boolean, default: true },
+        voicePreset: {
+          provider:    { type: String, enum: ['cartesia'] },
+          voiceId:     String,
+          displayName: String,
+          gender:      { type: String, enum: ['male', 'female'] },
+          language:    String,
+        },
       },
     },
+    dataScopeConfig: { type: Schema.Types.Mixed, default: {} },
   },
   { timestamps: true }
 );

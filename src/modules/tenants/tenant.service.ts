@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { Tenant, ITenant } from './tenant.model';
 import { parsePagination, buildSkip } from '../../utils/pagination';
 import { uploadToS3, deleteFromS3, keyFromUrl } from '../../services/s3.service';
+import { DEFAULT_DATA_SCOPE_CONFIG } from '../native-crm/shared/data-scope';
 
 export async function createTenant(data: Partial<ITenant>): Promise<ITenant> {
   if (!data.slug && data.name) {
@@ -48,13 +49,14 @@ export async function updateTenant(
   // aiConfig ({agentName, language, systemPrompt} only) — every save from
   // that existing page was silently wiping fallbackToHuman/monthlyTokenLimit
   // back to their schema defaults before this dot-notation merge existed.
-  const { widget, aiConfig, ...rest } = data as Partial<ITenant> & {
+  const { widget, aiConfig, dataScopeConfig, ...rest } = data as Partial<ITenant> & {
     widget?: Record<string, unknown>;
     aiConfig?: Record<string, unknown>;
+    dataScopeConfig?: Record<string, unknown>;
   };
   const update: Record<string, unknown> = { ...rest };
   if (widget && typeof widget === 'object') {
-    for (const key of ['enabled', 'allowedDomains', 'greeting', 'defaultTeamId', 'websiteUrl', 'booking', 'template']) {
+    for (const key of ['enabled', 'allowedDomains', 'greeting', 'defaultTeamId', 'websiteUrl', 'booking', 'template', 'voice']) {
       if (widget[key] !== undefined) update[`widget.${key}`] = widget[key];
     }
     // lastCrawledAt/crawlPageCount are deliberately NOT in the allow-list above —
@@ -62,8 +64,20 @@ export async function updateTenant(
     // never accepted from the generic tenant-update payload.
   }
   if (aiConfig && typeof aiConfig === 'object') {
-    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'toolModelPreset']) {
+    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'monthlyVoiceMinutesLimit', 'toolModelPreset', 'autoConvertLeadOnMeetingCompleted']) {
       if (aiConfig[key] !== undefined) update[`aiConfig.${key}`] = aiConfig[key];
+    }
+  }
+  // Same "never wipe sibling keys" reasoning as widget/aiConfig above, but
+  // the key set here is dynamic (one boolean per native-crm module) rather
+  // than fixed — validated against DEFAULT_DATA_SCOPE_CONFIG's own keys
+  // (the authoritative module list) instead of a hardcoded array, and each
+  // value coerced to a real boolean so a stray non-boolean payload value
+  // can never silently corrupt the toggle a module's own filter-builder
+  // later reads as truthy/falsy.
+  if (dataScopeConfig && typeof dataScopeConfig === 'object') {
+    for (const key of Object.keys(DEFAULT_DATA_SCOPE_CONFIG)) {
+      if (dataScopeConfig[key] !== undefined) update[`dataScopeConfig.${key}`] = Boolean(dataScopeConfig[key]);
     }
   }
   return Tenant.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });

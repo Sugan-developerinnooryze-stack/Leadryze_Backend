@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 import { NativeQuotation } from './quotation.model';
 import { QuotationListOptions } from './quotation.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -10,12 +12,13 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listQuotations(tenantId: string, opts: QuotationListOptions, branchId?: string | null) {
+export async function listQuotations(tenantId: string, opts: QuotationListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToCreatedByFilter(filter, scope);
 
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.$or = [
@@ -30,9 +33,11 @@ export async function listQuotations(tenantId: string, opts: QuotationListOption
   return { items, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export async function getQuotationById(id: string, tenantId: string) {
+export async function getQuotationById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeQuotation.findOne({ _id: id, tenantId: tid });
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeQuotation.findOne(filter);
 }
 
 export async function createQuotation(data: any) {
@@ -52,11 +57,13 @@ export async function createQuotation(data: any) {
   });
 }
 
-export async function updateQuotation(id: string, tenantId: string, data: any) {
+export async function updateQuotation(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined || data.gstPercentage !== undefined) {
-    const existing = await NativeQuotation.findOne({ _id: id, tenantId: tid }).lean();
+    const existing = await NativeQuotation.findOne(filter).lean();
     const services  = data.services        ?? (existing as any)?.services        ?? [];
     const parts     = data.parts           ?? (existing as any)?.parts           ?? [];
     const discount  = Number(data.discount      ?? (existing as any)?.discount      ?? 0);
@@ -69,13 +76,15 @@ export async function updateQuotation(id: string, tenantId: string, data: any) {
     data.servicesAmountWithTax = after + (after * gst) / 100;
   }
   return NativeQuotation.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     data,
     { new: true, runValidators: true }
   );
 }
 
-export async function deleteQuotation(id: string, tenantId: string) {
+export async function deleteQuotation(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeQuotation.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  applyDataScopeToCreatedByFilter(filter, scope);
+  return NativeQuotation.findOneAndDelete(filter);
 }

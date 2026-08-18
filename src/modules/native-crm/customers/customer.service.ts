@@ -58,3 +58,19 @@ export async function deleteCustomer(id: string, tenantId: string, scope?: DataS
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   return NativeCustomer.findOneAndDelete(filter);
 }
+
+/** New — mirrors Lead.stats()/Meeting.stats()' own already-scoped pattern
+ * exactly (no Customer aggregate endpoint existed before this). Feeds the
+ * Supervisor dashboard's 3rd stat tile — correctly scoped to a Manager's
+ * own team(s) or an Agent's own records via the same applyDataScopeToFilter
+ * every other Customer query already uses. */
+export async function getCustomerStats(tenantId: string, scope?: DataScope) {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const matchFilter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToFilter(matchFilter, scope, 'assignedStaffId');
+  const [total, byStatus] = await Promise.all([
+    NativeCustomer.countDocuments(matchFilter),
+    NativeCustomer.aggregate([{ $match: matchFilter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+  ]);
+  return { total, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
+}

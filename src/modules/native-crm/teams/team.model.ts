@@ -23,6 +23,11 @@ export interface ITeamDoc extends Document {
    * chatbot-captured free-text service mention to the right team's
    * round-robin roster instead of the tenant's single default team. */
   serviceIds?: mongoose.Types.ObjectId[];
+  /** Which UI flow created this record — 'supervisor_flow' when created via
+   * the Supervisors page's inline "Create Team" form, 'manual' (default)
+   * for the standalone Teams page. Purely a display/provenance tag, not a
+   * security boundary — mirrors Lead.source/Meeting.source. */
+  source?: 'manual' | 'supervisor_flow';
   customFields?: Record<string, any>;
   createdBy?:  string;
   createdAt:   Date;
@@ -42,6 +47,7 @@ const schema = new Schema<ITeamDoc>(
     showInWidget: { type: Boolean, default: false },
     managerUserId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     serviceIds:  [{ type: Schema.Types.ObjectId, ref: 'NativeService' }],
+    source:      { type: String, enum: ['manual', 'supervisor_flow'], default: 'manual' },
     customFields: { type: Schema.Types.Mixed, default: {} },
     createdBy:   { type: String },
   },

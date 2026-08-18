@@ -7,6 +7,8 @@ import { NativeContract }  from '../contracts/contract.model';
 import { NativeStaff }     from '../staffs/staff.model';
 import { getSettings }     from '../fs-settings/fs-settings.service';
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { DataScope } from '../../../types';
+import { applyDataScopeToFilter } from '../shared/data-scope';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -22,12 +24,13 @@ async function getDefaultDuration(tenantId: string, branchId?: string | null): P
   return Number.isFinite(def) && def > 0 ? def : null;
 }
 
-export async function listWorkorders(tenantId: string, opts: WorkorderListOptions, branchId?: string | null) {
+export async function listWorkorders(tenantId: string, opts: WorkorderListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToFilter(filter, scope, 'staffIds');
 
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.$or = [
@@ -53,9 +56,11 @@ export async function listWorkorders(tenantId: string, opts: WorkorderListOption
   return { items, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export async function getWorkorderById(id: string, tenantId: string) {
+export async function getWorkorderById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeWorkorder.findOne({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffIds');
+  return NativeWorkorder.findOne(filter);
 }
 
 /** Keep staffId <-> staffIds consistent when either key is present in the payload. */
@@ -112,11 +117,13 @@ export async function createWorkorder(data: any) {
   return doc;
 }
 
-export async function updateWorkorder(id: string, tenantId: string, data: any) {
+export async function updateWorkorder(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffIds');
   const doc = await NativeWorkorder.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     normalizeStaffAssignment(data),
     { new: true, runValidators: true }
   );
@@ -144,9 +151,11 @@ export async function updateWorkorder(id: string, tenantId: string, data: any) {
   return doc;
 }
 
-export async function deleteWorkorder(id: string, tenantId: string) {
+export async function deleteWorkorder(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeWorkorder.findOneAndDelete({ _id: id, tenantId: tid });
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffIds');
+  return NativeWorkorder.findOneAndDelete(filter);
 }
 
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {

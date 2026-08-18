@@ -4,6 +4,7 @@ import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../uti
 import { listSites, getSiteById, createSite, updateSite, deleteSite } from './site.service';
 import { getSettings } from '../fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../../platform/pii/pii.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
@@ -12,7 +13,7 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listSites(req.tenantId!, req.query as any, req.branchId);
+    const { items, total, page } = await listSites(req.tenantId!, req.query as any, req.branchId, resolveEffectiveScope(req, 'sites'));
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(items, 'sites', req.user!.role, viewRoles);
     sendPaginated(res, safeItems, total, page, Number(req.query.limit ?? 20));
@@ -23,7 +24,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getSiteById(req.params.id, req.tenantId!);
+    const item = await getSiteById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'sites'));
     if (!item) return sendError(res, 'Site not found', 404);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     sendSuccess(res, transformPIIResponse(item, 'sites', req.user!.role, viewRoles));
@@ -48,7 +49,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateSite(req.params.id, req.tenantId!, req.body);
+    const item = await updateSite(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'sites'));
     if (!item) return sendError(res, 'Site not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -58,7 +59,7 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteSite(req.params.id, req.tenantId!);
+    const item = await deleteSite(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'sites'));
     if (!item) return sendError(res, 'Site not found', 404);
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

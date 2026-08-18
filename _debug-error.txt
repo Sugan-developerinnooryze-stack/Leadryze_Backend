@@ -1,0 +1,11 @@
+MongoServerError: Plan executor error during findAndModify :: caused by :: E11000 duplicate key error collection: leadryze.crm_meetings index: tenantId_1_assignedStaffId_1_startDate_1 dup key: { tenantId: ObjectId('6a3cab08c3fc75c6089ad38e'), assignedStaffId: "rrverify_1786516388810-ST-0001", startDate: new Date(1786788000000) }
+    at Connection.sendCommand (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongodb\src\cmap\connection.ts:559:17)
+    at processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async Connection.command (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongodb\src\cmap\connection.ts:633:22)
+    at async Server.command (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongodb\src\sdam\server.ts:350:21)
+    at async tryOperation (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongodb\src\operations\execute_operation.ts:289:24)
+    at async executeOperation (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongodb\src\operations\execute_operation.ts:119:12)
+    at async Collection.findOneAndUpdate (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongodb\src\collection.ts:1041:12)
+    at async model.Query._findOneAndUpdate (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongoose\lib\query.js:3536:13)
+    at async model.Query.exec (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\node_modules\mongoose\lib\query.js:4627:63)
+    at async Object.updateMeeting (C:\Users\Innoverse\Desktop\Leadryze_AI\backend\src\modules\native-crm\meetings\meeting.service.ts:81:19)

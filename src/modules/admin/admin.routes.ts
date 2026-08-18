@@ -240,6 +240,7 @@ router.get('/system/health', async (_req, res, next) => {
     let aiOk = false;
     let aiKeys: Record<string, boolean | string> = {};
     let aiChecks: Record<string, 'ok' | 'degraded'> = {};
+    let voiceAgent: { running: boolean; lastHeartbeatAt: string | null; ageSeconds: number | null } | null = null;
     try {
       const aiRes = await axios.get(`${config.app.aiServiceUrl}/health/detail`, {
         timeout: 4000,
@@ -248,8 +249,10 @@ router.get('/system/health', async (_req, res, next) => {
       aiOk = true;
       if (aiRes.data?.keys) aiKeys = aiRes.data.keys;
       if (aiRes.data?.checks) aiChecks = aiRes.data.checks;
+      if (aiRes.data?.voiceAgent) voiceAgent = aiRes.data.voiceAgent;
     } catch { /* offline */ }
     const qdrantOk = aiChecks.qdrant === 'ok';
+    const voiceAgentOk = !!voiceAgent?.running;
 
     // Brevo/Twilio — real, side-effect-free reachability pings, not just
     // "is the API key set" (which the apiKeys list below already shows).
@@ -282,6 +285,15 @@ router.get('/system/health', async (_req, res, next) => {
       { name: 'Qdrant',     status: qdrantOk ? 'ok' : 'error', detail: aiOk ? (qdrantOk ? 'Reachable' : 'Unreachable') : 'Unknown (AI service offline)' },
       { name: 'Brevo',      status: brevoOk  ? 'ok' : 'error', detail: brevoOk  ? 'Reachable' : (config.brevo.apiKey ? 'Unreachable' : 'Not configured') },
       { name: 'Twilio',     status: twilioOk ? 'ok' : 'error', detail: twilioOk ? 'Reachable' : (config.twilio.accountSid ? 'Unreachable' : 'Not configured') },
+      {
+        name: 'Voice Agent Worker',
+        status: voiceAgentOk ? 'ok' : 'error',
+        detail: !aiOk
+          ? 'Unknown (AI service offline)'
+          : voiceAgentOk
+            ? `Running (last heartbeat ${Math.round(voiceAgent!.ageSeconds ?? 0)}s ago)`
+            : 'Not running — start with `npm run voice-agent` (or `npm run dev:with-voice`) in ai/',
+      },
     ];
 
     // Determine which providers are active from AI service response
@@ -488,7 +500,7 @@ router.get('/ai-usage', async (_req, res, next) => {
     const monthStart = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`;
 
     const [tenants, usageRows] = await Promise.all([
-      Tenant.find({ isActive: true }).select('name plan aiConfig.monthlyTokenLimit').lean(),
+      Tenant.find({ isActive: true }).select('name plan aiConfig.monthlyTokenLimit aiConfig.monthlyVoiceMinutesLimit').lean(),
       AiTokenUsage.aggregate([
         { $match: { date: { $gte: monthStart } } },
         {
@@ -498,6 +510,15 @@ router.get('/ai-usage', async (_req, res, next) => {
             estimatedCostUsd: { $sum: '$estimatedCostUsd' },
             requestCount: { $sum: '$requestCount' },
             moderationFallbackCount: { $sum: '$moderationFallbackCount' },
+            sttSeconds: { $sum: '$sttSeconds' },
+            ttsCharacters: { $sum: '$ttsCharacters' },
+            voiceCostUsd: { $sum: '$voiceCostUsd' },
+            voiceRequestCount: { $sum: '$voiceRequestCount' },
+            continuousVoiceMinutes: { $sum: '$continuousVoiceMinutes' },
+            continuousVoiceSessionCount: { $sum: '$continuousVoiceSessionCount' },
+            deepgramSttSeconds: { $sum: '$deepgramSttSeconds' },
+            cartesiaTtsCharacters: { $sum: '$cartesiaTtsCharacters' },
+            continuousVoiceCostUsd: { $sum: '$continuousVoiceCostUsd' },
           },
         },
       ]),
@@ -512,6 +533,13 @@ router.get('/ai-usage', async (_req, res, next) => {
       professional: 1_500_000,
       enterprise: 8_000_000,
     };
+    // Mirrors ai/src/services/context.builder.ts's own default map for this
+    // same field — kept in sync manually, same as the token limits above.
+    const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
+      starter: 100,
+      professional: 500,
+      enterprise: 3000,
+    };
 
     const rows = tenants
       .map((t: any) => {
@@ -519,6 +547,9 @@ router.get('/ai-usage', async (_req, res, next) => {
         const monthlyTokenLimit =
           t.aiConfig?.monthlyTokenLimit ?? DEFAULT_MONTHLY_TOKEN_LIMITS[t.plan] ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter;
         const tokensUsedThisMonth = usageRow?.totalTokens ?? 0;
+        const monthlyVoiceMinutesLimit =
+          t.aiConfig?.monthlyVoiceMinutesLimit ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS[t.plan] ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS.starter;
+        const continuousVoiceMinutesUsed = usageRow?.continuousVoiceMinutes ?? 0;
         return {
           tenantId: String(t._id),
           tenantName: t.name,
@@ -529,6 +560,17 @@ router.get('/ai-usage', async (_req, res, next) => {
           estimatedCostUsd: usageRow?.estimatedCostUsd ?? 0,
           requestCount: usageRow?.requestCount ?? 0,
           moderationFallbackCount: usageRow?.moderationFallbackCount ?? 0,
+          sttSeconds: usageRow?.sttSeconds ?? 0,
+          ttsCharacters: usageRow?.ttsCharacters ?? 0,
+          voiceCostUsd: usageRow?.voiceCostUsd ?? 0,
+          voiceRequestCount: usageRow?.voiceRequestCount ?? 0,
+          monthlyVoiceMinutesLimit,
+          continuousVoiceMinutesUsed,
+          voiceMinutesPercentUsed: monthlyVoiceMinutesLimit > 0 ? continuousVoiceMinutesUsed / monthlyVoiceMinutesLimit : 0,
+          continuousVoiceSessionCount: usageRow?.continuousVoiceSessionCount ?? 0,
+          deepgramSttSeconds: usageRow?.deepgramSttSeconds ?? 0,
+          cartesiaTtsCharacters: usageRow?.cartesiaTtsCharacters ?? 0,
+          continuousVoiceCostUsd: usageRow?.continuousVoiceCostUsd ?? 0,
         };
       })
       .sort((a, b) => b.percentUsed - a.percentUsed);

@@ -12,10 +12,11 @@ import { logTimeline } from '../timeline/timeline.service';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
+import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listInvoices(req.tenantId!, req.query, req.branchId);
+    const { items, total, page } = await listInvoices(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'invoices'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
   } catch (err: any) {
     sendError(res, err.message, 500);
@@ -24,7 +25,7 @@ export async function list(req: AuthRequest, res: Response) {
 
 export async function getOne(req: AuthRequest, res: Response) {
   try {
-    const item = await getInvoiceById(req.params.id, req.tenantId!);
+    const item = await getInvoiceById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'invoices'));
     if (!item) return sendError(res, 'Invoice not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {
@@ -50,8 +51,8 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const prev = await getInvoiceById(req.params.id, req.tenantId!);
-    const item = await updateInvoice(req.params.id, req.tenantId!, req.body);
+    const prev = await getInvoiceById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'invoices'));
+    const item = await updateInvoice(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'invoices'));
     if (!item) return sendError(res, 'Invoice not found', 404);
     const action = req.body.status ? 'status_changed' : 'updated';
     const desc   = req.body.status ? `Status changed to ${req.body.status}` : `Invoice ${(item as any).invoiceId} updated`;
@@ -72,7 +73,7 @@ export async function update(req: AuthRequest, res: Response) {
 
 export async function remove(req: AuthRequest, res: Response) {
   try {
-    const item = await deleteInvoice(req.params.id, req.tenantId!);
+    const item = await deleteInvoice(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'invoices'));
     if (!item) return sendError(res, 'Invoice not found', 404);
     logTimeline(req.tenantId!, 'invoice', req.params.id, 'deleted', 'Invoice deleted', req.user?.userId).catch(() => {});
     runAutomationsOnDelete(req.tenantId!, 'invoice', item as any).catch(() => {});

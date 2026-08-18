@@ -4,6 +4,7 @@ import { CaptureLeadInput, LeadCaptureListOptions } from './lead-capture.types';
 import { createLead } from '../leads/lead.service';
 import { runAutomationsOnCreate } from '../automation-rules/automation-rule.service';
 import { NativeTimeline } from '../timeline/timeline.model';
+import { resolveTeamFromStaffId } from '../shared/team-resolution';
 
 function firstNonEmpty(...vals: unknown[]): string | undefined {
   for (const v of vals) {
@@ -81,6 +82,8 @@ export async function captureLeadFromExternalSource(
   // Lead.model.ts's own LeadSource union already has a matching value
   // ('chatbot' for the AI widget); every other platform falls back to the
   // generic 'api' value, same as before this mapping existed.
+  const { teamId, teamName } = await resolveTeamFromStaffId(tenantId, input.assignedStaffId);
+
   const lead = await createLead({
     tenantId,
     branchId: branchId ?? null,
@@ -95,6 +98,8 @@ export async function captureLeadFromExternalSource(
     lastActivityAt: new Date(),
     leadOwnerStaffId: input.assignedStaffId,
     leadOwner:        input.assignedStaffName,
+    teamId:    teamId ?? undefined,
+    teamName:  teamName ?? undefined,
     interestedServices: normalized.service ? [normalized.service] : undefined,
     customFields: {
       _leadCaptureId:   String(capture._id),
@@ -111,6 +116,25 @@ export async function captureLeadFromExternalSource(
     performedBy:  userId,
     metadata:     { leadCaptureId: capture._id, capturePlatform: input.platform },
   });
+
+  // A real round-robin/team assignment happened (not every capture has
+  // one — e.g. a browser-extension capture with no configured team) —
+  // record it as its own step in the Lead's own assignment history, giving
+  // the exact "AI Widget -> Team -> Staff" trail requested, distinct from
+  // the plain "created" entry above.
+  if (input.assignedStaffId) {
+    await NativeTimeline.create({
+      tenantId:     tid,
+      entityModule: 'leads',
+      entityId:     lead._id.toString(),
+      action:       'assigned',
+      description:  teamName
+        ? `${input.platform === 'chatbot' ? 'AI Widget' : input.platform} → ${teamName} → ${input.assignedStaffName ?? input.assignedStaffId}`
+        : `${input.platform === 'chatbot' ? 'AI Widget' : input.platform} → Round Robin → ${input.assignedStaffName ?? input.assignedStaffId}`,
+      performedBy:  userId,
+      metadata:     { staffId: input.assignedStaffId, staffName: input.assignedStaffName, teamId, teamName },
+    });
+  }
 
   runAutomationsOnCreate(tenantId, 'lead', lead.toObject()).catch(() => {});
 

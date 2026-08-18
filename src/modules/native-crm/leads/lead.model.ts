@@ -64,6 +64,16 @@ export interface ILeadDoc extends Document {
    * strategy, which leadOwner's free text alone can't support. leadOwner is
    * kept in sync as this staff's display name for existing exports/search. */
   leadOwnerStaffId?: string;
+  /** Denormalized display convenience — mirrors Meeting.assignedStaffId/
+   * assignedStaffName's own convention. Populated whenever leadOwnerStaffId
+   * is set (round robin, AI-widget capture, manual reassignment) from
+   * NativeStaff.teamId -> NativeTeam.name, so the Team a Lead belongs to is
+   * visible on the record itself without a join on every list render.
+   * Supervisor is deliberately NOT stored here (a team's manager can change
+   * independently of any given Lead) — resolved live from teamId at read
+   * time instead. */
+  teamId?:   string;
+  teamName?: string;
 
   // Sales
   expectedRevenue?:   number;
@@ -167,6 +177,8 @@ const schema = new Schema<ILeadDoc>(
     priority: { type: String, enum: ['high','medium','low'], default: 'medium' },
     leadOwner: { type: String },
     leadOwnerStaffId: { type: String, index: true },
+    teamId:   { type: String, index: true },
+    teamName: { type: String, trim: true },
 
     expectedRevenue:   { type: Number },
     expectedCloseDate: { type: Date },
