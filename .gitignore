@@ -20,6 +20,11 @@ pids/
 *.pid
 *.seed
 
+# Temp uploads — dataset-image import ZIPs, etc. Transient, auto-cleaned
+# by the backend itself (processDatasetImages()'s finally block / the
+# hourly orphaned-upload sweep), never meant to be source-controlled.
+tmp/
+
 # OS files
 .DS_Store
 Thumbs.db
