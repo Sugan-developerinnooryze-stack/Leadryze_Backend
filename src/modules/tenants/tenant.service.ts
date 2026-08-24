@@ -35,23 +35,29 @@ export async function updateTenant(
   id: string,
   data: Partial<ITenant>
 ): Promise<ITenant | null> {
-  // `widget` and `aiConfig` are both handled separately, via dot-notation,
-  // for the same correctness reason: a plain top-level `$set: {widget:{...}}`
-  // (or `{aiConfig:{...}}`) would REPLACE the entire embedded subdocument,
-  // silently wiping out whichever fields the caller's partial payload didn't
-  // happen to include (e.g. saving just `allowedDomains` would erase
-  // `enabled`). `widget` additionally has a security reason — widgetKey is
-  // server-generated only (regenerateWidgetKey()), never accepted from this
-  // generic update payload, no matter what a caller sends.
+  // `widget`, `aiConfig`, and `branding` are all handled separately, via
+  // dot-notation, for the same correctness reason: a plain top-level
+  // `$set: {widget:{...}}` (or `{aiConfig:{...}}`/`{branding:{...}}`) would
+  // REPLACE the entire embedded subdocument, silently wiping out whichever
+  // fields the caller's partial payload didn't happen to include (e.g.
+  // saving just `allowedDomains` would erase `enabled`). `widget`
+  // additionally has a security reason — widgetKey is server-generated only
+  // (regenerateWidgetKey()), never accepted from this generic update
+  // payload, no matter what a caller sends.
   //
   // This was a REAL, live bug for aiConfig specifically until this fix:
   // confirmed SettingsPage.tsx's own saveAI() already sends a partial
   // aiConfig ({agentName, language, systemPrompt} only) — every save from
   // that existing page was silently wiping fallbackToHuman/monthlyTokenLimit
   // back to their schema defaults before this dot-notation merge existed.
-  const { widget, aiConfig, dataScopeConfig, ...rest } = data as Partial<ITenant> & {
+  // `branding` had the exact same bug: WidgetSettingsPage.tsx's own
+  // handleContactInfoSave() sends only {contactEmail, contactPhone, address}
+  // — a plain top-level replace would have wiped companyName/primaryColor/
+  // logoUrl on every contact-info save.
+  const { widget, aiConfig, branding, dataScopeConfig, ...rest } = data as Partial<ITenant> & {
     widget?: Record<string, unknown>;
     aiConfig?: Record<string, unknown>;
+    branding?: Record<string, unknown>;
     dataScopeConfig?: Record<string, unknown>;
   };
   const update: Record<string, unknown> = { ...rest };
@@ -62,6 +68,14 @@ export async function updateTenant(
     // lastCrawledAt/crawlPageCount are deliberately NOT in the allow-list above —
     // they're status fields written only by recordWebsiteCrawlResult() below,
     // never accepted from the generic tenant-update payload.
+  }
+  if (branding && typeof branding === 'object') {
+    // logoUrl deliberately NOT in this allow-list — same write-protection
+    // precedent as widget.logoUrl/widgetKey above, server-uploaded only via
+    // the dedicated logo endpoint.
+    for (const key of ['companyName', 'primaryColor', 'contactEmail', 'contactPhone', 'address']) {
+      if (branding[key] !== undefined) update[`branding.${key}`] = branding[key];
+    }
   }
   if (aiConfig && typeof aiConfig === 'object') {
     for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'monthlyVoiceMinutesLimit', 'toolModelPreset', 'autoConvertLeadOnMeetingCompleted']) {

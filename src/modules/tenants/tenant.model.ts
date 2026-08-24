@@ -106,6 +106,14 @@ export interface ITenant extends Document {
     logoUrl?: string;
     primaryColor?: string;
     companyName?: string;
+    /** The widget's real, public contact details — shown to a visitor in
+     * the automatic "thanks for visiting" lead-confirmation email, never
+     * anywhere else. Deliberately separate from widget.greeting/template
+     * (chat-UI config) since these are business-identity fields a tenant
+     * edits far less often. */
+    contactEmail?: string;
+    contactPhone?: string;
+    address?: string;
   };
   aiConfig: {
     systemPrompt?: string;
@@ -343,6 +351,9 @@ const tenantSchema = new Schema<ITenant>(
       logoUrl: String,
       primaryColor: { type: String, default: '#00B8D9' },
       companyName: String,
+      contactEmail: String,
+      contactPhone: String,
+      address: String,
     },
     aiConfig: {
       systemPrompt: String,
