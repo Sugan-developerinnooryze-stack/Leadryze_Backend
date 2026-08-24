@@ -36,6 +36,8 @@ import {
 import { getWebsiteProfile, upsertWebsiteProfileFromCrawl } from '../native-crm/catalog/website-profile.service';
 import { resolveTeamFromStaffId } from '../native-crm/shared/team-resolution';
 import { NativeTimeline } from '../native-crm/timeline/timeline.model';
+import { listChatbotDatasets, executeDatasetQuery, getDatasetRecordById, QueryPlan } from '../native-crm/datasets/dataset-query.service';
+import { getDatasetSchemaForChatbot } from '../native-crm/datasets/dataset.service';
 
 const router = Router();
 
@@ -239,6 +241,91 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * GET /api/internal/datasets?tenantId=
+ *
+ * Every dataset this tenant has opted into the public chatbot for — the
+ * Generic Dataset system's own resolution source for search_dataset/
+ * get_dataset_record (backendClient.listDatasetsForChatbot()). Only
+ * availableToChatbot:true datasets with a real activeVersion (a version
+ * that's actually finished importing — undefined means still importing or
+ * never successfully finished) are offered; an in-progress or disabled
+ * dataset is invisible to the AI, same opt-in posture as every other
+ * widget-facing data source in this codebase.
+ */
+router.get('/datasets', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.query as { tenantId: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'tenantId is required', 400);
+      return;
+    }
+    sendSuccess(res, { datasets: await listChatbotDatasets(tenantId) });
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/datasets/:datasetId/schema?tenantId=
+ *
+ * The column/role schema (no raw row data) for one dataset's active
+ * version — feeds the query router's fast-path/classifier so a plan only
+ * ever references real, currently-known fields. Reuses
+ * getDatasetSchemaForChatbot() as-is (dataset.service.ts) — already
+ * enforces "no active version yet" -> null, no separate check needed here.
+ */
+router.get('/datasets/:datasetId/schema', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { datasetId } = req.params;
+    const { tenantId } = req.query as { tenantId: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !mongoose.isValidObjectId(datasetId)) {
+      sendError(res, 'tenantId and a valid datasetId are required', 400);
+      return;
+    }
+    const columns = await getDatasetSchemaForChatbot(tenantId, datasetId);
+    sendSuccess(res, { columns: columns ?? [] });
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/datasets/query
+ *
+ * The ONLY place a QueryPlan (built by the AI's query router) is actually
+ * executed against real dataset records — reuses executeDatasetQuery() as-is
+ * (dataset-query.service.ts), which itself re-enforces availableToChatbot
+ * and resolves activeVersion server-side, never trusting datasetId alone.
+ */
+router.post('/datasets/query', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, datasetId, plan } = req.body as { tenantId: string; datasetId: string; plan: QueryPlan };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !datasetId || !mongoose.isValidObjectId(datasetId) || !plan) {
+      sendError(res, 'tenantId, datasetId, and plan are required', 400);
+      return;
+    }
+    const result = await executeDatasetQuery(tenantId, datasetId, plan);
+    sendSuccess(res, result ?? { results: [], datasetName: null });
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/datasets/:datasetId/record/:recordId?tenantId=
+ *
+ * get_dataset_record's own lookup — the model always calls search_dataset
+ * first to get a real recordId, this just fetches that exact row. Reuses
+ * getDatasetRecordById() as-is (dataset-query.service.ts).
+ */
+router.get('/datasets/:datasetId/record/:recordId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { datasetId, recordId } = req.params;
+    const { tenantId } = req.query as { tenantId: string };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !mongoose.isValidObjectId(datasetId)) {
+      sendError(res, 'tenantId and a valid datasetId are required', 400);
+      return;
+    }
+    const record = await getDatasetRecordById(tenantId, datasetId, recordId);
+    sendSuccess(res, { record });
+  } catch (err) { next(err); }
 });
 
 /**
