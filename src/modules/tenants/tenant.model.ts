@@ -165,6 +165,20 @@ export interface ITenant extends Document {
      * subdomain wildcarding. */
     allowedDomains: string[];
     greeting?: string;
+    /** The widget's opening suggestion chips — a tenant-authored list, NOT
+     * the client-side QUICK_SUGGESTIONS fallback the widget renders when
+     * this is empty/absent. Resolved from GET /public/widget/config like
+     * template/greeting, so a tenant's real questions actually reach the
+     * live widget instead of it silently falling back to generic ones. */
+    quickQuestions?: Array<{ text: string; enabled: boolean }>;
+    /** Always shows a "Book an appointment" quick-reply chip alongside the
+     * questions above, when booking is enabled — independent of whether
+     * that chip is also one of quickQuestions' own entries. */
+    showBookingQuickReply?: boolean;
+    /** Fires the visitor "thanks for visiting" + assigned-staff alert emails
+     * automatically the moment the chatbot captures a new lead, instead of
+     * only on an explicit manual action. */
+    autoSendLeadEmails?: boolean;
     /** Server-uploaded via the dedicated logo endpoint only (multipart ->
      * S3 -> URL saved here) — NEVER accepted from the generic tenant-update
      * payload, same write-protection precedent as widgetKey, so a tenant
@@ -345,6 +359,12 @@ const tenantSchema = new Schema<ITenant>(
       widgetKey:      { type: String, unique: true, sparse: true, index: true },
       allowedDomains: { type: [String], default: [] },
       greeting:       String,
+      quickQuestions: {
+        type: [{ text: { type: String, required: true }, enabled: { type: Boolean, default: true } }],
+        default: [],
+      },
+      showBookingQuickReply: { type: Boolean, default: false },
+      autoSendLeadEmails:    { type: Boolean, default: true },
       logoUrl:        String,
       template:       { type: String, enum: ['modern', 'minimal', 'chips', 'dark'], default: 'modern' },
       defaultTeamId:  { type: Schema.Types.ObjectId, ref: 'NativeTeam', default: null },

@@ -12,6 +12,7 @@ import { isRedisAvailable, createBullMQConnection } from '../../config/redis';
 import { writeLog } from '../logs/log.service';
 import { sendEmailNow, buildFollowupEmail } from '../messages/brevo.service';
 import { sendSmsNow, buildFollowupSms } from '../messages/twilio.service';
+import { cleanupOrphanedImageUploads } from '../native-crm/datasets/dataset-image.service';
 
 // ─── BullMQ (Redis-dependent) — graceful stub when Redis unavailable ──────────
 let _bullmqAvailable = false;
@@ -387,7 +388,16 @@ function initCronJobs(): void {
     await pollScheduledFlows().catch((err) => logger.error('pollScheduledFlows crashed', { error: (err as Error).message }));
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows)');
+  // Second, explicit safety net alongside TempImageUpload's own TTL index
+  // (24h) — this sweep uses a shorter 2h grace period so an abandoned
+  // dataset-image ZIP's FILE on disk doesn't sit around for a near-day even
+  // after it's obviously abandoned (the TTL index alone only ever removes
+  // the tracking doc, never the file).
+  cron.schedule('0 * * * *', async () => {
+    await cleanupOrphanedImageUploads().catch((err) => logger.error('cleanupOrphanedImageUploads crashed', { error: (err as Error).message }));
+  });
+
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────

@@ -65,6 +65,13 @@ export async function getConfig(req: Request, res: Response): Promise<void> {
     greeting:     tenant.widget?.greeting || 'Hi! How can I help you today?',
     language:     tenant.aiConfig?.language || 'en',
     template:     tenant.widget?.template || 'modern',
+    // Flat label array — matches leadryze-widget's own this.quickQuestions
+    // shape exactly (`for (const label of this.quickQuestions)`), so an
+    // empty/absent array correctly falls through to the widget's own
+    // QUICK_SUGGESTIONS default rather than this endpoint needing to know
+    // that fallback text itself.
+    quickQuestions: (tenant.widget?.quickQuestions ?? []).filter((q) => q.enabled).map((q) => q.text),
+    showBookingQuickReply: !!tenant.widget?.showBookingQuickReply,
     voiceEnabled: !!tenant.widget?.voice?.enabled,
     voiceAutoPlay: tenant.widget?.voice?.autoPlay !== false,
     continuousVoiceEnabled: !!tenant.widget?.voice?.continuousModeEnabled,

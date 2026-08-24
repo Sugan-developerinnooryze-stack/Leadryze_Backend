@@ -13,6 +13,7 @@ import taskRoutes     from './tasks/task.routes';
 import ticketRoutes   from './tickets/ticket.routes';
 import callRoutes     from './calls/call.routes';
 import meetingRoutes  from './meetings/meeting.routes';
+import datasetRoutes  from './datasets/dataset.routes';
 
 /* ── Field-service modules (Phase 1) ─────────────────────────────────────── */
 import categoryRoutes from './categories/category.routes';
@@ -88,6 +89,7 @@ router.use('/tasks',     taskRoutes);
 router.use('/tickets',   ticketRoutes);
 router.use('/calls',     callRoutes);
 router.use('/meetings',  meetingRoutes);
+router.use('/datasets',  datasetRoutes);
 
 /* ── Field-service sub-routers ────────────────────────────────────────────── */
 router.use('/categories', categoryRoutes);
