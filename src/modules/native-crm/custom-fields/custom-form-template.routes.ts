@@ -1,13 +1,14 @@
 import { Router, Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError } from '../../../utils/response';
+import { requirePermission } from '../../../middlewares/auth.middleware';
 import { NativeCustomFormTemplate } from './custom-form-template.model';
 import mongoose from 'mongoose';
 
 const router = Router();
 
 /* GET /api/v1/native-crm/custom-form-templates */
-router.get('/', async (req: AuthRequest, res: Response) => {
+router.get('/', requirePermission('form_templates.view'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const templates = await NativeCustomFormTemplate.find({ tenantId: tid }).sort({ name: 1 });
@@ -18,7 +19,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
 });
 
 /* POST /api/v1/native-crm/custom-form-templates */
-router.post('/', async (req: AuthRequest, res: Response) => {
+router.post('/', requirePermission('form_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const { name, description, fields } = req.body;
@@ -31,7 +32,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
 });
 
 /* PUT /api/v1/native-crm/custom-form-templates/:id */
-router.put('/:id', async (req: AuthRequest, res: Response) => {
+router.put('/:id', requirePermission('form_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const { name, description, fields } = req.body;
@@ -48,7 +49,7 @@ router.put('/:id', async (req: AuthRequest, res: Response) => {
 });
 
 /* DELETE /api/v1/native-crm/custom-form-templates/:id */
-router.delete('/:id', async (req: AuthRequest, res: Response) => {
+router.delete('/:id', requirePermission('form_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const template = await NativeCustomFormTemplate.findOneAndDelete({ _id: req.params.id, tenantId: tid });

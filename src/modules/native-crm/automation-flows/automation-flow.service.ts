@@ -1,6 +1,8 @@
 import mongoose from 'mongoose';
+import axios from 'axios';
 import { AutomationFlow, IAutomationFlow, IFlowNode, IFlowEdge, LoopSourceModule } from './automation-flow.model';
 import { AutomationFlowRun, IFlowRunStep } from './automation-flow-run.model';
+import { AutomationFlowRunIdempotency } from './automation-flow-run-idempotency.model';
 import { PipelineModule } from '../pipeline-config/pipeline-config.model';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { getTemplateById, renderTemplate } from '../../templates/template.service';
@@ -11,11 +13,19 @@ import { writeLog } from '../../notifications/email-log.service';
 import { logger } from '../../../utils/logger';
 import {
   getFieldCatalog, readSourceField, setPayloadField, resolveAutomationRecipient,
-  buildVariables, createRecordInTargetModule, sourceIdentifierOf, MAX_LINKED_RECORD_CHAIN_DEPTH,
+  buildVariables, createRecordInTargetModule, updateRecordInTargetModule, sourceIdentifierOf,
+  MAX_LINKED_RECORD_CHAIN_DEPTH,
   conditionsToMongoFilter, MAX_SCHEDULE_MATCHES_PER_TICK, queryScheduleMatches, resolveComparableValue,
-  generateWebhookToken,
+  generateWebhookToken, isAutomationPausedForTenant, matchesBranchScope,
 } from '../automation-rules/automation-rule.service';
 import { IFlowCondition } from '../automation-rules/automation-rule.model';
+import { resolveAndPinSafeUrl } from '../../../utils/url-safety';
+import { Tenant } from '../../tenants/tenant.model';
+import { Branch } from '../branches/branch.model';
+import {
+  decryptWebhookHeadersForExecution, redactWebhookHeadersForDisplay,
+  encryptWebhookSecrets, maskWebhookSecretsForRead,
+} from './webhook-secret.util';
 import cronParser from 'cron-parser';
 
 /** "Advanced Mode" engine — see automation-flow.model.ts's top comment for
@@ -27,6 +37,34 @@ import cronParser from 'cron-parser';
  * reimplements — every actual execution primitive (imports above) so the
  * two engines can never quietly drift apart on how a template renders or a
  * recipient resolves. */
+
+/* ── Safety limits: per-action timeout, per-run wall-clock timeout ───────
+   Neither existed before — a single hanging external call (a stalled SMTP/
+   HTTP request) or a pathological run (a huge Loop, a long retry chain) had
+   no ceiling. Both are deliberately generous — these exist to bound the
+   worst case, not to constrain everyday use — and both integrate into
+   EXISTING control flow rather than restructuring it: a timed-out action
+   call rejects like any other failure and falls into the retry loop that
+   already wraps it; a run-timeout check sits at the top of runLoop()'s own
+   while-loop, the one place every node transition already passes through. */
+const ACTION_TIMEOUT_MS = 30_000;
+const RUN_TIMEOUT_MS = 30 * 60_000;
+
+/* ── webhook_call-specific safety limits — additional to, never a
+   replacement for, the two above. Fixed, tenant-non-configurable ceilings,
+   same precedent as loopMaxItems<=2000/MAX_SCHEDULE_MATCHES_PER_TICK. ── */
+const WEBHOOK_MAX_BODY_BYTES = 1_000_000; // 1 MB — request AND response body
+const WEBHOOK_MAX_RETRY_AFTER_MS = 120_000; // cap on how long a 429's Retry-After is honored
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
 
 /* ── Structural validation (v1: branching TREE + flat fork→merge) ────────── */
 
@@ -274,6 +312,23 @@ async function assertValidNodes(tenantId: string, nodes: IFlowNode[]): Promise<v
           throw new Error(`"${node.triggerField}" is not a field on ${node.module}`);
         }
       }
+      // Phase 6 — mirrors the existing rigor level for every other
+      // referenced-id field in this function (targetFlowId/loopSubFlowId,
+      // below/in assertValidSubFlowHierarchy): a stale or foreign branch id
+      // is rejected at save time, not silently saved as an unreachable
+      // scope. Zod already rejects branchIds on a webhook trigger before
+      // this ever runs (automation-flow.validation.ts), so no need to
+      // re-check that here.
+      if (node.branchIds && node.branchIds.length > 0) {
+        const validIds = node.branchIds.filter((id) => mongoose.isValidObjectId(id));
+        if (validIds.length !== node.branchIds.length) {
+          throw new Error(`Node "${node.id}": branchIds contains an invalid branch id`);
+        }
+        const count = await Branch.countDocuments({ _id: { $in: validIds }, tenantId: new mongoose.Types.ObjectId(tenantId) });
+        if (count !== node.branchIds.length) {
+          throw new Error(`Node "${node.id}": branchIds contains a branch that does not belong to this tenant`);
+        }
+      }
     } else if (node.actionType === 'create_linked_record') {
       if (!node.targetModule) throw new Error(`Node "${node.id}": targetModule is required for create_linked_record`);
       if (!node.fieldMappings || node.fieldMappings.length === 0) {
@@ -357,12 +412,25 @@ async function assertValidSubFlowHierarchy(tenantId: string, nodes: IFlowNode[],
 
 /* ── CRUD ──────────────────────────────────────────────────────────────── */
 
+/** Applies the read-path secret mask to both a flow's live nodes and its
+ * staged draft's nodes (if any) — a sensitive webhookHeaders value must
+ * never be returned through EITHER, not just the live side. */
+function maskFlowSecretsForRead<T extends { nodes: IFlowNode[]; draft?: { nodes: IFlowNode[] } | null }>(flow: T): T {
+  return {
+    ...flow,
+    nodes: maskWebhookSecretsForRead(flow.nodes),
+    ...(flow.draft ? { draft: { ...flow.draft, nodes: maskWebhookSecretsForRead(flow.draft.nodes) } } : {}),
+  };
+}
+
 export async function listFlows(tenantId: string) {
-  return AutomationFlow.find({ tenantId: new mongoose.Types.ObjectId(tenantId) }).sort({ createdAt: -1 }).lean();
+  const flows = await AutomationFlow.find({ tenantId: new mongoose.Types.ObjectId(tenantId) }).sort({ createdAt: -1 }).lean();
+  return flows.map(maskFlowSecretsForRead);
 }
 
 export async function getFlowById(tenantId: string, id: string) {
-  return AutomationFlow.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), _id: id }).lean();
+  const flow = await AutomationFlow.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), _id: id }).lean();
+  return flow ? maskFlowSecretsForRead(flow) : flow;
 }
 
 export async function createFlow(tenantId: string, data: Partial<IAutomationFlow>) {
@@ -374,42 +442,313 @@ export async function createFlow(tenantId: string, data: Partial<IAutomationFlow
   if (triggerNode?.triggerType === 'webhook') {
     triggerNode.webhookToken = await generateWebhookToken((t) => AutomationFlow.exists({ 'nodes.webhookToken': t }).then(Boolean));
   }
-  return AutomationFlow.create({ ...data, tenantId: new mongoose.Types.ObjectId(tenantId) });
+  // No `existingNodesById` — a brand-new flow has nothing to restore a
+  // placeholder value from (the builder never shows a placeholder for a
+  // header it hasn't saved yet).
+  const nodes = encryptWebhookSecrets(data.nodes ?? []);
+  const created = await AutomationFlow.create({ ...data, nodes, tenantId: new mongoose.Types.ObjectId(tenantId) });
+  // Masked before returning — every mutating endpoint's response is
+  // effectively a read surface too (the frontend uses it to update local
+  // state after a save), so the same "never echo a real secret back"
+  // guarantee applies here, not just to GET.
+  return maskFlowSecretsForRead(created.toObject());
 }
 
+/** Non-structural fields (name, enabled) apply directly to the live document
+ * — pausing/renaming a flow is not "workflow content" and doesn't need
+ * draft/publish ceremony. A structural edit (nodes/edges present) instead
+ * validates and stages into `draft`, leaving the live nodes/edges — and
+ * therefore every trigger-matching query and any run in flight — completely
+ * untouched until publishFlow() is called. This is the "editing a published
+ * workflow creates a draft, never mutates the live version in place" rule;
+ * createFlow() is deliberately exempt (a brand-new flow has no prior live
+ * behavior to protect, so it writes nodes/edges directly, same as always). */
 export async function updateFlow(tenantId: string, id: string, data: Partial<IAutomationFlow>) {
-  if (data.nodes) {
-    assertValidFlowShape(data.nodes, data.edges ?? []);
-    assertValidForkMergeShape(data.nodes, data.edges ?? []);
-    await assertValidNodes(tenantId, data.nodes);
-    await assertValidSubFlowHierarchy(tenantId, data.nodes, id);
-  }
   const tid = new mongoose.Types.ObjectId(tenantId);
 
-  // updateFlow replaces the ENTIRE nodes[] array on every save (the natural
-  // round-trip shape of a node-graph editor) — Zod strips webhookToken from
-  // every incoming node regardless, so a webhook-triggered flow's trigger
-  // node NEVER arrives with a token attached, on ANY save, even one editing a
-  // completely unrelated node. Without this, editing anything at all on an
-  // already-webhook flow would silently mint a fresh token and break an
-  // already-configured external system (Stripe, a website form) on every
-  // single save. Reuse the CURRENTLY STORED token if the flow's trigger node
-  // is ALREADY a webhook trigger with one; mint fresh only when genuinely
-  // switching into 'webhook' from something else (or none was ever issued).
-  if (data.nodes) {
-    const incomingTrigger = data.nodes.find((n) => n.type === 'trigger');
-    if (incomingTrigger?.triggerType === 'webhook') {
-      const existing = await AutomationFlow.findOne({ _id: id, tenantId: tid }).lean();
-      const existingTrigger = existing?.nodes?.find((n) => n.type === 'trigger');
-      if (existingTrigger?.triggerType === 'webhook' && existingTrigger.webhookToken) {
-        incomingTrigger.webhookToken = existingTrigger.webhookToken;
-      } else {
-        incomingTrigger.webhookToken = await generateWebhookToken((t) => AutomationFlow.exists({ 'nodes.webhookToken': t }).then(Boolean));
-      }
+  if (!data.nodes) {
+    const patch: Record<string, unknown> = {};
+    if (data.name !== undefined) patch.name = data.name;
+    if (data.enabled !== undefined) patch.enabled = data.enabled;
+    const result = await AutomationFlow.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: patch }, { new: true }).lean();
+    return result ? maskFlowSecretsForRead(result) : result;
+  }
+
+  assertValidFlowShape(data.nodes, data.edges ?? []);
+  assertValidForkMergeShape(data.nodes, data.edges ?? []);
+  await assertValidNodes(tenantId, data.nodes);
+  await assertValidSubFlowHierarchy(tenantId, data.nodes, id);
+
+  const existing = await AutomationFlow.findOne({ _id: id, tenantId: tid }).lean();
+  if (!existing) return null;
+
+  // Webhook token preservation — same reasoning as before draft/publish
+  // existed (Zod strips webhookToken from every incoming node on every
+  // save), now sourced from whichever trigger is more current: an
+  // already-staged draft's own token first (so chaining several edits
+  // before publishing never mints a new token each time), else the LIVE
+  // trigger's token, else mint fresh only when genuinely switching into
+  // 'webhook' from something else (or none was ever issued).
+  const incomingTrigger = data.nodes.find((n) => n.type === 'trigger');
+  if (incomingTrigger?.triggerType === 'webhook') {
+    const priorTrigger = (existing.draft?.nodes ?? existing.nodes)?.find((n) => n.type === 'trigger');
+    if (priorTrigger?.triggerType === 'webhook' && priorTrigger.webhookToken) {
+      incomingTrigger.webhookToken = priorTrigger.webhookToken;
+    } else {
+      incomingTrigger.webhookToken = await generateWebhookToken((t) => AutomationFlow.exists({ 'nodes.webhookToken': t }).then(Boolean));
     }
   }
 
-  return AutomationFlow.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: data }, { new: true });
+  // Encrypt any sensitive webhookHeaders value before it ever lands in
+  // `draft` — restoring the CURRENTLY STORED value (draft first, else live)
+  // wherever the incoming node's value is exactly the masked placeholder
+  // (the user left that field alone while editing something else), so
+  // re-saving a flow can never clobber a real secret with the placeholder
+  // text itself. See webhook-secret.util.ts's own doc comment.
+  const priorNodesById = new Map((existing.draft?.nodes ?? existing.nodes).map((n) => [n.id, n]));
+  const encryptedNodes = encryptWebhookSecrets(data.nodes, priorNodesById);
+
+  const setPatch: Record<string, unknown> = {
+    draft: { nodes: encryptedNodes, edges: data.edges ?? [], canvasPositions: data.canvasPositions, updatedAt: new Date() },
+  };
+  if (data.name !== undefined) setPatch.name = data.name;
+  if (data.enabled !== undefined) setPatch.enabled = data.enabled;
+  const result = await AutomationFlow.findOneAndUpdate({ _id: id, tenantId: tid }, { $set: setPatch }, { new: true }).lean();
+  return result ? maskFlowSecretsForRead(result) : result;
+}
+
+/** Promotes a staged draft to live — the only place nodes/edges/
+ * canvasPositions on the LIVE document change after creation. Re-validates
+ * the draft at publish time, not just when it was originally staged:
+ * something it depends on (a Sub-Flow target, a pipeline stage) may have
+ * been deleted or changed shape in the meantime. Bumps `version` and stamps
+ * `publishedAt`; the draft is cleared on success so a subsequent GET no
+ * longer shows "unpublished changes." Throws (never silently no-ops) when
+ * there's nothing staged — publishing is an explicit action, not a fallback
+ * for "just save whatever's live already." */
+export async function publishFlow(tenantId: string, id: string) {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const flow = await AutomationFlow.findOne({ _id: id, tenantId: tid }).lean();
+  if (!flow) return null;
+  if (!flow.draft) throw new Error('This flow has no unpublished changes to publish');
+
+  assertValidFlowShape(flow.draft.nodes, flow.draft.edges);
+  assertValidForkMergeShape(flow.draft.nodes, flow.draft.edges);
+  await assertValidNodes(tenantId, flow.draft.nodes);
+  await assertValidSubFlowHierarchy(tenantId, flow.draft.nodes, id);
+
+  const published = await AutomationFlow.findOneAndUpdate(
+    { _id: id, tenantId: tid },
+    {
+      $set: {
+        nodes: flow.draft.nodes, edges: flow.draft.edges, canvasPositions: flow.draft.canvasPositions,
+        version: (flow.version ?? 1) + 1, publishedAt: new Date(),
+      },
+      $unset: { draft: '' },
+    },
+    { new: true },
+  ).lean();
+  // draft.nodes were already encrypted when staged (updateFlow), so this is
+  // a straight copy — no re-encryption needed here, only the same
+  // read-path mask every response applies.
+  return published ? maskFlowSecretsForRead(published) : published;
+}
+
+/** Discards a staged draft without publishing it — reverts to "no
+ * unpublished changes," live nodes/edges untouched (they were never touched
+ * in the first place). A no-op, not an error, when there's nothing staged. */
+export async function discardDraft(tenantId: string, id: string) {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const result = await AutomationFlow.findOneAndUpdate({ _id: id, tenantId: tid }, { $unset: { draft: '' } }, { new: true }).lean();
+  return result ? maskFlowSecretsForRead(result) : result;
+}
+
+export interface IDryRunStep {
+  nodeId: string;
+  nodeType: string;
+  label: string;
+  result: string;
+}
+
+/** Simulates a flow against one real sample record WITHOUT sending any
+ * message, creating/mutating any record, or persisting a real
+ * AutomationFlowRun — "Test/Dry-Run before Publish." Walks the DRAFT graph
+ * when one is staged (the whole point — test what hasn't gone live yet),
+ * falling back to the live graph for an already-published flow with nothing
+ * pending. Re-validates the graph first (the same validators createFlow/
+ * updateFlow/publishFlow already run), so a structural error surfaces here
+ * before publish, not after.
+ *
+ * Deliberately a SEPARATE, smaller walker rather than a `dryRun` flag
+ * threaded through processOneNode/runLoop — those already carry
+ * retry/pause/fork/sub-flow/loop logic built for real execution, and
+ * repurposing them to fake every side effect risks the exact kind of subtle
+ * real-vs-simulated divergence a dry-run exists to catch. What this covers:
+ * the primary path (trigger → condition/action/merge nodes in sequence),
+ * reporting what a send-message or create_linked_record node WOULD do
+ * (template and recipient resolved for real, nothing sent/created) and what a
+ * delay/approval node WOULD pause on. Sub-Flow and Loop are reported, not
+ * recursed into — "would invoke Sub-Flow X" / "would process up to N
+ * matching item(s)" — since simulating an arbitrarily deep Sub-Flow chain or
+ * large Loop with the same fidelity as a real run is its own scope beyond a
+ * pre-publish sanity check. A Parallel fork is walked down its FIRST branch
+ * only, for the same reason. */
+export async function dryRunFlow(
+  tenantId: string, id: string, sampleModule: PipelineModule, sampleRecordId: string,
+): Promise<{ flowName: string; usingDraft: boolean; steps: IDryRunStep[] }> {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const flow = await AutomationFlow.findOne({ _id: id, tenantId: tid }).lean();
+  if (!flow) throw new Error('Automation flow not found');
+
+  const usingDraft = !!flow.draft;
+  const nodes = usingDraft ? flow.draft!.nodes : flow.nodes;
+  const edges = usingDraft ? flow.draft!.edges : flow.edges;
+
+  assertValidFlowShape(nodes, edges);
+  assertValidForkMergeShape(nodes, edges);
+  await assertValidNodes(tenantId, nodes);
+
+  const triggerNode = nodes.find((n) => n.type === 'trigger');
+  if (!triggerNode) throw new Error('Flow has no trigger node');
+
+  const [sampleRecord] = await queryLoopItems(tenantId, sampleModule as LoopSourceModule, { _id: new mongoose.Types.ObjectId(sampleRecordId) }, 1);
+  if (!sampleRecord) throw new Error('Sample record not found');
+
+  const steps: IDryRunStep[] = [{
+    nodeId: triggerNode.id, nodeType: 'trigger', label: describeNodeForLog(triggerNode), result: 'trigger fired (simulated)',
+  }];
+
+  const currentRecord = sampleRecord;
+  const currentModule: PipelineModule = sampleModule;
+  let cursorId: string | undefined = edges.find((e) => e.from === triggerNode.id)?.to;
+  // Defensive ceiling, not a real limit — the graph is already guaranteed
+  // finite and acyclic by assertValidFlowShape above.
+  let guard = 0;
+
+  while (cursorId && guard++ < 500) {
+    const node = nodes.find((n) => n.id === cursorId);
+    if (!node) break;
+
+    if (node.type === 'merge') {
+      steps.push({ nodeId: node.id, nodeType: 'merge', label: 'Merge', result: 'reached (branches not simulated independently in dry-run)' });
+      cursorId = edges.find((e) => e.from === node.id)?.to;
+      continue;
+    }
+
+    if (node.type === 'condition') {
+      const result = evaluateConditionNode(currentRecord, node);
+      steps.push({ nodeId: node.id, nodeType: 'condition', label: describeNodeForLog(node), result: `evaluated to ${result}` });
+      cursorId = edges.find((e) => e.from === node.id && e.fromPort === (result ? 'true' : 'false'))?.to;
+      continue;
+    }
+
+    if (node.type === 'delay') {
+      steps.push({ nodeId: node.id, nodeType: 'delay', label: describeNodeForLog(node), result: `would pause for ${node.delayMinutes} minute(s)` });
+      cursorId = edges.find((e) => e.from === node.id)?.to;
+      continue;
+    }
+
+    if (node.type === 'approval') {
+      const recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.approvalRecipientStrategy ?? 'manager');
+      steps.push({
+        nodeId: node.id, nodeType: 'approval', label: describeNodeForLog(node),
+        result: recipient?.email ? `would pause for approval, notifying ${recipient.email}` : 'would pause for approval — no resolvable recipient to notify',
+      });
+      break; // a real run genuinely stops here too, pending a decision
+    }
+
+    if (node.type === 'subFlow') {
+      const target = await AutomationFlow.findOne({ _id: node.targetFlowId, tenantId: tid }).select('name').lean();
+      steps.push({ nodeId: node.id, nodeType: 'subFlow', label: describeNodeForLog(node), result: `would invoke Sub-Flow "${target?.name ?? node.targetFlowId}" (not simulated further)` });
+      cursorId = edges.find((e) => e.from === node.id)?.to;
+      continue;
+    }
+
+    if (node.type === 'loop') {
+      const filter = conditionsToMongoFilter(node.loopFilter);
+      const capped = node.loopMaxItems ?? 0;
+      const probe = await queryLoopItems(tenantId, node.loopSourceModule as LoopSourceModule, filter, capped + 1);
+      const matched = probe.length;
+      steps.push({
+        nodeId: node.id, nodeType: 'loop', label: describeNodeForLog(node),
+        result: `would process up to ${Math.min(matched, capped)} matching item(s)${matched > capped ? ` (${matched - capped}+ more matched but capped)` : ''} via Sub-Flow (not simulated further)`,
+      });
+      cursorId = edges.find((e) => e.from === node.id)?.to;
+      continue;
+    }
+
+    // Action node.
+    if (node.actionType === 'create_linked_record') {
+      const payload: Record<string, unknown> = {};
+      for (const m of node.fieldMappings ?? []) {
+        const value = m.sourceType === 'static' ? m.staticValue : readSourceField(currentRecord, m.sourceField!);
+        setPayloadField(payload, m.targetField, value);
+      }
+      steps.push({
+        nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+        result: `would create a ${node.targetModule} record with: ${JSON.stringify(payload)}`,
+      });
+      // currentRecord/currentModule deliberately NOT advanced to the
+      // would-be-created record — nothing real exists to hand to a
+      // downstream node's own field mappings, and inventing placeholder
+      // data would misrepresent what a real run actually does.
+    } else if (node.actionType === 'update_record' || node.actionType === 'assign_record' || node.actionType === 'change_status') {
+      const payload: Record<string, unknown> = {};
+      for (const m of node.fieldMappings ?? []) {
+        const value = m.sourceType === 'static' ? m.staticValue : readSourceField(currentRecord, m.sourceField!);
+        setPayloadField(payload, m.targetField, value);
+      }
+      steps.push({
+        nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+        result: `would update this ${currentModule} record with: ${JSON.stringify(payload)}`,
+      });
+      // currentRecord/currentModule NOT mutated — same "don't fabricate a
+      // result nothing real produced" reasoning as create_linked_record above.
+    } else if (node.actionType === 'add_note') {
+      const noteCatalog = await getFieldCatalog(tenantId, currentModule);
+      const noteVariables = buildVariables(currentRecord, '', triggerNode.triggerStage ?? '', noteCatalog);
+      steps.push({
+        nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+        result: `would add a note: "${renderTemplate(node.noteSubject ?? '', noteVariables)}"`,
+      });
+    } else if (node.actionType === 'webhook_call') {
+      // Deliberately never resolves DNS or calls resolveAndPinSafeUrl here —
+      // a dry-run must perform ZERO real network activity for this action,
+      // matching its existing "nothing is sent, created, or saved" guarantee
+      // for every other action type.
+      const payload: Record<string, unknown> = {};
+      for (const m of node.fieldMappings ?? []) {
+        const value = m.sourceType === 'static' ? m.staticValue : readSourceField(currentRecord, m.sourceField!);
+        setPayloadField(payload, m.targetField, value);
+      }
+      const redactedHeaders = redactWebhookHeadersForDisplay(node.webhookHeaders ?? []);
+      steps.push({
+        nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+        result: `would ${node.webhookMethod ?? 'POST'} to ${node.webhookUrl} with headers ${JSON.stringify(redactedHeaders)} and body: ${JSON.stringify(payload)}`,
+      });
+    } else {
+      const channel: 'email' | 'sms' | 'whatsapp' =
+        node.actionType === 'send_email' ? 'email' : node.actionType === 'send_whatsapp' ? 'whatsapp' : 'sms';
+      const template = node.templateId ? await getTemplateById(tenantId, node.templateId) : null;
+      if (!template) {
+        steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: 'would be skipped — template not found' });
+      } else {
+        const recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.recipientStrategy ?? 'record_contact');
+        if (!recipient || (channel === 'email' && !recipient.email) || (channel !== 'email' && !recipient.phone)) {
+          steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: 'would be skipped — no resolvable recipient' });
+        } else {
+          const catalog = await getFieldCatalog(tenantId, currentModule);
+          const variables = buildVariables(currentRecord, recipient.name, triggerNode.triggerStage ?? '', catalog);
+          const body = renderTemplate(template.body, variables).replace(/<[^>]+>/g, ' ').trim().slice(0, 200);
+          const to = channel === 'email' ? recipient.email : recipient.phone;
+          steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: `would send ${channel} to ${to}: ${body}` });
+        }
+      }
+    }
+    cursorId = edges.find((e) => e.from === node.id && (e.fromPort === undefined || e.fromPort === 'success'))?.to;
+  }
+
+  return { flowName: flow.name, usingDraft, steps };
 }
 
 export async function deleteFlow(tenantId: string, id: string) {
@@ -447,6 +786,58 @@ export async function listFlowRuns(tenantId: string, opts: { flowId?: string; st
 
 export async function getFlowRunById(tenantId: string, id: string) {
   return AutomationFlowRun.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), _id: id }).lean();
+}
+
+/** Operations Dashboard (Phase 5) — per-flow run breakdown + an exact
+ * tenant-wide "today" summary, in one round trip via $facet over the same
+ * tenant-filtered stream. Deliberately does NOT derive "today" numbers from
+ * perFlow's own lastRunAt (a flow that ran 5 times today and one that ran
+ * once today look identical by lastRunAt alone) — todaySummary is its own
+ * real $match+$group over startedAt. totalFlows/disabledFlows are NOT
+ * computed here — both are already free client-side off the existing
+ * flows list query, no need to duplicate that here. Served by the new
+ * {tenantId:1, startedAt:-1} index (automation-flow-run.model.ts) for both
+ * the perFlow branch's $sort and the todaySummary branch's range $match. */
+export async function getFlowRunStats(tenantId: string) {
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
+  const [result] = await AutomationFlowRun.aggregate([
+    { $match: { tenantId: new mongoose.Types.ObjectId(tenantId) } },
+    { $facet: {
+        perFlow: [
+          { $sort: { startedAt: -1 } },
+          { $group: {
+              _id: '$flowId',
+              totalRuns:      { $sum: 1 },
+              completedCount: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+              failedCount:    { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
+              partialCount:   { $sum: { $cond: [{ $eq: ['$status', 'partial'] }, 1, 0] } },
+              pausedCount:    { $sum: { $cond: [{ $eq: ['$status', 'paused'] }, 1, 0] } },
+              lastRunAt:      { $first: '$startedAt' },
+              lastStatus:     { $first: '$status' },
+          } },
+        ],
+        todaySummary: [
+          { $match: { startedAt: { $gte: startOfToday } } },
+          { $group: {
+              _id: null,
+              runsToday:      { $sum: 1 },
+              failedToday:    { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
+              completedToday: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+          } },
+        ],
+    } },
+  ]);
+
+  const today = result?.todaySummary?.[0] ?? { runsToday: 0, failedToday: 0, completedToday: 0 };
+  return {
+    perFlow: (result?.perFlow ?? []) as Array<{
+      _id: mongoose.Types.ObjectId; totalRuns: number; completedCount: number; failedCount: number;
+      partialCount: number; pausedCount: number; lastRunAt: Date; lastStatus: string;
+    }>,
+    summary: { runsToday: today.runsToday, failedToday: today.failedToday, completedToday: today.completedToday },
+  };
 }
 
 /* ── Condition evaluation (step 2) ────────────────────────────────────────
@@ -529,6 +920,11 @@ function describeNodeForLog(node: IFlowNode): string {
   if (node.type === 'loop') return `Loop: ${node.loopSourceModule}`;
   if (node.type === 'approval') return `Approval: ${node.approvalRecipientStrategy ?? 'manager'}`;
   if (node.actionType === 'create_linked_record') return `Create ${node.targetModule} record`;
+  if (node.actionType === 'update_record') return 'Update Record';
+  if (node.actionType === 'assign_record') return 'Assign Record';
+  if (node.actionType === 'change_status') return 'Change Status';
+  if (node.actionType === 'add_note') return 'Add Note';
+  if (node.actionType === 'webhook_call') return `Webhook: ${node.webhookMethod ?? 'POST'} ${node.webhookUrl ?? ''}`;
   if (node.actionType === 'send_email') return 'Send Email';
   if (node.actionType === 'send_whatsapp') return 'Send WhatsApp';
   return 'Send SMS';
@@ -794,7 +1190,8 @@ async function processOneNode(
     const recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.approvalRecipientStrategy ?? 'manager');
     let notifyResult = 'skipped: no resolvable recipient';
     if (recipient?.email) {
-      const variables = buildVariables(currentRecord, recipient.name, toStage);
+      const approvalCatalog = await getFieldCatalog(tenantId, currentModule);
+      const variables = buildVariables(currentRecord, recipient.name, toStage, approvalCatalog);
       const subject = `Approval needed: ${variables.title || variables.id}`;
       const body = `<p>A ${currentModule} record (${variables.title || variables.id}) is waiting on your approval.</p>`;
       const messageId = await sendEmailNow({ to: recipient.email, toName: recipient.name, subject, htmlContent: body });
@@ -874,7 +1271,7 @@ async function processOneNode(
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const attemptStart = new Date();
       try {
-        created = await createRecordInTargetModule(tenantId, node.targetModule!, payload, depth + 1);
+        created = await withTimeout(createRecordInTargetModule(tenantId, node.targetModule!, payload, depth + 1), ACTION_TIMEOUT_MS, 'create_linked_record');
         break;
       } catch (err) {
         lastError = (err as Error).message;
@@ -924,12 +1321,253 @@ async function processOneNode(
     // Module targets already fired theirs inside createRecordInTargetModule.
     if (!node.targetModule!.startsWith('custom:')) {
       const { runAutomationsOnCreate } = await import('../automation-rules/automation-rule.service');
-      await runAutomationsOnCreate(tenantId, node.targetModule as PipelineModule, created, depth + 1);
+      await runAutomationsOnCreate(tenantId, node.targetModule as PipelineModule, created, depth + 1, runId);
     }
-    await runFlowsOnCreate(tenantId, node.targetModule as PipelineModule, created, depth + 1);
+    await runFlowsOnCreate(tenantId, node.targetModule as PipelineModule, created, depth + 1, runId);
 
     currentRecord = created;
     currentModule = node.targetModule as PipelineModule;
+  } else if (node.actionType === 'update_record' || node.actionType === 'assign_record' || node.actionType === 'change_status') {
+    // All three share one execution shape — they only differ in how the UI
+    // constrains fieldMappings before saving (Update Record: full editor;
+    // Assign Record/Change Status: a single-entry mapping onto the
+    // module's isAssigneeField/isStageField catalog entry). Always targets
+    // the CURRENT record (currentRecord._id) — never a node-configured id;
+    // there is no such field on this node type's schema. This is the
+    // primary defense against a misconfigured/malicious node targeting an
+    // arbitrary record, not a runtime check layered on top of a
+    // configurable id (see updateRecordInTargetModule's own doc comment
+    // for the full tenant-isolation reasoning).
+    const payload: Record<string, unknown> = {};
+    for (const m of node.fieldMappings ?? []) {
+      const value = m.sourceType === 'static' ? m.staticValue : readSourceField(currentRecord, m.sourceField!);
+      setPayloadField(payload, m.targetField, value);
+    }
+    const targetId = String(currentRecord._id ?? currentRecord.recordId ?? '');
+
+    let updated: Record<string, any> | null | undefined;
+    let lastError = '';
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const attemptStart = new Date();
+      try {
+        updated = await withTimeout(updateRecordInTargetModule(tenantId, currentModule, targetId, payload, depth + 1), ACTION_TIMEOUT_MS, node.actionType);
+        if (updated) break;
+        lastError = 'Record not found (may have been deleted, or belongs to a different tenant)';
+      } catch (err) {
+        lastError = (err as Error).message;
+      }
+      const finishedAt = new Date();
+      await log({
+        nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+        status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(),
+        error: lastError, ...(stampAttempt ? { attempt } : {}),
+      });
+      if (attempt < maxAttempts && backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
+    }
+
+    if (!updated) {
+      // Same hard-stop-unless-failure-edge posture as create_linked_record
+      // — a mutation, like a create, is the kind of failure a downstream
+      // node's own logic may implicitly depend on having succeeded, unlike
+      // a notification-style action (send_*/add_note/webhook_call below),
+      // which soft-continues by default.
+      logger.error('AutomationFlow node execution failed', { flowId: flow._id, nodeId: node.id, error: lastError });
+      await writeLog({ tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule, sourceId, status: 'failed', errorMessage: `Flow "${flow.name}" node "${node.id}": ${lastError}` }).catch(() => {});
+      const failIds = failureIds();
+      if (failIds.length > 0) {
+        return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip: true }, nextIds: failIds };
+      }
+      return { kind: 'hard-fail', ctx: { currentRecord, currentModule, hadSkip } };
+    }
+
+    const successAt = new Date();
+    await writeLog({
+      tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule, sourceId,
+      status: 'sent', bodyPreview: `Flow "${flow.name}": ${describeNodeForLog(node)} (node "${node.id}")`,
+    });
+    await log({
+      nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+      status: 'success', startedAt: stepStart, finishedAt: successAt, durationMs: successAt.getTime() - stepStart.getTime(),
+      result: sourceIdentifierOf(updated), createdRecordModule: currentModule, createdRecordId: sourceIdentifierOf(updated),
+    });
+
+    // updateDeal/updateLead/etc, like createDeal/createLead, don't self-fire
+    // automations (only their HTTP controllers do) — this dispatcher fires
+    // them explicitly, same reasoning and same custom-module double-dispatch
+    // shape as create_linked_record above (updateCustomRecord's own internal
+    // fireCustomModuleAutomations call already handles a custom target;
+    // calling runFlowsOnUpdate again here for one is redundant but not
+    // unsafe — the same crash-safe idempotency key that already protects
+    // create_linked_record's identical shape absorbs it).
+    const prevForAutomations = currentRecord;
+    currentRecord = updated;
+    // currentModule deliberately unchanged — unlike create_linked_record,
+    // these three always act on the CURRENT record/module, never switch.
+    if (!currentModule.startsWith('custom:')) {
+      const { runAutomationsOnUpdate } = await import('../automation-rules/automation-rule.service');
+      await runAutomationsOnUpdate(tenantId, currentModule, prevForAutomations, updated, depth + 1, runId);
+    }
+    await runFlowsOnUpdate(tenantId, currentModule, prevForAutomations, updated, depth + 1, runId);
+
+    // Change Status / a stage-touching Update Record additionally re-fires
+    // status_changed rules/flows — mirrors deal.controller.ts's own HTTP
+    // path, which only calls runAutomations(...) when req.body.stage is
+    // present, not unconditionally on every update.
+    const stageCatalog = await getFieldCatalog(tenantId, currentModule);
+    const stageField = stageCatalog.find((f) => f.isStageField);
+    if (stageField && (node.fieldMappings ?? []).some((m) => m.targetField === stageField.key)) {
+      const newStageValue = String(readSourceField(updated, stageField.key) ?? '');
+      if (!currentModule.startsWith('custom:')) {
+        const { runAutomations } = await import('../automation-rules/automation-rule.service');
+        await runAutomations(tenantId, currentModule, updated, newStageValue, depth + 1, runId);
+      }
+      await runFlows(tenantId, currentModule, updated, newStageValue, depth + 1, runId);
+    }
+  } else if (node.actionType === 'add_note') {
+    // Notification-style, not a mutation of the current record — soft-
+    // continues on an untagged edge by default (outcome/hadSkip, same
+    // fall-through pattern as send_* below), rather than hard-stopping like
+    // create_linked_record/update_record. No automations fire afterward;
+    // currentRecord/currentModule stay unchanged (mirrors Sub-Flow/Loop's
+    // existing "revert to pre-call context" precedent).
+    const noteCatalog = await getFieldCatalog(tenantId, currentModule);
+    const noteVariables = buildVariables(currentRecord, '', toStage, noteCatalog);
+    let ok = false;
+    let sendResult = '';
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const attemptStart = new Date();
+      try {
+        const { createActivity } = await import('../activities/activity.service');
+        const created = await withTimeout(createActivity({
+          tenantId,
+          type: 'note',
+          subject: renderTemplate(node.noteSubject ?? '', noteVariables),
+          description: node.noteBody ? renderTemplate(node.noteBody, noteVariables) : undefined,
+          relatedModule: currentModule,
+          relatedId: sourceId,
+          assignedTo: node.noteAssignedTo,
+        }), ACTION_TIMEOUT_MS, 'add_note');
+        ok = true;
+        sendResult = `note ${String((created as any).activityId ?? (created as any)._id)} added`;
+      } catch (err) {
+        ok = false;
+        sendResult = (err as Error).message;
+      }
+      const finishedAt = new Date();
+      if (ok) {
+        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), result: sendResult, ...(stampAttempt ? { attempt } : {}) });
+        break;
+      }
+      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), error: sendResult, ...(stampAttempt ? { attempt } : {}) });
+      if (attempt < maxAttempts && backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
+    }
+    if (!ok) {
+      hadSkip = true;
+      await writeLog({ tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule, sourceId, status: 'failed', errorMessage: sendResult }).catch(() => {});
+      const failIds = failureIds();
+      if (failIds.length > 0) {
+        return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip }, nextIds: failIds };
+      }
+      outcome = 'failure';
+    } else {
+      await writeLog({ tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule, sourceId, status: 'sent', bodyPreview: `Flow "${flow.name}": ${sendResult} (node "${node.id}")` }).catch(() => {});
+    }
+  } else if (node.actionType === 'webhook_call') {
+    // Notification-style, same soft-continue-by-default posture as add_note/
+    // send_* — an outbound webhook failing shouldn't necessarily hard-stop
+    // the whole run unless the node explicitly wires a failure edge.
+    const payload: Record<string, unknown> = {};
+    for (const m of node.fieldMappings ?? []) {
+      const value = m.sourceType === 'static' ? m.staticValue : readSourceField(currentRecord, m.sourceField!);
+      setPayloadField(payload, m.targetField, value);
+    }
+    const method = node.webhookMethod ?? 'POST';
+    // Stable across every attempt of THIS node execution (never regenerated
+    // per retry) — lets a well-behaved external API deduplicate a retried
+    // delivery. See webhook_call's own UI help text for the "at-least-once"
+    // documentation this pairs with.
+    const idempotencyKey = `${runId}:${node.id}${loopIterationIndex !== undefined ? ':' + loopIterationIndex : ''}`;
+
+    let ok = false;
+    let sendResult = '';
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const attemptStart = new Date();
+      let httpStatus: number | undefined;
+      let retryAfterMs: number | undefined;
+      try {
+        // Authoritative check immediately before every actual call
+        // (including every retry) — DNS can legitimately change between a
+        // save-time check, potentially days earlier, and now. Pins the
+        // real connection to the exact address validated here, closing the
+        // DNS-rebinding race a re-check-the-hostname-string approach alone
+        // wouldn't (see url-safety.ts's own doc comment).
+        const check = await resolveAndPinSafeUrl(node.webhookUrl ?? '');
+        if (!check.safe) {
+          logger.error('Webhook action blocked by SSRF guard', { flowId: flow._id, nodeId: node.id, reason: check.reason });
+          throw new Error('This webhook URL is not allowed');
+        }
+        const decryptedHeaders = decryptWebhookHeadersForExecution(node.webhookHeaders ?? []);
+        const response = await axios.request({
+          method, url: node.webhookUrl, data: payload,
+          headers: { ...decryptedHeaders, 'X-LeadRyze-Idempotency-Key': idempotencyKey },
+          lookup: check.lookup as any,
+          maxRedirects: 0, // disabled outright, not followed-and-revalidated — see url-safety.ts's own reasoning
+          maxContentLength: WEBHOOK_MAX_BODY_BYTES, maxBodyLength: WEBHOOK_MAX_BODY_BYTES,
+          timeout: ACTION_TIMEOUT_MS, // axios's own socket-level timeout — withTimeout below only stops waiting, doesn't abort the socket
+          validateStatus: () => true, // classify below ourselves, don't let axios throw on non-2xx
+        });
+        httpStatus = response.status;
+        if (httpStatus >= 200 && httpStatus < 300) {
+          ok = true;
+          sendResult = `HTTP ${httpStatus} from ${node.webhookUrl}`;
+        } else {
+          ok = false;
+          sendResult = `HTTP ${httpStatus} from ${node.webhookUrl}`;
+          const retryAfterHeader = response.headers?.['retry-after'];
+          if (retryAfterHeader) {
+            const parsed = Number(retryAfterHeader);
+            if (!Number.isNaN(parsed)) retryAfterMs = Math.min(parsed * 1000, WEBHOOK_MAX_RETRY_AFTER_MS);
+          }
+        }
+      } catch (err) {
+        ok = false;
+        sendResult = (err as Error).message;
+      }
+
+      const finishedAt = new Date();
+      if (ok) {
+        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), result: sendResult, ...(stampAttempt ? { attempt } : {}) });
+        break;
+      }
+      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), error: sendResult, ...(stampAttempt ? { attempt } : {}) });
+
+      // Retry classification — the one action type that doesn't just
+      // always retry: a permanent client error (4xx other than 408/429)
+      // exhausts immediately regardless of remaining retryCount, since
+      // retrying an identical malformed/unauthorized request can never
+      // succeed. Everything else (408/429/5xx/network-level errors with no
+      // response at all, including the SSRF-guard rejection) retries per
+      // the configured backoff, same as every other action type.
+      const isPermanentClientError = httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 408 && httpStatus !== 429;
+      if (isPermanentClientError) break;
+      if (attempt < maxAttempts) {
+        const delay = retryAfterMs ?? backoffMs;
+        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+
+    if (!ok) {
+      hadSkip = true;
+      await writeLog({ tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule, sourceId, status: 'failed', errorMessage: sendResult }).catch(() => {});
+      const failIds = failureIds();
+      if (failIds.length > 0) {
+        return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip }, nextIds: failIds };
+      }
+      outcome = 'failure';
+    } else {
+      await writeLog({ tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule, sourceId, status: 'sent', bodyPreview: `Flow "${flow.name}": webhook call (node "${node.id}") — ${sendResult}` }).catch(() => {});
+    }
+    // currentRecord/currentModule unchanged after a webhook call.
   } else {
     const channel: 'email' | 'sms' | 'whatsapp' =
       node.actionType === 'send_email' ? 'email' : node.actionType === 'send_whatsapp' ? 'whatsapp' : 'sms';
@@ -963,7 +1601,8 @@ async function processOneNode(
         }
         outcome = 'failure';
       } else {
-        const variables = buildVariables(currentRecord, recipient.name, toStage);
+        const sendCatalog = await getFieldCatalog(tenantId, currentModule);
+        const variables = buildVariables(currentRecord, recipient.name, toStage, sendCatalog);
         const body = renderTemplate(template.body, variables);
 
         let ok = false;
@@ -973,17 +1612,17 @@ async function processOneNode(
           try {
             if (node.actionType === 'send_email') {
               const subject = renderTemplate(template.subject || `Update: ${variables.title || variables.id}`, variables);
-              const messageId = await sendEmailNow({ to: recipient.email!, toName: recipient.name, subject, htmlContent: body });
+              const messageId = await withTimeout(sendEmailNow({ to: recipient.email!, toName: recipient.name, subject, htmlContent: body }), ACTION_TIMEOUT_MS, 'send_email');
               ok = !!messageId;
               sendResult = ok ? `sent to ${recipient.email}` : 'email channel not configured';
               if (ok) await writeLog({ tenantId, channel: 'email', kind: 'automation', sourceModule: currentModule, sourceId, recipientName: recipient.name, recipientEmail: recipient.email, subject, bodyPreview: body.replace(/<[^>]+>/g, ' '), status: 'sent', providerMessageId: messageId ?? undefined });
             } else if (node.actionType === 'send_whatsapp') {
-              const messageId = await sendWhatsAppNow(recipient.phone!, body);
+              const messageId = await withTimeout(sendWhatsAppNow(recipient.phone!, body), ACTION_TIMEOUT_MS, 'send_whatsapp');
               ok = !!messageId;
               sendResult = ok ? `sent to ${recipient.phone}` : 'WhatsApp not configured';
               if (ok) await writeLog({ tenantId, channel: 'whatsapp', kind: 'automation', sourceModule: currentModule, sourceId, recipientName: recipient.name, recipientPhone: recipient.phone, bodyPreview: body, status: 'sent', providerMessageId: messageId ?? undefined });
             } else {
-              const sid = await sendSmsNow({ to: recipient.phone!, body });
+              const sid = await withTimeout(sendSmsNow({ to: recipient.phone!, body }), ACTION_TIMEOUT_MS, 'send_sms');
               ok = !!sid;
               sendResult = ok ? `sent to ${recipient.phone}` : 'SMS send failed or not configured';
               if (ok) await writeLog({ tenantId, channel: 'sms', kind: 'automation', sourceModule: currentModule, sourceId, recipientName: recipient.name, recipientPhone: recipient.phone, bodyPreview: body, status: 'sent', providerMessageId: sid ?? undefined });
@@ -1186,6 +1825,22 @@ async function runLoop(
   let cursors: string[] = startCursors;
   let lastNodeId = startNodeId;
   while (cursors.length > 0) {
+    // Run-level wall-clock cap — checked once per node transition, the one
+    // place every path through this loop already passes. Measures active
+    // processing time only: a run that's genuinely 'paused' (Delay/Approval)
+    // has already exited this loop entirely via the 'paused' return below,
+    // so time spent waiting on a human or a timer never counts against it.
+    if (!inlineOpts && Date.now() - runStartedAt.getTime() > RUN_TIMEOUT_MS) {
+      const timeoutAt = new Date();
+      await logStep(runId, {
+        nodeId: lastNodeId, nodeType: 'action', label: 'Run timeout',
+        status: 'failed', startedAt: timeoutAt, finishedAt: timeoutAt, durationMs: 0,
+        error: `Run exceeded the ${RUN_TIMEOUT_MS / 60_000}-minute execution timeout and was aborted`,
+      });
+      logger.error('AutomationFlow run timed out', { flowId: flow._id, runId });
+      await finish('failed');
+      return { status: 'failed', ctx };
+    }
     if (cursors.length === 1) {
       const node = flow.nodes.find((n) => n.id === cursors[0]);
       if (!node || (node.type !== 'action' && node.type !== 'condition' && node.type !== 'delay' && node.type !== 'subFlow' && node.type !== 'loop' && node.type !== 'approval')) break;
@@ -1242,6 +1897,50 @@ async function runLoop(
  * hands off to the shared runLoop() starting right after the trigger node.
  * Unchanged from the outside (same signature, same callers) even though its
  * own body shrank considerably once the loop moved into runLoop(). */
+// Generous vs. this function's own typical dispatch time: runLoop() exits
+// promptly even for a run that pauses on a Delay/Approval node (its own
+// 'paused' return happens BEFORE runLoop's while-loop would ever block on
+// the pause duration itself — see runLoop's own comments), so 'processing'
+// should only ever last milliseconds-to-seconds under normal operation. 2
+// minutes is a wide margin before a still-'processing' record is treated as
+// a crashed attempt eligible for reclaim.
+const STALE_PROCESSING_MS = 2 * 60 * 1000;
+const MAX_IDEMPOTENCY_ATTEMPTS = 5;
+
+/** Crash-safe claim for one trigger-event dispatch — see
+ * automation-flow-run-idempotency.model.ts's own doc comment for why this
+ * is a processing/completed/failed state machine rather than a plain
+ * insert-once-skip-on-duplicate scheme. Both branches (fresh create, and
+ * the reclaim findOneAndUpdate) are single atomic Mongo operations, so two
+ * truly concurrent identical events can never both return true. */
+async function claimIdempotencyKey(
+  tenantId: string, flowId: mongoose.Types.ObjectId, eventId: string,
+): Promise<boolean> {
+  const now = new Date();
+  try {
+    await AutomationFlowRunIdempotency.create({
+      tenantId: new mongoose.Types.ObjectId(tenantId), flowId, triggerEventId: eventId,
+      status: 'processing', attempts: 1, startedAt: now,
+    });
+    return true; // fresh claim
+  } catch (err: any) {
+    if (err?.code !== 11000) throw err;
+  }
+  const staleBefore = new Date(now.getTime() - STALE_PROCESSING_MS);
+  const reclaimed = await AutomationFlowRunIdempotency.findOneAndUpdate(
+    {
+      tenantId: new mongoose.Types.ObjectId(tenantId), flowId, triggerEventId: eventId,
+      attempts: { $lt: MAX_IDEMPOTENCY_ATTEMPTS },
+      $or: [
+        { status: 'failed' },
+        { status: 'processing', startedAt: { $lte: staleBefore } }, // crashed mid-run — safe to retry
+      ],
+    },
+    { $set: { status: 'processing', startedAt: now }, $inc: { attempts: 1 } },
+  );
+  return !!reclaimed; // false = already completed, actively processing elsewhere, or attempts exhausted
+}
+
 async function executeFlow(
   tenantId: string,
   flow: IAutomationFlow,
@@ -1249,25 +1948,85 @@ async function executeFlow(
   triggerModule: PipelineModule,
   toStage: string,
   depth: number,
+  triggerEventId?: string,
+  /** Set only when this firing is a downstream consequence of another,
+   * currently-executing run's own action (update_record/assign_record/
+   * change_status/create_linked_record) — see AutomationFlowRun's own
+   * triggeredByRunId doc comment for the full reasoning. Absent for every
+   * genuine external trigger (a real record edit, a schedule tick, a
+   * webhook delivery). */
+  triggeredByRunId?: mongoose.Types.ObjectId,
 ): Promise<void> {
   const triggerNode = flow.nodes.find((n) => n.type === 'trigger');
   if (!triggerNode) return;
 
+  // Emergency kill switch (Phase 5) — the single choke point every
+  // runFlows*/runFlowOnWebhook/pollScheduledFlows entry point funnels
+  // through before a new AutomationFlowRun is ever created, so one guard
+  // here covers all of them. Deliberately NOT checked inside runLoop() —
+  // an already-running run should finish, not abort mid-node; this only
+  // blocks NEW runs from starting.
+  const tenantForPause = await Tenant.findById(tenantId).select('settings.automationsPaused').lean();
+  if (isAutomationPausedForTenant(tenantForPause)) return;
+
+  // Correct as a fallback ONLY for the record create/update/delete/status-
+  // changed hooks (runFlows*, below) — pollScheduledFlows and
+  // runFlowOnWebhook both pass an explicit triggerEventId because this
+  // formula would be wrong for them (see each call site's own comment).
+  // recordUpdatedAtMs disambiguates two genuinely separate writes to the
+  // SAME record+toStage within the idempotency TTL (e.g. Deal: Proposal ->
+  // Negotiation -> Proposal again within 10 minutes) — every native-crm
+  // schema bumps `updatedAt` on each write, so two distinct writes get two
+  // distinct keys (both automations fire, correctly), while a retried
+  // dispatch of the SAME write (the crash-recovery case Fix 2 exists for)
+  // replays the identical triggerRecord snapshot, hence the identical
+  // updatedAt, hence still correctly deduplicates.
+  const recordUpdatedAtMs = (triggerRecord as any)?.updatedAt
+    ? new Date((triggerRecord as any).updatedAt).getTime() : undefined;
+  const eventId = triggerEventId
+    ?? `${flow._id}:${triggerModule}:${toStage}:${String(triggerRecord._id ?? triggerRecord.recordId ?? '')}${recordUpdatedAtMs !== undefined ? ':' + recordUpdatedAtMs : ''}`;
+
+  const claimed = await claimIdempotencyKey(tenantId, flow._id as mongoose.Types.ObjectId, eventId);
+  if (!claimed) {
+    logger.warn('AutomationFlow run deduplicated — event already processing/completed/exhausted', { flowId: flow._id, eventId });
+    return;
+  }
+
   const startedAt = new Date();
   const run = await AutomationFlowRun.create({
-    tenantId: new mongoose.Types.ObjectId(tenantId), flowId: flow._id, flowName: flow.name,
+    tenantId: new mongoose.Types.ObjectId(tenantId), flowId: flow._id, flowName: flow.name, flowVersion: flow.version,
     status: 'running', triggerModule, triggerRecordId: String(triggerRecord._id ?? triggerRecord.recordId ?? ''),
     startedAt,
     steps: [{
       nodeId: triggerNode.id, nodeType: 'trigger', label: describeNodeForLog(triggerNode),
       status: 'success', startedAt, finishedAt: startedAt, durationMs: 0,
     }],
+    // Pinned once, here, unconditionally — see the model's own doc comment
+    // on why resumeFlow/decideApproval read this back instead of a fresh
+    // AutomationFlow.findOne() (a Delay/Approval-paused run must stay bound
+    // to the graph it started with, unaffected by a later publish).
+    flowSnapshot: { nodes: flow.nodes, edges: flow.edges },
+    ...(triggeredByRunId ? { triggeredByRunId } : {}),
   });
 
   const startCursors = flow.edges.filter((e) => e.from === triggerNode.id).map((e) => e.to);
-  await runLoop(tenantId, flow, run._id as mongoose.Types.ObjectId, startedAt, startCursors, {
-    currentRecord: triggerRecord, currentModule: triggerModule, depth, hadSkip: false, toStage,
-  }, triggerNode.id);
+  const idFilter = { tenantId: new mongoose.Types.ObjectId(tenantId), flowId: flow._id, triggerEventId: eventId };
+  try {
+    const result = await runLoop(tenantId, flow, run._id as mongoose.Types.ObjectId, startedAt, startCursors, {
+      currentRecord: triggerRecord, currentModule: triggerModule, depth, hadSkip: false, toStage,
+    }, triggerNode.id);
+    await AutomationFlowRunIdempotency.updateOne(
+      idFilter,
+      result.status === 'failed'
+        ? { $set: { status: 'failed', lastError: 'Run failed or exceeded its execution timeout' } }
+        : { $set: { status: 'completed', completedAt: new Date() } },
+    ).catch(() => {});
+  } catch (err) {
+    await AutomationFlowRunIdempotency.updateOne(
+      idFilter, { $set: { status: 'failed', lastError: (err as Error).message } },
+    ).catch(() => {});
+    throw err; // preserve existing propagation — every call site already wraps executeFlow(...) in its own .catch() logger
+  }
 }
 
 /** Resumes exactly one paused run — called only by pollPausedFlows() below,
@@ -1278,6 +2037,13 @@ async function executeFlow(
  * the update, so pauseState is still readable off the result even though
  * the DB row has already moved on. */
 export async function resumeFlow(tenantId: string, runId: string): Promise<void> {
+  // Emergency kill switch (Phase 5) — checked BEFORE the atomic claim below,
+  // not after: while paused, this run must stay exactly 'paused' (never
+  // claimed) so pollPausedFlows()'s next tick naturally retries it once the
+  // tenant unpauses, rather than being silently dropped.
+  const tenantForPause = await Tenant.findById(tenantId).select('settings.automationsPaused').lean();
+  if (isAutomationPausedForTenant(tenantForPause)) return;
+
   const tid = new mongoose.Types.ObjectId(tenantId);
   const run = await AutomationFlowRun.findOneAndUpdate(
     { _id: runId, tenantId: tid, status: 'paused' },
@@ -1285,8 +2051,8 @@ export async function resumeFlow(tenantId: string, runId: string): Promise<void>
   ).lean();
   if (!run || !run.pauseState) return; // already resumed, deleted, or never actually paused — no-op
 
-  const flow = await AutomationFlow.findOne({ _id: run.flowId, tenantId: tid });
-  if (!flow || !flow.enabled) {
+  const liveFlow = await AutomationFlow.findOne({ _id: run.flowId, tenantId: tid });
+  if (!liveFlow || !liveFlow.enabled) {
     // Adversarial-but-real case: the flow was deleted or disabled while this
     // run sat paused. Finish it plainly rather than crashing or resurrecting
     // logic for a flow that no longer exists/is off.
@@ -1296,6 +2062,19 @@ export async function resumeFlow(tenantId: string, runId: string): Promise<void>
     }).catch(() => {});
     return;
   }
+
+  // Bound to the graph THIS RUN actually started with, not whatever the
+  // flow's live nodes/edges are right now — see AutomationFlowRun.
+  // flowSnapshot's own doc comment (a Delay/Approval-paused run must not
+  // silently pick up a later publish's changed config while it sits
+  // waiting). `liveFlow` above is fetched only for the enabled/existence
+  // check, which correctly IS live — a disabled/deleted flow should still
+  // abort a resume; that's unrelated to graph staleness. Falls back to
+  // liveFlow only for a run created before flowSnapshot existed
+  // (pre-migration safety, not the normal path going forward).
+  const flow = run.flowSnapshot
+    ? ({ _id: run.flowId, nodes: run.flowSnapshot.nodes, edges: run.flowSnapshot.edges } as unknown as IAutomationFlow)
+    : liveFlow;
 
   await runLoop(tenantId, flow, run._id as mongoose.Types.ObjectId, run.startedAt, run.pauseState.cursor ? [run.pauseState.cursor] : [], {
     currentRecord: run.pauseState.currentRecord, currentModule: run.pauseState.currentModule as PipelineModule,
@@ -1325,6 +2104,15 @@ export async function decideApproval(
   decision: 'approve' | 'reject',
   decidedByUserId?: string,
 ): Promise<{ ok: boolean; reason?: string }> {
+  // Emergency kill switch (Phase 5) — checked before claiming the run, same
+  // reasoning as resumeFlow(): the pending approval stays exactly 'paused'
+  // (never claimed) so it can still be decided once the tenant unpauses,
+  // rather than a decision made while paused silently continuing execution.
+  const tenantForPause = await Tenant.findById(tenantId).select('settings.automationsPaused').lean();
+  if (isAutomationPausedForTenant(tenantForPause)) {
+    return { ok: false, reason: "Automation is currently paused for this tenant — decisions cannot be processed until it's resumed." };
+  }
+
   const tid = new mongoose.Types.ObjectId(tenantId);
   const run = await AutomationFlowRun.findOneAndUpdate(
     { _id: runId, tenantId: tid, status: 'paused', 'pauseState.kind': 'approval' },
@@ -1334,8 +2122,8 @@ export async function decideApproval(
     return { ok: false, reason: 'No pending approval found for this run (already decided, not paused, or not an approval pause)' };
   }
 
-  const flow = await AutomationFlow.findOne({ _id: run.flowId, tenantId: tid });
-  if (!flow || !flow.enabled) {
+  const liveFlow = await AutomationFlow.findOne({ _id: run.flowId, tenantId: tid });
+  if (!liveFlow || !liveFlow.enabled) {
     // Same adversarial-but-real case resumeFlow() already guards against —
     // the flow was deleted/disabled while this run sat waiting on a decision.
     logger.error('AutomationFlow approval decision aborted — flow missing or disabled', { runId, flowId: run.flowId });
@@ -1344,6 +2132,13 @@ export async function decideApproval(
     }).catch(() => {});
     return { ok: false, reason: 'The underlying flow was deleted or disabled while this run was paused' };
   }
+  // Same reasoning as resumeFlow() — bound to the graph this run started
+  // with, so the approve/reject edge resolved below is the one that was
+  // actually live when the run paused, not whatever a later publish changed
+  // it to.
+  const flow = run.flowSnapshot
+    ? ({ _id: run.flowId, nodes: run.flowSnapshot.nodes, edges: run.flowSnapshot.edges } as unknown as IAutomationFlow)
+    : liveFlow;
 
   const pausedNodeId = run.pauseState.pausedNodeId;
   const decisionAt = new Date();
@@ -1385,7 +2180,7 @@ export async function pollPausedFlows(): Promise<void> {
    existing call sites via a dynamic import from that file (see its own
    hook functions) so zero controllers needed to change for this to exist. */
 
-export async function runFlows(tenantId: string, module: PipelineModule, record: Record<string, any>, toStage: string, depth = 0): Promise<void> {
+export async function runFlows(tenantId: string, module: PipelineModule, record: Record<string, any>, toStage: string, depth = 0, triggeredByRunId?: mongoose.Types.ObjectId): Promise<void> {
   if (depth >= MAX_LINKED_RECORD_CHAIN_DEPTH) { logger.error('AutomationFlow chain depth cap reached', { module, depth }); return; }
   try {
     const flows = await AutomationFlow.find({
@@ -1393,12 +2188,14 @@ export async function runFlows(tenantId: string, module: PipelineModule, record:
       'nodes.type': 'trigger', 'nodes.module': module, 'nodes.triggerType': 'status_changed', 'nodes.triggerStage': toStage,
     });
     for (const flow of flows) {
-      await executeFlow(tenantId, flow, record, module, toStage, depth).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
+      const triggerNode = flow.nodes.find((n) => n.type === 'trigger');
+      if (!matchesBranchScope(triggerNode?.branchIds, record)) continue;
+      await executeFlow(tenantId, flow, record, module, toStage, depth, undefined, triggeredByRunId).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
     }
   } catch (err) { logger.error('runFlows crashed', { module, error: (err as Error).message }); }
 }
 
-export async function runFlowsOnCreate(tenantId: string, module: PipelineModule, record: Record<string, any>, depth = 0): Promise<void> {
+export async function runFlowsOnCreate(tenantId: string, module: PipelineModule, record: Record<string, any>, depth = 0, triggeredByRunId?: mongoose.Types.ObjectId): Promise<void> {
   if (depth >= MAX_LINKED_RECORD_CHAIN_DEPTH) { logger.error('AutomationFlow chain depth cap reached', { module, depth }); return; }
   try {
     const flows = await AutomationFlow.find({
@@ -1406,12 +2203,14 @@ export async function runFlowsOnCreate(tenantId: string, module: PipelineModule,
       'nodes.type': 'trigger', 'nodes.module': module, 'nodes.triggerType': 'record_created',
     });
     for (const flow of flows) {
-      await executeFlow(tenantId, flow, record, module, 'created', depth).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
+      const triggerNode = flow.nodes.find((n) => n.type === 'trigger');
+      if (!matchesBranchScope(triggerNode?.branchIds, record)) continue;
+      await executeFlow(tenantId, flow, record, module, 'created', depth, undefined, triggeredByRunId).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
     }
   } catch (err) { logger.error('runFlowsOnCreate crashed', { module, error: (err as Error).message }); }
 }
 
-export async function runFlowsOnUpdate(tenantId: string, module: PipelineModule, prevRecord: Record<string, any>, newRecord: Record<string, any>, depth = 0): Promise<void> {
+export async function runFlowsOnUpdate(tenantId: string, module: PipelineModule, prevRecord: Record<string, any>, newRecord: Record<string, any>, depth = 0, triggeredByRunId?: mongoose.Types.ObjectId): Promise<void> {
   if (depth >= MAX_LINKED_RECORD_CHAIN_DEPTH) { logger.error('AutomationFlow chain depth cap reached', { module, depth }); return; }
   try {
     const flows = await AutomationFlow.find({
@@ -1420,12 +2219,13 @@ export async function runFlowsOnUpdate(tenantId: string, module: PipelineModule,
     });
     for (const flow of flows) {
       const triggerNode = flow.nodes.find((n) => n.type === 'trigger');
+      if (!matchesBranchScope(triggerNode?.branchIds, newRecord)) continue;
       if (!triggerNode?.triggerField) continue;
       const before = readSourceField(prevRecord, triggerNode.triggerField);
       const after  = readSourceField(newRecord, triggerNode.triggerField);
       if (String(before ?? '') === String(after ?? '')) continue;
       if (triggerNode.triggerStage && String(after ?? '') !== triggerNode.triggerStage) continue;
-      await executeFlow(tenantId, flow, newRecord, module, String(after ?? ''), depth).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
+      await executeFlow(tenantId, flow, newRecord, module, String(after ?? ''), depth, undefined, triggeredByRunId).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
     }
   } catch (err) { logger.error('runFlowsOnUpdate crashed', { module, error: (err as Error).message }); }
 }
@@ -1438,6 +2238,8 @@ export async function runFlowsOnDelete(tenantId: string, module: PipelineModule,
       'nodes.type': 'trigger', 'nodes.module': module, 'nodes.triggerType': 'record_deleted',
     });
     for (const flow of flows) {
+      const triggerNode = flow.nodes.find((n) => n.type === 'trigger');
+      if (!matchesBranchScope(triggerNode?.branchIds, deletedRecord)) continue;
       await executeFlow(tenantId, flow, deletedRecord, module, 'deleted', depth).catch((err) => logger.error('Flow run failed', { flowId: flow._id, error: (err as Error).message }));
     }
   } catch (err) { logger.error('runFlowsOnDelete crashed', { module, error: (err as Error).message }); }
@@ -1456,11 +2258,16 @@ export async function runFlowsOnDelete(tenantId: string, module: PipelineModule,
  * being required-but-functionally-unused on a 'scheduled' trigger node.
  * Never throws. */
 export async function runFlowOnWebhook(
-  tenantId: string, flow: IAutomationFlow, payload: Record<string, any>,
+  tenantId: string, flow: IAutomationFlow, payload: Record<string, any>, fingerprint: string,
 ): Promise<void> {
   const triggerNode = flow.nodes.find((n) => n.type === 'trigger');
   if (!triggerNode?.module) return; // shouldn't happen — module is required on every trigger node
-  await executeFlow(tenantId, flow, payload, triggerNode.module as PipelineModule, 'webhook', 0).catch((err) =>
+  // fingerprint (already computed by the caller — sha256 of token+raw body)
+  // is passed straight through as the idempotency key: `payload` here is
+  // the raw webhook JSON body, usually with no `_id`, so executeFlow's own
+  // fallback formula would collapse to a near-identical key for every
+  // distinct payload sent to this flow — the opposite of dedup.
+  await executeFlow(tenantId, flow, payload, triggerNode.module as PipelineModule, 'webhook', 0, fingerprint).catch((err) =>
     logger.error('Webhook-triggered flow run failed', { flowId: (flow as any)._id, error: (err as Error).message }));
 }
 
@@ -1504,6 +2311,13 @@ export async function pollScheduledFlows(): Promise<void> {
     try {
       const tenantId = String(flow.tenantId);
       let filter = conditionsToMongoFilter(triggerNode.scheduleFilter);
+      // Phase 6 branch scoping — same reasoning as pollScheduledRules()'s
+      // identical addition: folded into the compiled Mongo filter (not a
+      // JS-side post-filter) since this function already queries a
+      // potentially large candidate set.
+      if (triggerNode.branchIds && triggerNode.branchIds.length > 0) {
+        filter = { $and: [filter, { branchId: { $in: triggerNode.branchIds.map((id) => new mongoose.Types.ObjectId(id)) } }] };
+      }
       if (isContinuation) {
         filter = { $and: [filter, { _id: { $gt: new mongoose.Types.ObjectId(triggerNode.scheduleCursor) } }] };
       }
@@ -1514,7 +2328,13 @@ export async function pollScheduledFlows(): Promise<void> {
         logger.error('Schedule Trigger match cap reached — remainder deferred to next tick', { flowId: flow._id, module: triggerNode.scheduleModule, matched: matches.length, cap: MAX_SCHEDULE_MATCHES_PER_TICK });
       }
       for (const record of capped) {
-        await executeFlow(tenantId, flow, record, triggerNode.scheduleModule as PipelineModule, 'scheduled', 0).catch((err) => {
+        // Explicit triggerEventId, tick-timestamped: every firing of the
+        // same record otherwise shares the constant toStage 'scheduled', so
+        // executeFlow's own fallback formula would wrongly suppress the
+        // NEXT legitimate tick's firing of this same record within the TTL
+        // window without the tick timestamp here.
+        const triggerEventId = `${flow._id}:${triggerNode.id}:${now.getTime()}:${record._id}`;
+        await executeFlow(tenantId, flow, record, triggerNode.scheduleModule as PipelineModule, 'scheduled', 0, triggerEventId).catch((err) => {
           logger.error('Scheduled flow run failed', { flowId: flow._id, error: (err as Error).message });
         });
       }

@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from 'mongoose';
+import { IFlowNode, IFlowEdge } from './automation-flow.model';
 
 /** Execution history for the Advanced Mode engine — one document per firing
  * of an AutomationFlow, with a per-node step log. Not the same document as
@@ -108,6 +109,11 @@ export interface IAutomationFlowRun extends Document {
   /** Snapshot of the flow's name at run time — stays meaningful even if the
    * flow is later renamed or deleted. */
   flowName:      string;
+  /** The published version this run actually executed (AutomationFlow.version
+   * at trigger time) — stays meaningful across later publishes, same
+   * "point-in-time snapshot" reasoning as flowName. Absent on runs recorded
+   * before versioning existed. */
+  flowVersion?:  number;
   status:        FlowRunStatus;
   triggerModule: string;
   triggerRecordId?: string;
@@ -120,6 +126,34 @@ export interface IAutomationFlowRun extends Document {
   /** Only present while status === 'paused' — when pollPausedFlows() should
    * next attempt to resume this run. */
   resumeAt?:     Date;
+  /** Set to the CURRENTLY EXECUTING run's own _id whenever this run was
+   * itself triggered as a downstream consequence of that run's action
+   * (update_record/assign_record/change_status/create_linked_record calling
+   * runAutomationsOnUpdate/runFlowsOnUpdate or runAutomationsOnCreate/
+   * runFlowsOnCreate). Absent for a run that started from a genuine external
+   * trigger (a real record edit, a schedule tick, a webhook delivery).
+   * Additive traceability only — MAX_LINKED_RECORD_CHAIN_DEPTH (enforced via
+   * the separate `depth` counter threaded through the runFlowsOnX/
+   * runAutomationsOnX hooks, not this field) is what actually bounds a
+   * self-triggering chain; this
+   * just makes that chain directly queryable
+   * (`AutomationFlowRun.find({triggeredByRunId: X})`) instead of an
+   * inference reconstructed from timestamps. */
+  triggeredByRunId?: mongoose.Types.ObjectId;
+  /** A pinned copy of the flow's nodes/edges as of the moment THIS run was
+   * created — populated unconditionally by executeFlow(), read back by
+   * resumeFlow()/decideApproval() instead of a fresh AutomationFlow.findOne()
+   * fetch. Exists so a Delay/Approval-paused run stays bound to the graph it
+   * started with even if the flow is published to a new version while the
+   * run sits paused — without this, resumeFlow's own live re-fetch would
+   * silently execute the NEW graph using the OLD run's pauseState.cursor (a
+   * node id that may not even exist in the new version, or whose config
+   * simply changed underneath the paused run). Sub-Flow/Loop callee flows
+   * are deliberately NOT covered by this snapshot — they're fetched fresh at
+   * the moment they're actually invoked (inside invokeFlowInline), which is
+   * correct as-is since a Sub-Flow/Loop call is never itself a
+   * pause-then-resume-later boundary. */
+  flowSnapshot?: { nodes: IFlowNode[]; edges: IFlowEdge[] };
   createdAt:     Date;
   updatedAt:     Date;
 }
@@ -166,6 +200,7 @@ const schema = new Schema<IAutomationFlowRun>(
     tenantId:      { type: Schema.Types.ObjectId, ref: 'Tenant', required: true },
     flowId:        { type: Schema.Types.ObjectId, ref: 'AutomationFlow', required: true },
     flowName:      { type: String, required: true },
+    flowVersion:   { type: Number },
     status:        { type: String, enum: ['running', 'completed', 'partial', 'failed', 'paused'], default: 'running' },
     triggerModule: { type: String, required: true },
     triggerRecordId: { type: String },
@@ -175,6 +210,11 @@ const schema = new Schema<IAutomationFlowRun>(
     steps:         { type: [stepSchema], default: [] },
     pauseState:    { type: pauseStateSchema },
     resumeAt:      { type: Date },
+    triggeredByRunId: { type: Schema.Types.ObjectId, ref: 'AutomationFlowRun' },
+    // Mixed, not a strict sub-schema — flowSnapshot is server-computed only
+    // (never client-writable, same posture as pauseState.currentRecord
+    // above), so it doesn't need Mongoose-level structural validation.
+    flowSnapshot:  { type: Schema.Types.Mixed },
   },
   { timestamps: true },
 );
@@ -184,6 +224,15 @@ schema.index({ tenantId: 1, status: 1 });
 // Serves pollPausedFlows()'s cross-tenant scan directly — not scoped by
 // tenantId since the poll itself runs globally, once per cron tick.
 schema.index({ status: 1, resumeAt: 1 });
+// Sparse — most runs have no triggeredByRunId (a genuine external trigger,
+// not a downstream re-fire). Serves the self-recursion trace query directly.
+schema.index({ triggeredByRunId: 1 }, { sparse: true });
+// Serves getFlowRunStats()'s $facet aggregation (Phase 5) — none of the
+// indexes above cover `startedAt`, so both the perFlow branch's own
+// $sort:{startedAt:-1} (needed for its $first "most recent" trick) and the
+// todaySummary branch's $match:{startedAt:{$gte:...}} would otherwise fall
+// back to an in-memory sort/scan as this collection grows.
+schema.index({ tenantId: 1, startedAt: -1 });
 
 export const AutomationFlowRun = mongoose.model<IAutomationFlowRun>(
   'AutomationFlowRun',

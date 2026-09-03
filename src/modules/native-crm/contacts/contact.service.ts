@@ -4,6 +4,7 @@ import { CreateContactDTO, UpdateContactDTO } from './contact.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listContacts(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status } = opts;
@@ -32,14 +33,18 @@ export async function getContactById(tenantId: string, id: string, scope?: DataS
 
 export async function createContact(tenantId: string, dto: CreateContactDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Contact.create({ tenantId: tid, ...dto });
+  const created = await Contact.create({ tenantId: tid, ...dto });
+  indexNativeSearchRecord(tenantId, 'native', 'contacts', created.toObject(), `${created.firstName} ${created.lastName}`.trim());
+  return created;
 }
 
 export async function updateContact(tenantId: string, id: string, dto: UpdateContactDTO, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return Contact.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  const updated = await Contact.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'contacts', updated, `${updated.firstName} ${updated.lastName}`.trim());
+  return updated;
 }
 
 export async function deleteContact(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
@@ -47,6 +52,7 @@ export async function deleteContact(tenantId: string, id: string, scope?: DataSc
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const res = await Contact.findOneAndDelete(filter);
+  if (res) removeNativeSearchRecord(tenantId, 'native', 'contacts', String(res._id));
   return !!res;
 }
 

@@ -28,12 +28,11 @@ export async function getEffectivePermissions(tenantId: string, roleId: string):
 }
 
 /**
- * Checks whether a role has a specific permission key.
+ * Checks whether an already-fetched permission set grants a key.
  * Supports wildcard fallback: connector.zoho.accounts.view → connector.zoho.* → connector.*
+ * Synchronous — for callers (e.g. search) that fetch the set once and check many keys against it.
  */
-export async function hasPermission(tenantId: string, roleId: string, required: string): Promise<boolean> {
-  const perms = await getEffectivePermissions(tenantId, roleId);
-
+export function permissionAllows(perms: Set<string>, required: string): boolean {
   if (perms.has(required)) return true;
 
   // Wildcard fallback — progressively shorter prefixes
@@ -43,6 +42,15 @@ export async function hasPermission(tenantId: string, roleId: string, required: 
   }
 
   return false;
+}
+
+/**
+ * Checks whether a role has a specific permission key.
+ * Supports wildcard fallback: connector.zoho.accounts.view → connector.zoho.* → connector.*
+ */
+export async function hasPermission(tenantId: string, roleId: string, required: string): Promise<boolean> {
+  const perms = await getEffectivePermissions(tenantId, roleId);
+  return permissionAllows(perms, required);
 }
 
 /**

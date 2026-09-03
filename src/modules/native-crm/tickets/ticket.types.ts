@@ -20,10 +20,23 @@ export interface ITicket {
   createdBy?: string;
   createdAt: Date;
   updatedAt: Date;
+
+  // SLA — server-computed only, never client-writable (absent from
+  // CreateTicketDTO/UpdateTicketDTO below on purpose).
+  resolutionDueAt?: Date | null;
+  firstResponseDueAt?: Date | null;
+  resolutionWarningAt?: Date | null;
+  firstResponseWarningAt?: Date | null;
+  resolvedAt?: Date | null;
+  closedAt?: Date | null;
+  firstRespondedAt?: Date | null;
+  // Derived on read via deriveSlaStatus() — not stored on the document itself.
+  slaStatus?: SlaStatus;
 }
 
 export interface CreateTicketDTO {
   subject: string;
+  branchId?: string | null;
   priority?: string;
   ticketStatus?: string;
   description?: string;

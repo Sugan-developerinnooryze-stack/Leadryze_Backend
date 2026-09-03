@@ -4,6 +4,7 @@ import { sendSuccess, sendError } from '../../../utils/response';
 import { getOrCreateStages, updateStages } from './pipeline-config.service';
 import { PipelineModule, BuiltInPipelineModule } from './pipeline-config.model';
 import { getCustomModuleBySlug } from '../../custom-modules/custom-module.service';
+import { logAuditEvent } from '../../logs/audit-log.model';
 
 const BUILT_IN_MODULES: BuiltInPipelineModule[] = ['lead', 'deal', 'task', 'ticket', 'quotation', 'workorder', 'contract', 'invoice'];
 
@@ -39,7 +40,12 @@ export async function putStages(req: AuthRequest, res: Response) {
     for (const s of stages) {
       if (!s.key || !s.label) return sendError(res, 'Each stage requires a key and label', 400);
     }
+    const before = await getOrCreateStages(req.tenantId!, module);
     const updated = await updateStages(req.tenantId!, module, stages);
+    logAuditEvent('pipeline.stages_updated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'PipelineConfig', targetId: module, detail: { module, before: { stageCount: before.length }, after: { stageCount: updated.length } } },
+    );
     sendSuccess(res, updated);
   } catch (err: any) {
     sendError(res, err.message ?? 'Failed to update pipeline stages', 500);

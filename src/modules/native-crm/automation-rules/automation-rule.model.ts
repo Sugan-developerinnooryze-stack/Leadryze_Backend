@@ -1,7 +1,16 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { PipelineModule } from '../pipeline-config/pipeline-config.model';
 
-export type AutomationActionType = 'send_email' | 'send_sms' | 'send_whatsapp' | 'create_linked_record';
+/** Simple Mode ("this file's own AutomationRule") only ever persists/
+ * executes the first 4 — its own automation-rule.validation.ts Zod enum and
+ * this file's own Mongoose schema `enum` below are BOTH independently
+ * hardcoded at those 4 values, so widening this shared TS type for Advanced
+ * Mode's 5 new action types (automation-flow.model.ts/.validation.ts) is
+ * safely inert here — Simple Mode is doubly defended against ever
+ * persisting or executing one of the 5 new values, not just by convention. */
+export type AutomationActionType =
+  | 'send_email' | 'send_sms' | 'send_whatsapp' | 'create_linked_record'
+  | 'update_record' | 'assign_record' | 'change_status' | 'add_note' | 'webhook_call';
 /** 'tenant_admin' resolves to this tenant's own TENANT_ADMIN user — the only
  * (until 'manager') strategy that ignores the record entirely, for "notify a
  * fixed person regardless of which record this is" (Error Branch's own
@@ -125,6 +134,10 @@ export interface IAutomationRule extends Document {
    * token, never silently reissue one and break an already-configured
    * external system). */
   webhookToken?:      string;
+  /** Phase 6 branch scoping — see automation-flow.model.ts's IFlowNode's
+   * matching field for the full doc, shared verbatim between both engines.
+   * Not meaningful when triggerType === 'webhook' (rejected at save time). */
+  branchIds?:         string[];
   actionType:        AutomationActionType;
   /** Required only for send_email/send_sms. */
   templateId?:       string;
@@ -190,6 +203,7 @@ const schema = new Schema<IAutomationRule>(
     scheduleLastFiredAt: { type: Date },
     scheduleCursor:    { type: String },
     webhookToken:      { type: String, trim: true },
+    branchIds:         { type: [String], default: undefined },
     actionType:        { type: String, enum: ['send_email', 'send_sms', 'send_whatsapp', 'create_linked_record'], required: true },
     templateId:        { type: String },
     recipientStrategy: { type: String, enum: ['record_contact', 'assigned_user', 'tenant_admin', 'manager'], default: 'record_contact' },

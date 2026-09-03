@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import mongoose from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
 import { authenticate } from '../../../middlewares/auth.middleware';
 import { requireTenant } from '../../../middlewares/tenant.middleware';
@@ -19,6 +20,17 @@ const MODEL_MAP: Record<DocType, any> = {
   invoice:   NativeInvoice,
 };
 
+// Generating a share token is edit-tier on the underlying document — reuses
+// that module's own existing permission key rather than inventing a new
+// "portal.*" tier, one per docType since each already has its own edit
+// permission.
+const EDIT_PERMISSION: Record<DocType, string> = {
+  quotation: 'fs.quotations.edit',
+  contract:  'fs.contracts.edit',
+  workorder: 'fs.workorders.edit',
+  invoice:   'fs.invoices.edit',
+};
+
 const ID_FIELD: Record<DocType, string> = {
   quotation: 'quotationId',
   contract:  'contractId',
@@ -28,6 +40,18 @@ const ID_FIELD: Record<DocType, string> = {
 
 const router = Router();
 
+/** Mirrors requirePermission()'s own SUPER_ADMIN/TENANT_ADMIN bypass and DB
+ * check — needed as an inline check here rather than router-level
+ * middleware because which permission applies depends on `docType`, which
+ * isn't known until the body is parsed. */
+async function canEditDocType(req: AuthRequest, docType: DocType): Promise<boolean> {
+  const { role, roleId, tenantId } = req.user ?? {};
+  if (role === 'SUPER_ADMIN' || role === 'TENANT_ADMIN') return true;
+  if (!roleId || !tenantId) return false;
+  const { hasPermission } = await import('../../rbac/permission.service');
+  return hasPermission(tenantId, roleId, EDIT_PERMISSION[docType]);
+}
+
 /**
  * POST /api/v1/portal/generate-token
  * Authenticated: generates a portalToken on a document and returns the share URL.
@@ -35,12 +59,18 @@ const router = Router();
 router.post('/generate-token', authenticate, requireTenant, async (req: AuthRequest, res: Response) => {
   try {
     const { docType, docId } = req.body as { docType: DocType; docId: string };
-    if (!docType || !docId || !MODEL_MAP[docType]) {
+    if (!docType || !docId || !MODEL_MAP[docType] || !mongoose.Types.ObjectId.isValid(docId)) {
       return sendError(res, 'Invalid docType or docId', 400);
     }
+    if (!(await canEditDocType(req, docType))) {
+      return sendError(res, 'Insufficient permissions', 403);
+    }
     const token = uuidv4();
-    const doc = await MODEL_MAP[docType].findByIdAndUpdate(
-      docId,
+    // Scoped to the requester's own tenant — findByIdAndUpdate alone let any
+    // authenticated user of ANY tenant mint a public share link for another
+    // tenant's document just by guessing/knowing its ObjectId.
+    const doc = await MODEL_MAP[docType].findOneAndUpdate(
+      { _id: docId, tenantId: req.tenantId },
       { portalToken: token },
       { new: true }
     );

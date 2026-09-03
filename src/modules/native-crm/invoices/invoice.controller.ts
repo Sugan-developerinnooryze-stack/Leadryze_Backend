@@ -41,7 +41,8 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
-    logTimeline(req.tenantId!, 'invoice', String(item._id), 'created', `Invoice ${(item as any).invoiceId} created`, req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'invoice', String(item._id), 'created', `Invoice ${(item as any).invoiceId} created`, req.user?.userId,
+      { status: (item as any).status, amount: (item as any).servicesAmountWithTax }).catch(() => {});
     runAutomationsOnCreate(req.tenantId!, 'invoice', item as any).catch(() => {});
     sendCreated(res, item);
   } catch (err: any) {
@@ -56,7 +57,11 @@ export async function update(req: AuthRequest, res: Response) {
     if (!item) return sendError(res, 'Invoice not found', 404);
     const action = req.body.status ? 'status_changed' : 'updated';
     const desc   = req.body.status ? `Status changed to ${req.body.status}` : `Invoice ${(item as any).invoiceId} updated`;
-    logTimeline(req.tenantId!, 'invoice', String(item._id), action as any, desc, req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'invoice', String(item._id), action as any, desc, req.user?.userId,
+      req.body.status
+        ? { previousStatus: (prev as any)?.status, newStatus: req.body.status, amount: (item as any).servicesAmountWithTax }
+        : { amount: (item as any).servicesAmountWithTax },
+    ).catch(() => {});
     if (req.body.status) {
       const paidKey = await getOutcomeStageKey(req.tenantId!, 'invoice', 'paid', 'paid');
       if (req.body.status === paidKey) {
@@ -75,7 +80,8 @@ export async function remove(req: AuthRequest, res: Response) {
   try {
     const item = await deleteInvoice(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'invoices'));
     if (!item) return sendError(res, 'Invoice not found', 404);
-    logTimeline(req.tenantId!, 'invoice', req.params.id, 'deleted', 'Invoice deleted', req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'invoice', req.params.id, 'deleted', 'Invoice deleted', req.user?.userId,
+      { status: (item as any).status, amount: (item as any).servicesAmountWithTax }).catch(() => {});
     runAutomationsOnDelete(req.tenantId!, 'invoice', item as any).catch(() => {});
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

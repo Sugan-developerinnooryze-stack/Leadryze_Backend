@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { generatePdf, shareDocumentEmail, previewHtml, previewDraftHtml, downloadDraftPdf, getLiveData } from './pdf.controller';
 import { validate } from '../../../middleware/validate.middleware';
+import { requireModulePermission } from '../../../middlewares/auth.middleware';
 import { shareEmailSchema } from './pdf.validation';
 import { designElementSchema, templateRegionSchema } from '../custom-templates/custom-template.validation';
 
@@ -17,11 +18,14 @@ const previewDraftSchema = z.object({
 
 const router = Router();
 
-router.get('/:module/:id', generatePdf);
-router.get('/:module/:id/live-data',     getLiveData);
-router.get('/:module/:id/preview-html',  previewHtml);
-router.post('/:module/:id/preview-html', validate({ body: previewDraftSchema }), previewDraftHtml);
-router.post('/:module/:id/download-draft', validate({ body: previewDraftSchema }), downloadDraftPdf);
-router.post('/:module/:id/share-email',  validate({ body: shareEmailSchema }),  shareDocumentEmail);
+// Share-email is edit-tier — it emails the document to an arbitrary
+// recipient, an action, not a plain read, same reasoning as portal.routes.ts's
+// own generate-token gating.
+router.get('/:module/:id', requireModulePermission('module', 'view'), generatePdf);
+router.get('/:module/:id/live-data',     requireModulePermission('module', 'view'), getLiveData);
+router.get('/:module/:id/preview-html',  requireModulePermission('module', 'view'), previewHtml);
+router.post('/:module/:id/preview-html', requireModulePermission('module', 'view'), validate({ body: previewDraftSchema }), previewDraftHtml);
+router.post('/:module/:id/download-draft', requireModulePermission('module', 'view'), validate({ body: previewDraftSchema }), downloadDraftPdf);
+router.post('/:module/:id/share-email',  requireModulePermission('module', 'edit'), validate({ body: shareEmailSchema }),  shareDocumentEmail);
 
 export default router;

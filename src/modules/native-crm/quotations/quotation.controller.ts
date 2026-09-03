@@ -9,6 +9,7 @@ import {
   deleteQuotation,
 } from './quotation.service';
 import { logTimeline } from '../timeline/timeline.service';
+import { logAuditEvent } from '../../logs/audit-log.model';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
@@ -41,7 +42,8 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
-    logTimeline(req.tenantId!, 'quotation', String(item._id), 'created', `Quotation ${(item as any).quotationId} created`, req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'quotation', String(item._id), 'created', `Quotation ${(item as any).quotationId} created`, req.user?.userId,
+      { status: (item as any).status, amount: (item as any).servicesAmountWithTax }).catch(() => {});
     runAutomationsOnCreate(req.tenantId!, 'quotation', item as any).catch(() => {});
     sendCreated(res, item);
   } catch (err: any) {
@@ -56,7 +58,11 @@ export async function update(req: AuthRequest, res: Response) {
     if (!item) return sendError(res, 'Quotation not found', 404);
     const action = req.body.status ? 'status_changed' : 'updated';
     const desc   = req.body.status ? `Status changed to ${req.body.status}` : `Quotation ${(item as any).quotationId} updated`;
-    logTimeline(req.tenantId!, 'quotation', String(item._id), action as any, desc, req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'quotation', String(item._id), action as any, desc, req.user?.userId,
+      req.body.status
+        ? { previousStatus: (prev as any)?.status, newStatus: req.body.status, amount: (item as any).servicesAmountWithTax }
+        : { amount: (item as any).servicesAmountWithTax },
+    ).catch(() => {});
     if (req.body.status) {
       const approvedKey = await getOutcomeStageKey(req.tenantId!, 'quotation', 'approved', 'approved');
       if (req.body.status === approvedKey) {
@@ -75,8 +81,13 @@ export async function remove(req: AuthRequest, res: Response) {
   try {
     const item = await deleteQuotation(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'quotations'));
     if (!item) return sendError(res, 'Quotation not found', 404);
-    logTimeline(req.tenantId!, 'quotation', req.params.id, 'deleted', 'Quotation deleted', req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'quotation', req.params.id, 'deleted', 'Quotation deleted', req.user?.userId,
+      { status: (item as any).status, amount: (item as any).servicesAmountWithTax }).catch(() => {});
     runAutomationsOnDelete(req.tenantId!, 'quotation', item as any).catch(() => {});
+    logAuditEvent('quotation.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'Quotation', targetId: req.params.id, detail: { before: { status: (item as any).status, amount: (item as any).servicesAmountWithTax } } },
+    );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);

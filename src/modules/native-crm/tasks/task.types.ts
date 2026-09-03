@@ -20,6 +20,7 @@ export interface ITask {
 
 export interface CreateTaskDTO {
   title: string;
+  branchId?: string | null;
   dueDate?: string;
   priority?: string;
   taskStatus?: string;

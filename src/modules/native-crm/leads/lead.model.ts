@@ -81,6 +81,31 @@ export interface ILeadDoc extends Document {
   budget?:            number;
   interestedProducts?: string[];
   interestedServices?: string[];
+  /** Structured product-interest context from an AI chatbot conversation —
+   * distinct from interestedProducts (bare strings, no back-reference).
+   * Each entry is real, resolvable identity (datasetId/recordId/version),
+   * not just a display string, so a future Lead detail page could link
+   * straight back to the exact dataset record that prompted this lead. */
+  interestedItems?: Array<{
+    datasetId:      string;
+    datasetVersion: number;
+    recordId:       string;
+    title:          string;
+  }>;
+  /** AI-generated summary of the conversation that produced this lead —
+   * distinct from `requirement` (the specific ask, e.g. "Requested a quote
+   * for FF-D500"), this is the broader context (what was discussed before
+   * the ask). Only ever populated by the AI widget's capture/enrichment
+   * calls. */
+  conversationSummary?: string;
+  /** The AI widget's own chat session id — traceable back to ChatSession/
+   * AIAction records if ever needed. Only ever populated by the AI widget. */
+  chatSessionId?: string;
+  /** The page the chatbot conversation started on (e.g.
+   * "/products/butterfly-valves") — already captured on LeadCapture.sourceUrl
+   * today, duplicated here so it's visible directly on the Lead itself
+   * without a join, matching sales' real question "which page were they on". */
+  sourceUrl?: string;
   competitor?:        string;
   requirement?:       string;
   painPoints?:        string;
@@ -185,6 +210,16 @@ const schema = new Schema<ILeadDoc>(
     budget:            { type: Number },
     interestedProducts: [{ type: String }],
     interestedServices: [{ type: String }],
+    interestedItems: [{
+      datasetId:      { type: String, required: true },
+      datasetVersion: { type: Number, required: true },
+      recordId:       { type: String, required: true },
+      title:          { type: String, required: true },
+      _id: false,
+    }],
+    conversationSummary: { type: String },
+    chatSessionId:       { type: String, index: true },
+    sourceUrl:           { type: String },
     competitor:        { type: String, trim: true },
     requirement:       { type: String },
     painPoints:        { type: String },

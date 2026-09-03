@@ -17,7 +17,7 @@ import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { Activity } from '../activities/activity.model';
 import { AutomationRun } from '../automation/automation-run.model';
-import { captureLeadFromExternalSource } from '../native-crm/lead-capture/lead-capture.service';
+import { captureLeadFromExternalSource, enrichChatbotLead } from '../native-crm/lead-capture/lead-capture.service';
 import { assignRoundRobin, resolveTeamForService } from '../native-crm/staffs/round-robin.service';
 import { getActiveStaffByStaffId, listStaffs } from '../native-crm/staffs/staff.service';
 import { listTeams } from '../native-crm/teams/team.service';
@@ -38,6 +38,48 @@ import { resolveTeamFromStaffId } from '../native-crm/shared/team-resolution';
 import { NativeTimeline } from '../native-crm/timeline/timeline.model';
 import { listChatbotDatasets, executeDatasetQuery, getDatasetRecordById, QueryPlan } from '../native-crm/datasets/dataset-query.service';
 import { getDatasetSchemaForChatbot } from '../native-crm/datasets/dataset.service';
+import { listLeads } from '../native-crm/leads/lead.service';
+import { listDeals } from '../native-crm/deals/deal.service';
+import { listTickets } from '../native-crm/tickets/ticket.service';
+import { listContracts } from '../native-crm/contracts/contract.service';
+import { listQuotations } from '../native-crm/quotations/quotation.service';
+import { listCustomers as listNativeCustomers } from '../native-crm/customers/customer.service';
+import { listWorkorders } from '../native-crm/workorders/workorder.service';
+import jwt from 'jsonwebtoken';
+import { JwtPayload, DataScope } from '../../types';
+import { resolveDataScope } from '../native-crm/shared/data-scope';
+import { hasPermission } from '../rbac/permission.service';
+import { transformPIIResponse } from '../../platform/pii/pii.service';
+import { getSettings as getFsSettings } from '../native-crm/fs-settings/fs-settings.service';
+import { decrypt, isEncrypted } from '../../utils/crypto';
+import { EmailLog } from '../notifications/email-log.model';
+import { Contact } from '../native-crm/contacts/contact.model';
+import { Company } from '../native-crm/companies/company.model';
+import { Deal } from '../native-crm/deals/deal.model';
+import { Task } from '../native-crm/tasks/task.model';
+import { Ticket } from '../native-crm/tickets/ticket.model';
+import { Call } from '../native-crm/calls/call.model';
+import { Meeting } from '../native-crm/meetings/meeting.model';
+import { NativeCustomer } from '../native-crm/customers/customer.model';
+import { NativeSite } from '../native-crm/sites/site.model';
+import { NativePart } from '../native-crm/parts/part.model';
+import { NativeQuotation } from '../native-crm/quotations/quotation.model';
+import { NativeWorkorder } from '../native-crm/workorders/workorder.model';
+import { NativeContract } from '../native-crm/contracts/contract.model';
+import { NativeInvoice } from '../native-crm/invoices/invoice.model';
+import { NativeReceipt } from '../native-crm/receipts/receipt.model';
+import { NativeExpense } from '../native-crm/expenses/expense.model';
+import { NativeActivity } from '../native-crm/activities/activity.model';
+import { NativeProduct } from '../native-crm/products/product.model';
+import { NativeAsset } from '../native-crm/assets/asset.model';
+import { NativeVehicle } from '../native-crm/vehicles/vehicle.model';
+import { CatalogItem } from '../native-crm/catalog/catalog-item.model';
+import { CustomRecord } from '../custom-modules/custom-module.model';
+import { buildSearchIndexData } from '../custom-modules/custom-module.service';
+import { NativeService } from '../native-crm/services/service.model';
+import { NativeStaff } from '../native-crm/staffs/staff.model';
+import { NativeCategory } from '../native-crm/categories/category.model';
+import { Lead } from '../native-crm/leads/lead.model';
 
 const router = Router();
 
@@ -415,11 +457,139 @@ router.get('/crm-records/:tenantId/:channel/:module', async (req: Request, res: 
   }
 });
 
+/** Phase 6 (AI Agent — internal CRM Q&A): searches the tenant's OWN Native
+ * CRM records (Leads, Deals, Tickets, Contracts, Quotations, Customers,
+ * Workorders) — a completely separate system from the connector-synced
+ * Customer/CRMRecord models the rest of this route already searches. Before
+ * this, the internal AI assistant could see Zoho/HubSpot/Salesforce data but
+ * had NO visibility into a tenant's own native-crm records — the actual
+ * subject of nearly every other module in this codebase. Reuses each
+ * module's own existing list()/search logic (same text-search behavior,
+ * including custom-field search, already proven correct for the admin UI)
+ * rather than a parallel implementation. One module's own query failing
+ * (e.g. a scope/permission edge case) never blocks the others — this is a
+ * best-effort Q&A aid, not a page the AI needs bomb-proof pagination for.
+ * Invoices/Receipts deliberately excluded — no free-text title field, so
+ * name-based search has nothing useful to match against. */
+/** Same duplication this codebase's own controllers already carry (each of
+ * lead.controller.ts/customer.controller.ts has its own private copy, no
+ * shared export exists) — reads a tenant's PII-view-roles allowlist for one
+ * module. */
+async function getPIIViewRoles(tenantId: string, branchId: string | null, module: string): Promise<string[]> {
+  const settings = await getFsSettings(tenantId, branchId).catch(() => null);
+  return (settings as any)?.piiConfig?.find((p: any) => p.module === module)?.viewRoles ?? [];
+}
+
+async function searchNativeCrmRecords(
+  tenantId: string, q: string, limitPerModule: number,
+  branchId: string | null, scope: DataScope | null,
+  role: string | undefined, roleId: string | undefined,
+): Promise<Array<{ channel: string; module: string; displayName: string; data: Record<string, unknown> }>> {
+  const opts = { search: q, limit: limitPerModule, page: 1 };
+  const safe = async <T>(fn: () => Promise<T>): Promise<T | null> => {
+    try { return await fn(); } catch { return null; }
+  };
+
+  // Same bypass contract requirePermission() middleware already uses —
+  // SUPER_ADMIN/TENANT_ADMIN always pass; everyone else needs a real roleId
+  // and the specific module permission a normal CRM route would require.
+  // A module the caller can't view is simply skipped (contributes nothing),
+  // not an error for the whole search — best-effort Q&A, matching this
+  // endpoint's existing posture.
+  const isAdmin = role === 'SUPER_ADMIN' || role === 'TENANT_ADMIN';
+  const allowed = async (permKey: string): Promise<boolean> =>
+    isAdmin || (!!roleId && (await hasPermission(tenantId, roleId, permKey).catch(() => false)));
+
+  const scopedOpts = branchId ?? undefined;
+  const [
+    canLeads, canDeals, canTickets, canContracts, canQuotations, canCustomers, canWorkorders,
+  ] = await Promise.all([
+    allowed('native_crm.leads.view'),
+    allowed('native_crm.deals.view'),
+    allowed('native_crm.tickets.view'),
+    allowed('fs.contracts.view'),
+    allowed('fs.quotations.view'),
+    allowed('fs.customers.view'),
+    allowed('fs.workorders.view'),
+  ]);
+
+  const [leads, deals, tickets, contracts, quotations, customers, workorders] = await Promise.all([
+    canLeads      ? safe(() => listLeads(tenantId, opts, scopedOpts, scope ?? undefined))          : null,
+    canDeals      ? safe(() => listDeals(tenantId, opts, scopedOpts, scope ?? undefined))          : null,
+    canTickets    ? safe(() => listTickets(tenantId, opts, scopedOpts, scope ?? undefined))        : null,
+    canContracts  ? safe(() => listContracts(tenantId, opts, scopedOpts, scope ?? undefined))      : null,
+    canQuotations ? safe(() => listQuotations(tenantId, opts, scopedOpts, scope ?? undefined))     : null,
+    canCustomers  ? safe(() => listNativeCustomers(tenantId, opts, scopedOpts, scope ?? undefined)): null,
+    canWorkorders ? safe(() => listWorkorders(tenantId, opts, scopedOpts, scope ?? undefined))     : null,
+  ]);
+
+  // Real per-role PII masking, not unconditional decryption — a role
+  // outside the tenant's configured piiViewRoles for a module gets the
+  // same masked value it would see through the normal UI, instead of a
+  // raw decrypted email/phone via the AI. Only Leads/Customers carry
+  // encrypted PII fields in this search.
+  const [leadPiiRoles, customerPiiRoles] = await Promise.all([
+    getPIIViewRoles(tenantId, branchId, 'leads'),
+    getPIIViewRoles(tenantId, branchId, 'customers'),
+  ]);
+  const maskedLeads     = leads?.items     ? transformPIIResponse(leads.items,     'leads',     role ?? '', leadPiiRoles)     as any[] : [];
+  const maskedCustomers = customers?.items ? transformPIIResponse(customers.items, 'customers', role ?? '', customerPiiRoles) as any[] : [];
+
+  const out: Array<{ channel: string; module: string; displayName: string; data: Record<string, unknown> }> = [];
+  const push = (module: string, displayName: string, data: Record<string, unknown>) => {
+    const cleaned: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(data)) if (v !== undefined && v !== null && v !== '') cleaned[k] = v;
+    out.push({ channel: 'native-crm', module, displayName: displayName || `Untitled ${module.slice(0, -1)}`, data: cleaned });
+  };
+
+  for (const l of maskedLeads) {
+    push('Leads', [l.firstName, l.lastName].filter(Boolean).join(' ') || l.company, {
+      Lead_ID: l.leadId, Email: l.email, Phone: l.phone, Company: l.company,
+      Status: l.status, Rating: l.rating, Source: l.source, Score: l.score,
+    });
+  }
+  for (const d of (deals?.items ?? []) as any[]) {
+    push('Deals', d.title, {
+      Amount: d.amount, Currency: d.currency, Stage: d.stage,
+      Contact: d.contactName, Company: d.companyName, Close_Date: d.closeDate,
+    });
+  }
+  for (const t of (tickets?.items ?? []) as any[]) {
+    push('Tickets', t.subject, {
+      Priority: t.priority, Status: t.ticketStatus, Contact: t.contactName,
+    });
+  }
+  for (const c of (contracts?.items ?? []) as any[]) {
+    push('Contracts', c.title, {
+      Contract_ID: c.contractId, Status: c.status, Contract_Type: c.contractType,
+      Start_Date: c.startDate, End_Date: c.endDate, Amount: c.servicesAmountWithTax,
+    });
+  }
+  for (const q2 of (quotations?.items ?? []) as any[]) {
+    push('Quotations', q2.title, {
+      Quotation_ID: q2.quotationId, Status: q2.status, Amount: q2.servicesAmountWithTax,
+    });
+  }
+  for (const c of maskedCustomers) {
+    push('Customers', c.name, {
+      Customer_ID: c.customerId, Email: c.email, Phone: c.phone, Company: c.company, Status: c.status,
+    });
+  }
+  for (const w of (workorders?.items ?? []) as any[]) {
+    push('Workorders', w.title, {
+      WorkOrder_ID: w.workOrderId, Status: w.status, Priority: w.priority, Scheduled_Date: w.scheduledDate,
+    });
+  }
+
+  return out;
+}
+
 /**
  * GET /api/internal/crm-search/:tenantId?q=2gb+ram&limit=5
  *
  * Cross-module, cross-channel search. Searches Customer model (Contacts/Leads)
- * via MongoDB first, then CRMRecord via Meilisearch (or MongoDB fallback).
+ * via MongoDB first, then CRMRecord via Meilisearch (or MongoDB fallback),
+ * then the tenant's own Native CRM records (searchNativeCrmRecords above).
  * Results are merged with Contacts/Leads always appearing first.
  */
 router.get('/crm-search/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
@@ -434,66 +604,118 @@ router.get('/crm-search/:tenantId', async (req: Request, res: Response, next: Ne
     const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const qRe  = { $regex: safe, $options: 'i' };
 
-    // 1. Always search Customer model (Contacts + Leads) — never missed
-    const customers = await Customer.find({
-      tenantId: tid,
-      $or: [{ name: qRe }, { email: qRe }, { phone: qRe }, { company: qRe }, { address: qRe }],
-    }).select('name email phone company address leadSource channel recordType customFields').limit(limit).lean();
+    // Identity for the Native CRM portion of this search MUST come from a
+    // verified signed assertion, never from plain query params — anyone
+    // reaching this route with a valid x-internal-key could otherwise just
+    // assert role=TENANT_ADMIN and get fully unscoped access. Only
+    // ai.routes.ts's /chat handler mints this token (see its own comment);
+    // any failure to verify (missing, expired, tampered, wrong secret, or
+    // a tenantId claim that doesn't match this URL's :tenantId) is treated
+    // as "no identity at all" and falls through to the fail-closed scope
+    // below — never silently unscoped.
+    let identity: { role?: string; roleId?: string; userId?: string; branchId?: string | null } = {};
+    const internalAuthToken = req.query.internalAuth as string | undefined;
+    if (internalAuthToken) {
+      try {
+        const payload = jwt.verify(internalAuthToken, config.jwt.secret) as jwt.JwtPayload;
+        if (payload.tenantId === tenantId) {
+          identity = { role: payload.role, roleId: payload.roleId, userId: payload.userId, branchId: payload.branchId ?? null };
+        }
+      } catch { /* invalid/expired/tampered token — treat as no identity */ }
+    }
+    const nativeBranchId = identity.branchId ?? null;
+    const nativeScope: DataScope = identity.userId
+      ? await resolveDataScope(tenantId, {
+          tenantId, userId: identity.userId, role: (identity.role as any) ?? 'AGENT', roleId: identity.roleId, email: '',
+        } as JwtPayload)
+      : { kind: 'self', staffIds: [], teamIds: [], createdByUserIds: [] };
 
-    const customerRecords = customers.map((c) => ({
-      channel:     (c.channel as string) || 'web',
-      module:      c.recordType === 'lead' ? 'Leads' : 'Contacts',
-      displayName: c.name,
-      data: {
-        ...(c.email      ? { Email:      c.email }      : {}),
-        ...(c.phone      ? { Phone:      c.phone }      : {}),
-        ...(c.company    ? { Company:    c.company }    : {}),
-        ...(c.address    ? { Address:    c.address }    : {}),
-        ...(c.leadSource ? { LeadSource: c.leadSource } : {}),
-        ...(c.customFields as Record<string, unknown> || {}),
-      },
-    }));
+    // Same isAdmin/hasPermission bypass contract as searchNativeCrmRecords
+    // (Step 3) below, applied here to the two LEGACY search paths — these
+    // predate that fix and had NO permission check at all (confirmed
+    // exploitable: any authenticated staff member, any role, could see
+    // real connector-synced Customer/CRMRecord data regardless of what
+    // they're actually permitted to view). Reuses the exact permission
+    // keys the equivalent HUMAN-driven routes already require — not new
+    // keys: customers.routes.ts's own GET / requires 'customers.view';
+    // crm-record.routes.ts's own GET /search requires 'connector.view'.
+    const isAdminIdentity = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    const canViewLegacy = async (permKey: string): Promise<boolean> =>
+      isAdminIdentity || (!!identity.roleId && await hasPermission(tenantId, identity.roleId, permKey).catch(() => false));
 
-    // 2. Search CRMRecord via Meilisearch (or MongoDB fallback)
-    let crmRecords: Array<{ channel: string; module: string; displayName: string; data: Record<string, unknown> }> = [];
+    // 1. Search Customer model (Contacts + Leads) — gated on 'customers.view'
+    const customerRecords: Array<{ channel: string; module: string; displayName: string; data: Record<string, unknown> }> = [];
+    if (await canViewLegacy('customers.view')) {
+      const customers = await Customer.find({
+        tenantId: tid,
+        $or: [{ name: qRe }, { email: qRe }, { phone: qRe }, { company: qRe }, { address: qRe }],
+      }).select('name email phone company address leadSource channel recordType customFields').limit(limit).lean();
 
-    const meiliHits = await searchMeili(tenantId, q, limit);
-    if (meiliHits !== null) {
-      crmRecords = meiliHits.map((h) => ({
-        channel: h.channel, module: h.module, displayName: h.displayName, data: h.data,
-      }));
-    } else {
-      const escapeWord = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const words = q.split(/\s+/).map(escapeWord).filter(w => w.length >= 2);
-      if (words.length) {
-        const perWordConds = words.map((w) => ({
-          $or: [
-            { displayName: { $regex: w, $options: 'i' } },
-            { '_dataArr.v': { $regex: w, $options: 'i' } },
-          ],
-        }));
-        const searchMatch = perWordConds.length === 1 ? perWordConds[0] : { $and: perWordConds };
-        const SECONDARY = /note|task|call|log|history|activity|event|feed|inbox|audit|trail|macro|webform|campaign/i;
-
-        const records = await CRMRecord.aggregate([
-          { $match: { tenantId: tid } },
-          { $addFields: { _dataArr: { $objectToArray: '$data' } } },
-          { $match: searchMatch },
-          { $addFields: { _priority: { $cond: [{ $regexMatch: { input: '$module', regex: SECONDARY } }, 2, 1] } } },
-          { $sort: { _priority: 1 } },
-          { $project: { channel: 1, module: 1, displayName: 1, data: 1 } },
-          { $limit: limit },
-        ]);
-
-        crmRecords = records.map((r) => ({
-          channel: r.channel, module: r.module, displayName: r.displayName, data: r.data,
-        }));
+      for (const c of customers) {
+        customerRecords.push({
+          channel:     (c.channel as string) || 'web',
+          module:      c.recordType === 'lead' ? 'Leads' : 'Contacts',
+          displayName: c.name,
+          data: {
+            ...(c.email      ? { Email:      c.email }      : {}),
+            ...(c.phone      ? { Phone:      c.phone }      : {}),
+            ...(c.company    ? { Company:    c.company }    : {}),
+            ...(c.address    ? { Address:    c.address }    : {}),
+            ...(c.leadSource ? { LeadSource: c.leadSource } : {}),
+            ...(c.customFields as Record<string, unknown> || {}),
+          },
+        });
       }
     }
 
-    // 3. Merge: customers first, then CRM records, deduplicate
+    // 2. Search CRMRecord via Meilisearch (or MongoDB fallback) — gated on 'connector.view'
+    let crmRecords: Array<{ channel: string; module: string; displayName: string; data: Record<string, unknown> }> = [];
+
+    if (await canViewLegacy('connector.view')) {
+      const meiliHits = await searchMeili(tenantId, q, limit);
+      if (meiliHits !== null) {
+        crmRecords = meiliHits.map((h) => ({
+          channel: h.channel, module: h.module, displayName: h.displayName, data: h.data,
+        }));
+      } else {
+        const escapeWord = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const words = q.split(/\s+/).map(escapeWord).filter(w => w.length >= 2);
+        if (words.length) {
+          const perWordConds = words.map((w) => ({
+            $or: [
+              { displayName: { $regex: w, $options: 'i' } },
+              { '_dataArr.v': { $regex: w, $options: 'i' } },
+            ],
+          }));
+          const searchMatch = perWordConds.length === 1 ? perWordConds[0] : { $and: perWordConds };
+          const SECONDARY = /note|task|call|log|history|activity|event|feed|inbox|audit|trail|macro|webform|campaign/i;
+
+          const records = await CRMRecord.aggregate([
+            { $match: { tenantId: tid } },
+            { $addFields: { _dataArr: { $objectToArray: '$data' } } },
+            { $match: searchMatch },
+            { $addFields: { _priority: { $cond: [{ $regexMatch: { input: '$module', regex: SECONDARY } }, 2, 1] } } },
+            { $sort: { _priority: 1 } },
+            { $project: { channel: 1, module: 1, displayName: 1, data: 1 } },
+            { $limit: limit },
+          ]);
+
+          crmRecords = records.map((r) => ({
+            channel: r.channel, module: r.module, displayName: r.displayName, data: r.data,
+          }));
+        }
+      }
+    }
+
+    // 3. Search the tenant's own Native CRM records (Leads/Deals/Tickets/etc.)
+    //    — branch/scope/permission/PII-gated by the verified identity above.
+    const nativeCrmRecords = await searchNativeCrmRecords(
+      tenantId, q, limit, nativeBranchId, nativeScope, identity.role, identity.roleId,
+    );
+
+    // 4. Merge: customers first, then connector CRM records, then native CRM records, deduplicate
     const seen = new Set<string>();
-    const all = [...customerRecords, ...crmRecords].filter((r) => {
+    const all = [...customerRecords, ...crmRecords, ...nativeCrmRecords].filter((r) => {
       const key = `${r.channel}|${r.module}|${r.displayName.toLowerCase()}`;
       if (seen.has(key)) return false;
       seen.add(key);
@@ -723,6 +945,92 @@ router.post('/reindex-meilisearch/:tenantId', async (req: Request, res: Response
       if (batch.length < BATCH) break;
     }
 
+    // ── Index the 7 core Native CRM modules — see native-crm/shared/search-index.ts
+    //    and tender-squishing-nebula.md's channel/module scheme table. ──
+    const NATIVE_MODULES: Array<{ model: mongoose.Model<any>; module: string; nameOf: (d: any) => string }> = [
+      { model: Contact,  module: 'contacts',  nameOf: (d) => [d.firstName, d.lastName].filter(Boolean).join(' ') },
+      { model: Company,  module: 'companies', nameOf: (d) => d.name },
+      { model: Deal,     module: 'deals',     nameOf: (d) => d.title },
+      { model: Task,     module: 'tasks',     nameOf: (d) => d.title },
+      { model: Ticket,   module: 'tickets',   nameOf: (d) => d.subject },
+      { model: Call,     module: 'calls',     nameOf: (d) => d.contactName },
+      { model: Meeting,  module: 'meetings',  nameOf: (d) => d.title },
+      { model: Lead,     module: 'leads',     nameOf: (d) => [d.firstName, d.lastName].filter(Boolean).join(' ') || d.company || d.leadId },
+    ];
+    for (const { model, module, nameOf } of NATIVE_MODULES) {
+      skip = 0;
+      for (;;) {
+        const batch = await model.find({ tenantId: tid }).skip(skip).limit(BATCH).lean();
+        if (batch.length === 0) break;
+        await indexCRMRecords(batch.map((d: any) => ({
+          tenantId, channel: 'native', module,
+          externalId: String(d._id), displayName: nameOf(d) || 'Untitled',
+          data: (({ _id, __v, tenantId: _t, ...rest }) => rest)(d),
+        })));
+        total += batch.length;
+        skip += BATCH;
+        if (batch.length < BATCH) break;
+      }
+    }
+
+    // ── Index the 13 Field Service modules + Catalog (grouped into 'products') ──
+    const FIELD_SERVICE_MODULES: Array<{ model: mongoose.Model<any>; module: string; nameOf: (d: any) => string }> = [
+      { model: NativeCustomer,  module: 'customers',  nameOf: (d) => d.name },
+      { model: NativeSite,      module: 'sites',      nameOf: (d) => d.name },
+      { model: NativePart,      module: 'parts',      nameOf: (d) => d.name },
+      { model: NativeQuotation, module: 'quotations', nameOf: (d) => d.title },
+      { model: NativeWorkorder, module: 'workorders',  nameOf: (d) => d.title },
+      { model: NativeContract,  module: 'contracts',  nameOf: (d) => d.title },
+      { model: NativeInvoice,   module: 'invoices',   nameOf: (d) => d.invoiceId },
+      { model: NativeReceipt,   module: 'receipts',   nameOf: (d) => d.receiptId },
+      { model: NativeExpense,   module: 'expenses',   nameOf: (d) => d.title },
+      { model: NativeActivity,  module: 'activities', nameOf: (d) => d.subject },
+      { model: NativeProduct,   module: 'products',   nameOf: (d) => d.name },
+      { model: CatalogItem,     module: 'products',   nameOf: (d) => d.title },
+      { model: NativeAsset,     module: 'assets',     nameOf: (d) => d.name },
+      { model: NativeVehicle,   module: 'vehicles',   nameOf: (d) => d.name },
+      { model: NativeTeam,      module: 'teams',      nameOf: (d) => d.name },
+      { model: NativeService,   module: 'services',   nameOf: (d) => d.name },
+      { model: NativeStaff,     module: 'staffs',     nameOf: (d) => [d.firstName, d.lastName].filter(Boolean).join(' ') },
+      { model: NativeCategory,  module: 'categories', nameOf: (d) => d.name },
+    ];
+    for (const { model, module, nameOf } of FIELD_SERVICE_MODULES) {
+      skip = 0;
+      for (;;) {
+        const batch = await model.find({ tenantId: tid }).skip(skip).limit(BATCH).lean();
+        if (batch.length === 0) break;
+        await indexCRMRecords(batch.map((d: any) => ({
+          tenantId, channel: 'native-crm', module,
+          externalId: String(d._id), displayName: nameOf(d) || 'Untitled',
+          data: (({ _id, __v, tenantId: _t, ...rest }) => rest)(d),
+        })));
+        total += batch.length;
+        skip += BATCH;
+        if (batch.length < BATCH) break;
+      }
+    }
+
+    // ── Index Custom Module records — one shared collection across every
+    //    module/tenant, discriminated by moduleSlug (used as `module` directly).
+    //    Uses the same buildSearchIndexData() as live create/update so a
+    //    'relationship' field (e.g. a Technician pointing at Staff) resolves
+    //    to its real name here too, not just going forward. ──
+    skip = 0;
+    for (;;) {
+      const batch = await CustomRecord.find({ tenantId: tid }).skip(skip).limit(BATCH).lean();
+      if (batch.length === 0) break;
+      const mapped = await Promise.all(batch.map(async (d: any) => ({
+        tenantId, channel: 'custom-module', module: d.moduleSlug,
+        externalId: String(d._id),
+        displayName: String(d.data?.name ?? d.data?.title ?? d.recordId ?? 'Untitled'),
+        data: await buildSearchIndexData(tenantId, d.moduleSlug, (d.data as Record<string, unknown>) ?? {}),
+      })));
+      await indexCRMRecords(mapped);
+      total += batch.length;
+      skip += BATCH;
+      if (batch.length < BATCH) break;
+    }
+
     sendSuccess(res, { indexed: total }, `Re-indexed ${total} records into Meilisearch`);
   } catch (err) { next(err); }
 });
@@ -948,14 +1256,53 @@ router.post('/seed-templates/:tenantId', async (req: Request, res: Response, nex
  * (tenantId, platform:'chatbot', sessionId) stops a retried/duplicate call
  * for the same conversation from ever creating a second Lead.
  */
+
+const LEAD_COOLDOWN_MS = 10 * 60 * 1000;
+
+/** Widget-abuse guard: has this exact email already created a Lead for this
+ * tenant very recently, from a DIFFERENT session? `claimWidgetSession` only
+ * dedupes WITHIN one session — this closes the gap where the same visitor
+ * (or a scripted abuser) opens many sessions and resubmits the same email.
+ * `Lead.email` is PII-encrypted at rest, so this reuses the exact
+ * narrow-by-`emailDomain`-then-decrypt-the-small-candidate-set pattern
+ * already proven correct for the identical problem in
+ * `leads/lead-import.service.ts`, rather than inventing a new one. */
+async function hasRecentLeadForEmail(tenantId: string, email: string): Promise<boolean> {
+  const normalized = email.trim().toLowerCase();
+  const at = normalized.indexOf('@');
+  const domain = at > 0 ? normalized.slice(at + 1) : null;
+  if (!domain) return false;
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const cutoff = new Date(Date.now() - LEAD_COOLDOWN_MS);
+  const candidates = await Lead.find({ tenantId: tid, emailDomain: domain, createdAt: { $gte: cutoff } })
+    .select('email').lean();
+  for (const c of candidates) {
+    const plain = c.email && isEncrypted(c.email) ? decrypt(c.email) : c.email;
+    if (plain && plain.trim().toLowerCase() === normalized) return true;
+  }
+  return false;
+}
+
 router.post('/widget-lead-capture', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, sessionId, visitorId, sourceUrl, firstName, lastName, email, phone, company, service } = req.body as {
+    const {
+      tenantId, sessionId, visitorId, sourceUrl, firstName, lastName, email, phone, company, service,
+      leadScore, buyingIntent, interestedItems, requirement, conversationSummary,
+    } = req.body as {
       tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
       firstName: string; lastName?: string; email?: string; phone?: string; company?: string; service?: string;
+      leadScore?: number; buyingIntent?: 'low' | 'medium' | 'high';
+      interestedItems?: Array<{ datasetId: string; datasetVersion: number; recordId: string; title: string }>;
+      requirement?: string; conversationSummary?: string;
     };
-    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !sessionId || !firstName) {
-      sendError(res, 'tenantId, sessionId, firstName are required', 400);
+    // email required, not "email or phone" — a lead this endpoint creates
+    // MUST be reachable by the automatic confirmation email (Phase 4); phone
+    // stays optional/best-effort. The AI-side deterministic quote shortcut
+    // already enforces this before it ever calls here (see
+    // request-quote-shortcut.ts), this is defense-in-depth for any other
+    // future caller of this same endpoint.
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !sessionId || !firstName || !email) {
+      sendError(res, 'tenantId, sessionId, firstName, email are required', 400);
       return;
     }
     const tid = new mongoose.Types.ObjectId(tenantId);
@@ -971,6 +1318,16 @@ router.post('/widget-lead-capture', async (req: Request, res: Response, next: Ne
       } else {
         sendError(res, 'Lead capture for this session is already in progress — please retry shortly', 409);
       }
+      return;
+    }
+
+    // Abuse guard — a different session already created a Lead for this
+    // exact email very recently. Release (not resolve) the claim so this
+    // isn't recorded as a genuine capture; respond success-shaped so the
+    // widget conversation itself is never disrupted by this check.
+    if (email && await hasRecentLeadForEmail(tenantId, email)) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'lead');
+      sendSuccess(res, { skipped: true, reason: 'recent_duplicate_email' }, 'A recent lead already exists for this email');
       return;
     }
 
@@ -990,9 +1347,14 @@ router.post('/widget-lead-capture', async (req: Request, res: Response, next: Ne
       {
         platform: 'chatbot',
         sourceUrl: sourceUrl || 'widget-chat',
-        raw: { sessionId, visitorId, firstName, lastName, email, phone, company, service },
+        raw: {
+          sessionId, visitorId, firstName, lastName, email, phone, company, service,
+          leadScore, buyingIntent, interestedItems, requirement, conversationSummary,
+        },
         assignedStaffId: assigned?.staffId,
         assignedStaffName: assigned?.staffName,
+        leadScore, buyingIntent, interestedItems, requirement, conversationSummary,
+        chatSessionId: sessionId,
       },
     );
 
@@ -1004,6 +1366,40 @@ router.post('/widget-lead-capture', async (req: Request, res: Response, next: Ne
     const result = { leadId: lead._id, leadDisplayId: lead.leadId };
     await resolveWidgetSessionClaim(tenantId, sessionId, 'lead', result);
     sendSuccess(res, result, 'Lead created');
+  } catch (err) { next(err); }
+});
+
+/**
+ * PATCH /api/internal/widget-lead-update/:leadId
+ *
+ * Enriches an already-created chatbot Lead as buying intent/interest grows
+ * later in the same session — the endpoint updateLeadFromWidget()
+ * (ai/src/services/backend.client.ts) has always called, which previously
+ * 404'd because this route never existed. Every signal only ever escalates
+ * (see enrichChatbotLead()'s own doc comment) — never blocks or fails loudly
+ * on a stale/already-higher value, since this is a best-effort enrichment
+ * call, not a user-facing action.
+ */
+router.patch('/widget-lead-update/:leadId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { leadId } = req.params;
+    const { tenantId, leadScore, buyingIntent, interestedItems, requirement, conversationSummary } = req.body as {
+      tenantId: string; leadScore?: number; buyingIntent?: 'low' | 'medium' | 'high';
+      interestedItems?: Array<{ datasetId: string; datasetVersion: number; recordId: string; title: string }>;
+      requirement?: string; conversationSummary?: string;
+    };
+    if (!tenantId || !mongoose.isValidObjectId(tenantId) || !mongoose.isValidObjectId(leadId)) {
+      sendError(res, 'Valid tenantId and leadId are required', 400);
+      return;
+    }
+    const result = await enrichChatbotLead(tenantId, leadId, {
+      leadScore, buyingIntent, interestedItems, requirement, conversationSummary,
+    });
+    if (result.notFound) {
+      sendError(res, 'Lead not found', 404);
+      return;
+    }
+    sendSuccess(res, { leadId: result.lead._id }, 'Lead enriched');
   } catch (err) { next(err); }
 });
 

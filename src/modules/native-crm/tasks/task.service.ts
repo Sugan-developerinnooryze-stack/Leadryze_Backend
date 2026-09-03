@@ -6,6 +6,7 @@ import { sendOnCreateConfirmation } from '../../notifications/confirmation.servi
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -14,10 +15,11 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listTasks(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
+export async function listTasks(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
+  if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
   applyDataScopeToCreatedByFilter(filter, scope);
   if (status) filter.taskStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
@@ -43,8 +45,12 @@ export async function getTaskById(tenantId: string, id: string, scope?: DataScop
 export async function createTask(tenantId: string, dto: CreateTaskDTO) {
   await assertValidStatus(tenantId, dto.taskStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const created = await Task.create({ tenantId: tid, ...dto });
+  const created = await Task.create({
+    tenantId: tid, ...dto,
+    branchId: dto.branchId ? new mongoose.Types.ObjectId(dto.branchId) : null,
+  });
   void sendOnCreateConfirmation(tenantId, 'task', created.toObject()); // fire-and-forget, never throws
+  indexNativeSearchRecord(tenantId, 'native', 'tasks', created.toObject(), created.title);
   return created;
 }
 
@@ -53,20 +59,25 @@ export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDT
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return Task.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  const updated = await Task.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'tasks', updated, updated.title);
+  return updated;
 }
 
 export async function deleteTask(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return Task.findOneAndDelete(filter).lean();
+  const deleted = await Task.findOneAndDelete(filter).lean();
+  if (deleted) removeNativeSearchRecord(tenantId, 'native', 'tasks', String(deleted._id));
+  return deleted;
 }
 
-export async function getTaskStats(tenantId: string, scope?: DataScope) {
+export async function getTaskStats(tenantId: string, branchId?: string | null, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const now = new Date();
   const filter: Record<string, unknown> = { tenantId: tid };
+  if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
   applyDataScopeToCreatedByFilter(filter, scope);
   const [total, byStatus, overdue] = await Promise.all([
     Task.countDocuments(filter),

@@ -10,6 +10,8 @@ import { NativeCustomField } from '../custom-fields/custom-field.model';
 import { rowsToCsv, sendCsvResponse, CsvColumn } from '../../../utils/csv-export.util';
 import { getSettings } from '../fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../../platform/pii/pii.service';
+import { NativeCrmLog } from '../../logs/native-crm-log.model';
+import { logAuditEvent } from '../../logs/audit-log.model';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
@@ -83,6 +85,28 @@ export async function exportCsv(req: AuthRequest, res: Response) {
     ];
 
     const csv = rowsToCsv(safeItems, columns);
+
+    // Audited separately from the generic nativeCrmLog middleware — that
+    // middleware only logs write methods (POST/PUT/PATCH/DELETE), so a GET
+    // export of potentially many customers' contact data would otherwise
+    // leave no audit trail at all. Fire-and-forget, same convention as
+    // every other audit/timeline write in this codebase.
+    // filterKeys, not the raw req.query — a filter VALUE can be a searched
+    // email/phone/name and has no business sitting in an audit record about
+    // the export itself.
+    const filterKeys = Object.keys(req.query);
+    NativeCrmLog.create({
+      tenantId: req.tenantId!, actorId: req.user?.userId ?? 'anonymous',
+      actorName: req.user?.email ?? req.user?.userId ?? 'anonymous', actorRole: req.user?.role ?? '',
+      action: 'export', module: 'leads', resourceId: '',
+      before: null, after: null, changes: { count: safeItems.length, filterKeys },
+      error: null, statusCode: 200, ip: req.ip || 'unknown', url: req.originalUrl, timestamp: new Date(),
+    }).catch(() => {});
+    logAuditEvent('leads.exported',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'Lead', detail: { count: safeItems.length, module: 'leads', exportType: 'csv', filterKeys } },
+    );
+
     sendCsvResponse(res, `leads-export-${new Date().toISOString().slice(0, 10)}.csv`, csv);
   } catch (err: any) {
     sendError(res, err.message, 500);
@@ -223,6 +247,10 @@ export async function remove(req: AuthRequest, res: Response) {
     const item = await deleteLead(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
     if (!item) return sendError(res, 'Lead not found', 404);
     runAutomationsOnDelete(req.tenantId!, 'lead', item.toObject()).catch(() => {});
+    logAuditEvent('lead.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'Lead', targetId: String(item._id), detail: { before: { leadId: item.leadId, name: `${item.firstName} ${item.lastName}`, status: item.status } } },
+    );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);

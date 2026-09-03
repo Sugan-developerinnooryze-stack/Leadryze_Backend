@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import mongoose from 'mongoose';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError } from '../../../utils/response';
+import { requirePermission } from '../../../middlewares/auth.middleware';
 import { NativeCrmLog } from '../../logs/native-crm-log.model';
 
 const router = Router();
@@ -10,8 +11,11 @@ const router = Router();
  * GET /api/v1/native-crm/native-logs
  * Returns paginated native CRM activity logs for the current tenant.
  * Query: page, limit, module, action, startDate, endDate, search (actor name)
+ * Reuses the existing 'logs.view' tier (same key Manager already has from
+ * the platform-wide Logs section) — this IS the tenant's business audit
+ * trail, the same sensitivity class, not a separate concern.
  */
-router.get('/', async (req: AuthRequest, res: Response) => {
+router.get('/', requirePermission('logs.view'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.tenantId) { sendError(res, 'Unauthorized', 401); return; }
 

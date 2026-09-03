@@ -3,6 +3,7 @@ import { NativeReceipt } from './receipt.model';
 import { ReceiptListOptions } from './receipt.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listReceipts(tenantId: string, opts: ReceiptListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -34,23 +35,29 @@ export async function getReceiptById(id: string, tenantId: string, scope?: DataS
 }
 
 export async function createReceipt(data: any) {
-  return NativeReceipt.create(data);
+  const created = await NativeReceipt.create(data);
+  indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'receipts', created.toObject(), (created as any).receiptId);
+  return created;
 }
 
 export async function updateReceipt(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeReceipt.findOneAndUpdate(
+  const updated = await NativeReceipt.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'receipts', updated.toObject(), (updated as any).receiptId);
+  return updated;
 }
 
 export async function deleteReceipt(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeReceipt.findOneAndDelete(filter);
+  const deleted = await NativeReceipt.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'receipts', String(deleted._id));
+  return deleted;
 }

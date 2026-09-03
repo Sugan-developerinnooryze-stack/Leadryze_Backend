@@ -73,3 +73,32 @@ export function requirePermission(permissionKey: string) {
     }
   };
 }
+
+/**
+ * Same bypass/check contract as requirePermission(), for a route whose
+ * target module is a URL param rather than fixed at route-registration time
+ * (e.g. PDF generation's `/:module/:id` — the permission that applies
+ * depends on which document type is being requested). Maps the param value
+ * to `fs.<module>s.<tier>` (pluralizing unless already plural) — matches
+ * every fs.* module key's own naming convention. */
+export function requireModulePermission(paramName: string, tier: 'view' | 'edit') {
+  return async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
+    const { role, roleId, tenantId } = req.user ?? {};
+
+    if (role === 'SUPER_ADMIN' || role === 'TENANT_ADMIN') { next(); return; }
+    if (!roleId || !tenantId) { sendError(res, 'Insufficient permissions', 403); return; }
+
+    const moduleValue = req.params[paramName];
+    const plural = moduleValue?.endsWith('s') ? moduleValue : `${moduleValue}s`;
+    const permissionKey = `fs.${plural}.${tier}`;
+
+    try {
+      const allowed = await hasPermission(tenantId, roleId, permissionKey);
+      if (allowed) { next(); return; }
+      sendError(res, 'Insufficient permissions', 403);
+    } catch (err) {
+      logger.error('Permission check failed', { permissionKey, roleId, error: (err as Error).message });
+      sendError(res, 'Permission check failed', 500);
+    }
+  };
+}

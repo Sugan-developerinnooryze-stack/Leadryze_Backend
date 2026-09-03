@@ -11,6 +11,19 @@ export interface CaptureLeadInput {
    * completely unaffected by this addition. */
   assignedStaffId?: string;
   assignedStaffName?: string;
+  /** AI-computed conversation signals — only ever supplied by the AI
+   * widget's own caller, same as assignedStaffId/assignedStaffName above.
+   * leadScore/buyingIntent map onto Lead's existing score/rating fields;
+   * interestedItems/requirement/conversationSummary land on the new fields
+   * added alongside them (see lead.model.ts). */
+  leadScore?: number;
+  buyingIntent?: 'low' | 'medium' | 'high';
+  interestedItems?: Array<{ datasetId: string; datasetVersion: number; recordId: string; title: string }>;
+  requirement?: string;
+  conversationSummary?: string;
+  /** The widget's own chat sessionId — distinct from `sourceUrl` above
+   * (which already exists and is populated from this same caller). */
+  chatSessionId?: string;
 }
 
 export interface LeadCaptureListOptions {

@@ -14,6 +14,8 @@ import { NativeCustomer } from '../customers/customer.model';
 import { NativeStaff } from '../staffs/staff.model';
 import { NativeTeam } from '../teams/team.model';
 import { User } from '../../auth/auth.model';
+import { Tenant } from '../../tenants/tenant.model';
+import { Branch } from '../branches/branch.model';
 import { CustomModuleDef, CustomRecord } from '../../custom-modules/custom-module.model';
 import { listCustomFields } from '../custom-fields/custom-field.service';
 import { BUILT_IN_TARGET_FIELDS, ITargetFieldDef } from './target-field-catalog';
@@ -195,6 +197,24 @@ async function assertValidTriggerField(tenantId: string, module: PipelineModule,
   }
 }
 
+/** Phase 6 — mirrors this file's own assertValidTriggerField/assertValidRule
+ * precedent: a stale or foreign branch id is rejected at save time, not
+ * silently saved as an unreachable scope. Shared by both engines'
+ * create/update paths (this one for Simple Mode, assertValidNodes for
+ * Advanced Mode). */
+async function assertValidBranchIds(tenantId: string, branchIds: string[] | undefined): Promise<void> {
+  if (!branchIds || branchIds.length === 0) return;
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const validIds = branchIds.filter((id) => mongoose.isValidObjectId(id));
+  if (validIds.length !== branchIds.length) {
+    throw new Error('branchIds contains an invalid branch id');
+  }
+  const count = await Branch.countDocuments({ _id: { $in: validIds }, tenantId: tid });
+  if (count !== branchIds.length) {
+    throw new Error('branchIds contains a branch that does not belong to this tenant');
+  }
+}
+
 async function assertValidLinkedRecordRule(
   tenantId: string, targetModule: string | undefined, fieldMappings: IFieldMapping[] | undefined,
 ): Promise<void> {
@@ -232,6 +252,7 @@ export async function createRule(tenantId: string, data: Partial<IAutomationRule
   if (data.actionType === 'create_linked_record') {
     await assertValidLinkedRecordRule(tenantId, data.targetModule, data.fieldMappings);
   }
+  await assertValidBranchIds(tenantId, data.branchIds);
   if (data.triggerType === 'webhook') {
     data.webhookToken = await generateWebhookToken((t) => AutomationRule.exists({ webhookToken: t }).then(Boolean));
   }
@@ -248,6 +269,7 @@ export async function updateRule(tenantId: string, id: string, data: Partial<IAu
   if (data.actionType === 'create_linked_record') {
     await assertValidLinkedRecordRule(tenantId, data.targetModule, data.fieldMappings);
   }
+  await assertValidBranchIds(tenantId, data.branchIds);
   const tid = new mongoose.Types.ObjectId(tenantId);
 
   // A rule's actionType gates two mutually-exclusive field groups —
@@ -469,6 +491,59 @@ export function sourceIdentifierOf(record: Record<string, any>): string {
 
 export const MAX_LINKED_RECORD_CHAIN_DEPTH = 3;
 
+/** Phase 5 emergency kill switch's guard predicate — factored out to its own
+ * pure function (shared by both engines: runOneRule here, and executeFlow/
+ * resumeFlow/decideApproval in automation-flow.service.ts) so it's reliably
+ * unit-testable without a live Mongo connection (see
+ * tests/automation-kill-switch.test.ts) — every call site still does its own
+ * `Tenant.findById(tenantId).select('settings.automationsPaused').lean()`
+ * fetch (that part isn't unit-testable without a DB, and doesn't need to be —
+ * it's a single well-established `.lean()` read, same shape as five other
+ * precedents elsewhere in this codebase), only the boolean interpretation of
+ * the result is pulled out here.
+ *
+ * A tenant with no `automationsPaused` field at all (every pre-existing
+ * tenant — this field only gets a real value written once someone actually
+ * toggles the switch) is treated identically to an explicit `false`:
+ * `.lean()` reads don't materialize Mongoose's own schema default the way a
+ * hydrated document would, so the safety here comes from this function's own
+ * falsy check, not from the schema default applying — confirmed live against
+ * a real, untouched tenant during Phase 5 verification. Deliberately reads
+ * nothing else off the tenant object (in particular, never a per-flow
+ * `enabled` value — that's a completely independent concept living on
+ * AutomationFlow documents, not Tenant, and this function has no way to see
+ * it even if it wanted to). */
+export function isAutomationPausedForTenant(
+  tenant: { settings?: { automationsPaused?: boolean } } | null | undefined,
+): boolean {
+  return !!tenant?.settings?.automationsPaused;
+}
+
+/** Phase 6 branch scoping — pure predicate, shared by both engines'
+ * per-record dispatchers (the runFlowsOnX family and the runAutomationsOnX
+ * family), checked per matched
+ * flow/rule right alongside the existing triggerField/triggerStage JS
+ * refinement those functions already do after their own Mongo `.find()` —
+ * `branchIds` lives inside the matched document already fetched, not
+ * something the initial query filter can usefully pre-filter on beyond
+ * what it already does.
+ *
+ * Absent/empty branchIds = unscoped trigger, matches every branch — today's
+ * exact behavior for every pre-existing flow/rule. A record whose own
+ * `branchId` is null/undefined never matches a branch-scoped trigger
+ * (confirmed decision, Phase 6 planning) — a branchless record isn't
+ * confirmed to belong to any of the configured branches. Not used for
+ * webhook triggers at all (rejected at save time instead — see
+ * automation-flow.validation.ts/automation-rule.validation.ts). */
+export function matchesBranchScope(
+  branchIds: string[] | undefined,
+  record: { branchId?: unknown },
+): boolean {
+  if (!branchIds || branchIds.length === 0) return true;
+  if (record.branchId === null || record.branchId === undefined) return false;
+  return branchIds.includes(String(record.branchId));
+}
+
 /** Server-generated only, never client-writable — used as the URL path
  * segment for a webhook-triggered rule/flow (POST /api/v1/automation-
  * webhooks/trigger/:token). 192 bits, same randomBytes(24).toString('hex')
@@ -536,6 +611,78 @@ export async function createRecordInTargetModule(
     case 'invoice': {
       const { createInvoice } = await import('../invoices/invoice.service');
       return createInvoice({ ...payload, tenantId });
+    }
+    default:
+      throw new Error(`Unknown target module: ${targetModule}`);
+  }
+}
+
+/** Calls the target module's OWN service-layer update function — the
+ * update-family counterpart to createRecordInTargetModule above, backing
+ * Advanced Mode's update_record/assign_record/change_status actions
+ * (automation-flow.service.ts's processOneNode). `id` is ALWAYS
+ * String(currentRecord._id) — the record the flow's own trigger already
+ * resolved via a tenant-scoped query — never a value read from node
+ * configuration; there is no such field on those 3 action types' node
+ * schema. This is the primary defense against "a misconfigured or
+ * malicious node targets an arbitrary record by ID," not a runtime check
+ * layered on top of a configurable id.
+ *
+ * `scope` is deliberately never passed, verified per-module (not assumed
+ * uniform) rather than blindly copying create's own "runs unscoped"
+ * precedent: every one of the 8 built-ins' update* functions filters
+ * `{_id, tenantId}` before anything else (confirmed by direct read of each
+ * — Lead/Quotation/Workorder/Contract/Invoice at `{_id: id, tenantId: tid}`,
+ * Deal/Task/Ticket at the same shape with args reordered), so a cross-tenant
+ * id can never match another tenant's record regardless of scope. Not
+ * passing a live-user DataScope (self/team/all) is a considered choice, not
+ * an oversight: authoring/editing/testing a flow already requires
+ * automation.create/.edit/.execute (Manager+/Admin only — Agent holds none
+ * of these), automation execution itself is a background/system process
+ * with no live "acting user" session at run time (matching
+ * createRecordInTargetModule's own already-accepted precedent), and
+ * automation.publish/.delete are Admin-only — a Manager-authored update
+ * action cannot affect real, live traffic until an Admin explicitly
+ * publishes it. */
+export async function updateRecordInTargetModule(
+  tenantId: string, targetModule: string, id: string, payload: Record<string, unknown>, depth: number,
+): Promise<Record<string, any> | null> {
+  if (targetModule.startsWith('custom:')) {
+    const { updateCustomRecord } = await import('../../custom-modules/custom-module.service');
+    return updateCustomRecord(tenantId, targetModule.slice('custom:'.length), id, payload, depth);
+  }
+  switch (targetModule as BuiltInPipelineModule) {
+    case 'lead': {
+      const { updateLead } = await import('../leads/lead.service');
+      return updateLead(id, tenantId, payload);
+    }
+    case 'deal': {
+      const { updateDeal } = await import('../deals/deal.service');
+      return updateDeal(tenantId, id, payload as any);
+    }
+    case 'task': {
+      const { updateTask } = await import('../tasks/task.service');
+      return updateTask(tenantId, id, payload as any);
+    }
+    case 'ticket': {
+      const { updateTicket } = await import('../tickets/ticket.service');
+      return updateTicket(tenantId, id, payload as any);
+    }
+    case 'quotation': {
+      const { updateQuotation } = await import('../quotations/quotation.service');
+      return updateQuotation(id, tenantId, payload);
+    }
+    case 'workorder': {
+      const { updateWorkorder } = await import('../workorders/workorder.service');
+      return updateWorkorder(id, tenantId, payload);
+    }
+    case 'contract': {
+      const { updateContract } = await import('../contracts/contract.service');
+      return updateContract(id, tenantId, payload);
+    }
+    case 'invoice': {
+      const { updateInvoice } = await import('../invoices/invoice.service');
+      return updateInvoice(id, tenantId, payload);
     }
     default:
       throw new Error(`Unknown target module: ${targetModule}`);
@@ -645,12 +792,39 @@ async function runCreateLinkedRecordAction(
   }
 }
 
-export function buildVariables(record: Record<string, any>, recipientName: string, toStage: string): Record<string, string> {
+/** Renders a single catalog-typed value the same deterministic way
+ * regardless of caller — a Date becomes a plain YYYY-MM-DD (never
+ * `String(dateObj)`'s verbose default), everything else via plain
+ * `String(v)` (already correct for text/number/boolean/select), and a
+ * missing/undefined value becomes '' rather than the literal text
+ * "undefined"/"null" — a template must never leak either. */
+function renderCatalogValue(value: unknown): string {
+  if (value === undefined || value === null || value === '') return '';
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value);
+}
+
+/** `catalog`, when passed, adds one `record.<catalogKey>` entry per field —
+ * namespaced under `record.` (not top-level) because several catalog keys
+ * collide with the 5 legacy names below (deal/quotation's own `title`;
+ * legacy `status` is the TRIGGER's resolved toStage, literally 'created' for
+ * a create trigger, not the record's real status field) — a silent
+ * overwrite here would be a real regression, not cosmetic. Only ever driven
+ * by getFieldCatalog()'s own hand-authored, scalar-only allowlist (never a
+ * raw record dump) — this is what keeps a `[object Object]`/secret-field
+ * leak structurally impossible rather than merely avoided by convention:
+ * readSourceField only ever reads a key the catalog explicitly exposes, and
+ * none of the 8 built-in modules' schemas carry a password/token/secret
+ * shaped field for the catalog to expose in the first place (that's
+ * exclusively User/Connector territory, never touched by this catalog). */
+export function buildVariables(
+  record: Record<string, any>, recipientName: string, toStage: string, catalog?: ITargetFieldDef[],
+): Record<string, string> {
   // Custom Module records store their tenant-defined field values under
   // `.data` (an EAV blob), not on the record root like built-in modules —
   // fall back to that nested bag for the same best-effort lookups.
   const d: Record<string, any> = record.data ?? record;
-  return {
+  const variables: Record<string, string> = {
     name:    recipientName,
     status:  toStage,
     title:   String(d.title ?? d.subject ?? d.firstName ?? d.name ?? ''),
@@ -659,7 +833,12 @@ export function buildVariables(record: Record<string, any>, recipientName: strin
       record.contractId ?? record.invoiceId ?? record.recordId ?? record._id ?? '',
     ),
     company: String(d.company ?? d.companyName ?? ''),
+    today:   new Date().toISOString().slice(0, 10),
   };
+  for (const field of catalog ?? []) {
+    variables[`record.${field.key}`] = renderCatalogValue(readSourceField(record, field.key));
+  }
+  return variables;
 }
 
 async function runOneRule(
@@ -670,6 +849,16 @@ async function runOneRule(
   rule: IAutomationRule,
   depth = 0,
 ): Promise<void> {
+  // Emergency kill switch (Phase 5) — the single choke point every one of
+  // this engine's own dispatchers (runAutomations/OnCreate/OnUpdate/
+  // OnDelete, the webhook handler, the scheduled-rule poll) funnels through
+  // before any real action runs, so one guard here covers all of Simple
+  // Mode — this engine never shared a kill switch with the Flow engine
+  // before this phase, so this is the fix for that gap, not a duplicate of
+  // executeFlow()'s own guard.
+  const tenantForPause = await Tenant.findById(tenantId).select('settings.automationsPaused').lean();
+  if (isAutomationPausedForTenant(tenantForPause)) return;
+
   if (rule.actionType === 'create_linked_record') {
     return runCreateLinkedRecordAction(tenantId, module, record, rule, depth);
   }
@@ -699,7 +888,8 @@ async function runOneRule(
     return;
   }
 
-  const variables = buildVariables(record, recipient.name, toStage);
+  const catalog = await getFieldCatalog(tenantId, module);
+  const variables = buildVariables(record, recipient.name, toStage, catalog);
   const body = renderTemplate(template.body, variables);
 
   if (rule.actionType === 'send_email') {
@@ -754,6 +944,13 @@ export async function runAutomations(
   record: Record<string, any>,
   toStage: string,
   depth = 0,
+  /** Threaded straight through to the internal runFlows cascade below —
+   * see AutomationFlowRun.triggeredByRunId's own doc comment. Every
+   * existing caller omits this (undefined, correct for a genuine external
+   * trigger); only Advanced Mode's update_record/assign_record/
+   * change_status/create_linked_record actions (automation-flow.service.ts)
+   * pass their own currently-executing run's id. */
+  triggeredByRunId?: mongoose.Types.ObjectId,
 ): Promise<void> {
   // Enforced centrally here (not just where automation-rule.service.ts
   // itself calls back in) so this cap holds regardless of HOW deep we are —
@@ -770,6 +967,7 @@ export async function runAutomations(
       module, triggerType: 'status_changed', triggerStage: toStage, enabled: true,
     }).lean();
     for (const rule of rules) {
+      if (!matchesBranchScope((rule as unknown as IAutomationRule).branchIds, record)) continue;
       await runOneRule(tenantId, module, record, toStage, rule as unknown as IAutomationRule, depth).catch((err) => {
         logger.error('Automation rule run failed', { ruleId: rule._id, module, error: (err as Error).message });
       });
@@ -786,7 +984,7 @@ export async function runAutomations(
   // the SAME depth cap, from the SAME call sites — no controller changes
   // needed for flows to exist at all.
   await import('../automation-flows/automation-flow.service')
-    .then(({ runFlows }) => runFlows(tenantId, module, record, toStage, depth))
+    .then(({ runFlows }) => runFlows(tenantId, module, record, toStage, depth, triggeredByRunId))
     .catch((err) => logger.error('runFlows dispatch crashed', { module, error: (err as Error).message }));
 }
 
@@ -800,6 +998,7 @@ export async function runAutomationsOnCreate(
   module: PipelineModule,
   record: Record<string, any>,
   depth = 0,
+  triggeredByRunId?: mongoose.Types.ObjectId,
 ): Promise<void> {
   if (depth >= MAX_LINKED_RECORD_CHAIN_DEPTH) {
     logger.error('Automation chain depth cap reached — stopping further chaining', { module, depth });
@@ -811,6 +1010,7 @@ export async function runAutomationsOnCreate(
       module, triggerType: 'record_created', enabled: true,
     }).lean();
     for (const rule of rules) {
+      if (!matchesBranchScope((rule as unknown as IAutomationRule).branchIds, record)) continue;
       await runOneRule(tenantId, module, record, 'created', rule as unknown as IAutomationRule, depth).catch((err) => {
         logger.error('Automation rule (record_created) run failed', { ruleId: rule._id, module, error: (err as Error).message });
       });
@@ -820,7 +1020,7 @@ export async function runAutomationsOnCreate(
   }
 
   await import('../automation-flows/automation-flow.service')
-    .then(({ runFlowsOnCreate }) => runFlowsOnCreate(tenantId, module, record, depth))
+    .then(({ runFlowsOnCreate }) => runFlowsOnCreate(tenantId, module, record, depth, triggeredByRunId))
     .catch((err) => logger.error('runFlowsOnCreate dispatch crashed', { module, error: (err as Error).message }));
 }
 
@@ -841,6 +1041,7 @@ export async function runAutomationsOnUpdate(
   prevRecord: Record<string, any>,
   newRecord: Record<string, any>,
   depth = 0,
+  triggeredByRunId?: mongoose.Types.ObjectId,
 ): Promise<void> {
   if (depth >= MAX_LINKED_RECORD_CHAIN_DEPTH) {
     logger.error('Automation chain depth cap reached — stopping further chaining', { module, depth });
@@ -853,6 +1054,7 @@ export async function runAutomationsOnUpdate(
     }).lean();
     for (const rule of rules) {
       const r = rule as unknown as IAutomationRule;
+      if (!matchesBranchScope(r.branchIds, newRecord)) continue;
       if (!r.triggerField) continue;
       const before = readSourceField(prevRecord, r.triggerField);
       const after = readSourceField(newRecord, r.triggerField);
@@ -874,7 +1076,7 @@ export async function runAutomationsOnUpdate(
   }
 
   await import('../automation-flows/automation-flow.service')
-    .then(({ runFlowsOnUpdate }) => runFlowsOnUpdate(tenantId, module, prevRecord, newRecord, depth))
+    .then(({ runFlowsOnUpdate }) => runFlowsOnUpdate(tenantId, module, prevRecord, newRecord, depth, triggeredByRunId))
     .catch((err) => logger.error('runFlowsOnUpdate dispatch crashed', { module, error: (err as Error).message }));
 }
 
@@ -901,6 +1103,7 @@ export async function runAutomationsOnDelete(
       module, triggerType: 'record_deleted', enabled: true,
     }).lean();
     for (const rule of rules) {
+      if (!matchesBranchScope((rule as unknown as IAutomationRule).branchIds, deletedRecord)) continue;
       await runOneRule(tenantId, module, deletedRecord, 'deleted', rule as unknown as IAutomationRule, depth).catch((err) => {
         logger.error('Automation rule (record_deleted) run failed', { ruleId: rule._id, module, error: (err as Error).message });
       });
@@ -1094,6 +1297,16 @@ export async function pollScheduledRules(): Promise<void> {
     try {
       const tenantId = String(r.tenantId);
       let filter = conditionsToMongoFilter(r.scheduleFilter);
+      // Phase 6 branch scoping — folded directly into the compiled Mongo
+      // filter (unlike the per-record dispatchers' JS-side post-filter)
+      // since this function already builds and executes a real query over a
+      // potentially large candidate set (bounded by
+      // MAX_SCHEDULE_MATCHES_PER_TICK) — pushing the branch filter into the
+      // DB query is strictly more efficient than fetching every branch's
+      // matches just to discard most of them afterward.
+      if (r.branchIds && r.branchIds.length > 0) {
+        filter = { $and: [filter, { branchId: { $in: r.branchIds.map((id) => new mongoose.Types.ObjectId(id)) } }] };
+      }
       if (isContinuation) {
         filter = { $and: [filter, { _id: { $gt: new mongoose.Types.ObjectId(r.scheduleCursor) } }] };
       }

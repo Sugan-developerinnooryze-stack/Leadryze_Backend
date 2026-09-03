@@ -13,6 +13,7 @@ import { writeLog } from '../logs/log.service';
 import { sendEmailNow, buildFollowupEmail } from '../messages/brevo.service';
 import { sendSmsNow, buildFollowupSms } from '../messages/twilio.service';
 import { cleanupOrphanedImageUploads } from '../native-crm/datasets/dataset-image.service';
+import { retryFailedChatbotLeadEmails } from '../native-crm/lead-capture/chatbot-lead-email.service';
 
 // ─── BullMQ (Redis-dependent) — graceful stub when Redis unavailable ──────────
 let _bullmqAvailable = false;
@@ -397,7 +398,15 @@ function initCronJobs(): void {
     await cleanupOrphanedImageUploads().catch((err) => logger.error('cleanupOrphanedImageUploads crashed', { error: (err as Error).message }));
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly)');
+  // Retries chatbot-lead emails (customer confirmation + salesperson alert)
+  // that failed on their first attempt — see chatbot-lead-email.service.ts.
+  // Same hourly cadence as the image-upload cleanup above; a failed send
+  // waits at most ~1h before its first retry.
+  cron.schedule('15 * * * *', async () => {
+    await retryFailedChatbotLeadEmails().catch((err) => logger.error('retryFailedChatbotLeadEmails crashed', { error: (err as Error).message }));
+  });
+
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────

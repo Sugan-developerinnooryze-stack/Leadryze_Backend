@@ -4,6 +4,7 @@ import { CustomerListOptions } from './customer.types';
 import { ensureCredentials } from '../shared/app-credentials.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listCustomers(tenantId: string, opts: CustomerListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -38,6 +39,7 @@ export async function createCustomer(data: any) {
   const doc = await NativeCustomer.create(data);
   // Auto-generate customer-app login credentials — never blocks/breaks creation
   await ensureCredentials(NativeCustomer, doc._id, doc.tenantId, data.name ?? '');
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'customers', doc.toObject(), doc.name);
   return doc;
 }
 
@@ -45,18 +47,22 @@ export async function updateCustomer(id: string, tenantId: string, data: any, sc
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
-  return NativeCustomer.findOneAndUpdate(
+  const updated = await NativeCustomer.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'customers', updated.toObject(), updated.name);
+  return updated;
 }
 
 export async function deleteCustomer(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
-  return NativeCustomer.findOneAndDelete(filter);
+  const deleted = await NativeCustomer.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'customers', String(deleted._id));
+  return deleted;
 }
 
 /** New — mirrors Lead.stats()/Meeting.stats()' own already-scoped pattern

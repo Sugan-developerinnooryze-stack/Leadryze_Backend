@@ -214,10 +214,48 @@ export async function deleteConnector(tenantId: string, id: string): Promise<voi
   });
 }
 
+export type ConnectorTestStatus =
+  | 'connected' | 'auth_failed' | 'timeout' | 'invalid_credentials'
+  | 'permission_denied' | 'server_unavailable' | 'configuration_error';
+
+/** Classifies a failed test-connection attempt into a specific, supportable
+ * status instead of a bare boolean — "Test Connection" previously just said
+ * success/failure, which meant a tenant (or LeadRyze support) had no way to
+ * tell a bad password apart from a firewalled server apart from a genuinely
+ * missing config field without reading raw error text. Covers both HTTP
+ * connectors (axios error shape) and DB driver connectors (MySQL/Postgres/
+ * MongoDB each surface auth/network failures via different error.code
+ * conventions), falling back to 'configuration_error' for anything that
+ * doesn't match a known network/auth pattern — which correctly also catches
+ * a plain "X is required" throw from a missing config field, since that
+ * never matches any of the more specific checks below. */
+function classifyConnectorTestError(err: unknown): { status: ConnectorTestStatus; message: string } {
+  const message = err instanceof Error ? err.message : 'Connection failed';
+  if (axios.isAxiosError(err)) {
+    if (err.code === 'ECONNABORTED' || /timeout/i.test(err.message)) return { status: 'timeout', message };
+    const code = err.response?.status;
+    if (code === 401) return { status: 'auth_failed', message };
+    if (code === 403) return { status: 'permission_denied', message };
+    if (code !== undefined && code >= 500) return { status: 'server_unavailable', message };
+    if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') return { status: 'server_unavailable', message };
+  }
+  const anyErr = err as { code?: string | number; name?: string };
+  if (anyErr?.code === 'ETIMEDOUT' || anyErr?.code === 'ECONNABORTED') return { status: 'timeout', message };
+  if (anyErr?.code === 'ECONNREFUSED' || anyErr?.code === 'ENOTFOUND' || anyErr?.name === 'MongoServerSelectionError') {
+    return { status: 'server_unavailable', message };
+  }
+  // Postgres auth error codes (28000 = invalid_authorization_specification, 28P01 = invalid_password)
+  if (anyErr?.code === '28000' || anyErr?.code === '28P01') return { status: 'auth_failed', message };
+  // MySQL auth error code
+  if (anyErr?.code === 'ER_ACCESS_DENIED_ERROR') return { status: 'auth_failed', message };
+  if (/auth/i.test(message) || /credential/i.test(message)) return { status: 'invalid_credentials', message };
+  return { status: 'configuration_error', message };
+}
+
 export async function testConnector(
   tenantId: string,
   id: string
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; status: ConnectorTestStatus; message: string }> {
   const connector = await Connector.findOne({ _id: id, tenantId }).select(
     '+config.password +config.apiKey +config.accessToken +config.uri +config.baseUrl'
   );
@@ -237,8 +275,9 @@ export async function testConnector(
         timeout: 5000,
       });
     } else if (connector.type === 'hubspot') {
+      const hsToken = await refreshHubspotToken(connector);
       await axios.get('https://api.hubapi.com/crm/v3/objects/contacts?limit=1', {
-        headers: { Authorization: `Bearer ${connector.config.accessToken}` },
+        headers: { Authorization: `Bearer ${hsToken}` },
         timeout: 5000,
       });
     } else if (connector.type === 'zoho') {
@@ -247,8 +286,16 @@ export async function testConnector(
         headers: { Authorization: `Zoho-oauthtoken ${connector.config.accessToken}` },
         timeout: 5000,
       });
+    } else if (connector.type === 'salesforce') {
+      // Real connectivity + auth check — refreshes the token (proves the
+      // stored Consumer Key/Secret are still valid) then a lightweight
+      // describe call (proves the resulting access token actually works).
+      const { accessToken, instanceUrl } = await refreshSalesforceToken(connector);
+      await axios.get(`${instanceUrl}/services/data/v59.0/sobjects/Lead/describe/`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: 5000,
+      });
     } else if (connector.type === 'mysql') {
-      // Wiring for MySQL test
       const mysql = require('mysql2/promise');
       const connection = await mysql.createConnection(connector.config.uri || {
         host: connector.config.host,
@@ -260,7 +307,6 @@ export async function testConnector(
       await connection.ping();
       await connection.end();
     } else if (connector.type === 'postgresql') {
-      // Wiring for PostgreSQL test
       const { Client } = require('pg');
       const client = new Client(connector.config.uri ? { connectionString: connector.config.uri } : {
         host: connector.config.host,
@@ -271,15 +317,23 @@ export async function testConnector(
       });
       await client.connect();
       await client.end();
+    } else if (connector.type === 'mongodb') {
+      const { MongoClient } = require('mongodb');
+      const uri = connector.config.uri
+        || `mongodb://${connector.config.username ? `${connector.config.username}:${connector.config.password}@` : ''}${connector.config.host}:${connector.config.port || 27017}`;
+      const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+      await client.connect();
+      await client.db(connector.config.database).command({ ping: 1 });
+      await client.close();
     }
 
     await Connector.findByIdAndUpdate(id, { syncStatus: 'success', lastSyncAt: new Date() });
-    return { success: true, message: 'Connection successful' };
+    return { success: true, status: 'connected', message: 'Connection successful' };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Connection failed';
+    const { status, message: msg } = classifyConnectorTestError(error);
     await Connector.findByIdAndUpdate(id, { syncStatus: 'failed', syncError: msg });
-    logger.error('Connector test failed', { id, error: msg });
-    return { success: false, message: msg };
+    logger.error('Connector test failed', { id, status, error: msg });
+    return { success: false, status, message: msg };
   }
 }
 
@@ -351,8 +405,50 @@ async function refreshZohoToken(connector: IConnector): Promise<string> {
     throw new Error(msg);
   }
 
-  // Persist new token
-  await Connector.findByIdAndUpdate(connector._id, { 'config.accessToken': newToken });
+  // Persist new token — encrypted, matching createConnector/updateConnector's
+  // convention (SENSITIVE_FIELDS via encrypt()). Previously this wrote the
+  // refreshed token in plaintext, silently downgrading a connector's
+  // encryption-at-rest the moment its FIRST refresh happened, even though
+  // the initial OAuth-issued token was correctly encrypted.
+  await Connector.findByIdAndUpdate(connector._id, { 'config.accessToken': encrypt(newToken) });
+  return newToken;
+}
+
+/** Only meaningful for a connector created via the real OAuth "Connect"
+ * button (connector-oauth.routes.ts) — those store a refreshToken and get a
+ * short-lived (~30min) access token. A Private App token (the older,
+ * still-supported manual-paste flow) has no refreshToken and never
+ * expires, so this is a no-op passthrough for those — same "does this
+ * connector even need refreshing" branch refreshZohoToken() doesn't need
+ * (Zoho's authCode flow always yields a refresh token). HubSpot rotates the
+ * refresh token on every use, so the new one is persisted alongside the new
+ * access token, not just the access token alone. */
+async function refreshHubspotToken(connector: IConnector): Promise<string> {
+  const refreshToken = connector.config.refreshToken;
+  if (!refreshToken) return connector.config.accessToken || '';
+
+  const res = await axios.post('https://api.hubapi.com/oauth/v1/token', new URLSearchParams({
+    grant_type:    'refresh_token',
+    client_id:     process.env.HUBSPOT_CLIENT_ID || '',
+    client_secret: process.env.HUBSPOT_CLIENT_SECRET || '',
+    refresh_token: refreshToken,
+  }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+
+  const newToken = res.data.access_token as string;
+  if (!newToken) throw new Error('HubSpot token refresh returned no access_token');
+
+  // DB write encrypted (see refreshZohoToken's own comment on why this
+  // matters); the in-memory `connector.config.*` fields below stay
+  // plaintext deliberately — this connector object is used immediately by
+  // the caller in the same request (e.g. testConnector/fetchCRMCustomers),
+  // matching how every other in-memory connector is already expected to
+  // hold decrypted values (decryptConnectorConfig's own contract).
+  await Connector.findByIdAndUpdate(connector._id, {
+    'config.accessToken': encrypt(newToken),
+    ...(res.data.refresh_token ? { 'config.refreshToken': encrypt(res.data.refresh_token) } : {}),
+  });
+  connector.config.accessToken = newToken;
+  if (res.data.refresh_token) connector.config.refreshToken = res.data.refresh_token;
   return newToken;
 }
 
@@ -528,7 +624,7 @@ export async function fetchCRMCustomers(
 
     /* ── HUBSPOT ───────────────────────────────────────────────────── */
     if (connector.type === 'hubspot') {
-      const hsHeaders = { Authorization: `Bearer ${connector.config.accessToken}` };
+      const hsHeaders = { Authorization: `Bearer ${await refreshHubspotToken(connector)}` };
 
       // Fetch contact property names — always put core identity fields first so they're never cut off
       const propsRes = await axios.get('https://api.hubapi.com/crm/v3/properties/contacts', {
@@ -1214,7 +1310,7 @@ function hsPickDisplayField(propNames: string[]): string {
 }
 
 async function syncHubSpotCRMModules(connector: IConnector, tenantId: string): Promise<void> {
-  const headers = { Authorization: `Bearer ${connector.config.accessToken}` };
+  const headers = { Authorization: `Bearer ${await refreshHubspotToken(connector)}` };
 
   // Auto-repair: populate hubId if missing
   if (!connector.config.hubId) {
@@ -1890,10 +1986,11 @@ async function wbHubSpot(connector: IConnector, c: WBPayload): Promise<void> {
   if (c.phone)     props.phone     = c.phone;
   if (c.company)   props.company   = c.company;
   if (!Object.keys(props).length) return;
+  const token = await refreshHubspotToken(connector);
   await axios.patch(
     `https://api.hubapi.com/crm/v3/objects/contacts/${c.externalId}`,
     { properties: props },
-    { headers: { Authorization: `Bearer ${connector.config.accessToken}`, 'Content-Type': 'application/json' } }
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
   );
 }
 
@@ -2057,10 +2154,11 @@ export async function pushCRMRecordUpdate(tenantId: string, rec: CRMWBRecord): P
         );
       }
     } else if (connector.type === 'hubspot') {
+      const hsToken = await refreshHubspotToken(connector);
       await axios.patch(
         `https://api.hubapi.com/crm/v3/objects/${hsObjectType(rec.module)}/${rec.externalId}`,
         { properties: rec.changedData },
-        { headers: { Authorization: `Bearer ${connector.config.accessToken}`, 'Content-Type': 'application/json' } },
+        { headers: { Authorization: `Bearer ${hsToken}`, 'Content-Type': 'application/json' } },
       );
     } else if (connector.type === 'mysql') {
       const { createConnection } = await import('mysql2/promise');
@@ -2118,9 +2216,10 @@ export async function pushCRMRecordDelete(tenantId: string, rec: CRMWBRecord): P
         { headers: { Authorization: `Bearer ${accessToken}` } },
       );
     } else if (connector.type === 'hubspot') {
+      const hsToken = await refreshHubspotToken(connector);
       await axios.delete(
         `https://api.hubapi.com/crm/v3/objects/${hsObjectType(rec.module)}/${rec.externalId}`,
-        { headers: { Authorization: `Bearer ${connector.config.accessToken}` } },
+        { headers: { Authorization: `Bearer ${hsToken}` } },
       );
     } else if (connector.type === 'mysql') {
       const { createConnection } = await import('mysql2/promise');
@@ -2175,10 +2274,11 @@ export async function pushCRMRecordCreate(tenantId: string, rec: CRMWBRecord): P
       );
       return (r.data?.id as string) || null;
     } else if (connector.type === 'hubspot') {
+      const hsToken = await refreshHubspotToken(connector);
       const r = await axios.post(
         `https://api.hubapi.com/crm/v3/objects/${hsObjectType(rec.module)}`,
         { properties: rec.changedData },
-        { headers: { Authorization: `Bearer ${connector.config.accessToken}`, 'Content-Type': 'application/json' } },
+        { headers: { Authorization: `Bearer ${hsToken}`, 'Content-Type': 'application/json' } },
       );
       return String(r.data?.id || '') || null;
     } else if (connector.type === 'mysql') {
@@ -2242,9 +2342,10 @@ export async function pushCustomerDelete(tenantId: string, customer: WBPayload):
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
     } else if (connector.type === 'hubspot') {
+      const hsToken = await refreshHubspotToken(connector);
       await axios.delete(
         `https://api.hubapi.com/crm/v3/objects/contacts/${customer.externalId}`,
-        { headers: { Authorization: `Bearer ${connector.config.accessToken}` } }
+        { headers: { Authorization: `Bearer ${hsToken}` } }
       );
     } else if (connector.type === 'mysql') {
       const { createConnection } = await import('mysql2/promise');
@@ -2307,7 +2408,7 @@ export async function hubSpotUpsertContact(
   connector: IConnector,
   contactId: string
 ): Promise<void> {
-  const headers = { Authorization: `Bearer ${connector.config.accessToken}` };
+  const headers = { Authorization: `Bearer ${await refreshHubspotToken(connector)}` };
 
   const propsRes = await axios.get('https://api.hubapi.com/crm/v3/properties/contacts', { headers })
     .catch(() => ({ data: { results: [] } }));
@@ -2356,7 +2457,7 @@ export async function hubSpotUpsertCRMObject(
   displayField: string,
   objectId: string
 ): Promise<void> {
-  const headers = { Authorization: `Bearer ${connector.config.accessToken}` };
+  const headers = { Authorization: `Bearer ${await refreshHubspotToken(connector)}` };
 
   const propsRes = await axios.get(`https://api.hubapi.com/crm/v3/properties/${objectType}`, { headers })
     .catch(() => ({ data: { results: [] } }));

@@ -21,6 +21,7 @@ import { searchMeili } from '../../services/meilisearch.service';
 import { CRMRecord } from './crm-record.model';
 import { Customer } from '../customers/customer.model';
 import { NativeRecord } from '../native-crm/native-record.model';
+import { getEffectivePermissions, permissionAllows } from '../rbac/permission.service';
 
 function actor(req: AuthRequest) {
   return { userId: req.user?.userId, userEmail: req.user?.email, userRole: req.user?.role };
@@ -170,6 +171,25 @@ export async function searchRecords(req: AuthRequest, res: Response, next: NextF
     const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const qRe  = { $regex: safe, $options: 'i' };
 
+    // Restrict results to what this user's role is allowed to see — mirrors the
+    // exact same requirePermission() gates already enforced on each module's own
+    // routes (native_crm.*, fs.*, customers.view, connector.<type>.view), so a
+    // role with a tab hidden in Settings can't discover that data via search
+    // either. SUPER_ADMIN/TENANT_ADMIN keep full access, same as everywhere else.
+    const { role, roleId } = req.user!;
+    const isFullAccess = role === 'SUPER_ADMIN' || role === 'TENANT_ADMIN';
+    const perms = isFullAccess || !roleId ? null : await getEffectivePermissions(tenantId, roleId);
+    const canSeeChannelModule = (channel: string, module: string): boolean => {
+      if (isFullAccess) return true;
+      if (!perms) return false; // no role assigned — see nothing, same posture as requirePermission()
+      if (channel === 'native')        return permissionAllows(perms, `native_crm.${module}.view`);
+      if (channel === 'native-crm')    return permissionAllows(perms, `fs.${module}.view`);
+      if (channel === 'custom-module') return true; // custom module routes have no permission gate yet
+      if (channel === 'web')           return permissionAllows(perms, 'customers.view');
+      return permissionAllows(perms, `connector.${channel}.view`);
+    };
+    const canSeeCustomer = isFullAccess || (perms ? permissionAllows(perms, 'customers.view') : false);
+
     // Resolve active connector channels once — used to filter all search paths
     const activeConnectors = await Connector.find({ tenantId, isActive: true }).select('type').lean();
     const activeChannels = activeConnectors.map((c) => c.type as string);
@@ -186,11 +206,11 @@ export async function searchRecords(req: AuthRequest, res: Response, next: NextF
       ? { $in: [...activeChannels, ...ALWAYS_INCLUDE, null] }
       : { $in: [...ALWAYS_INCLUDE, null] };
 
-    const customers = await Customer.find({
+    const customers = canSeeCustomer ? await Customer.find({
       tenantId: tid,
       channel: channelFilter,
       $or: [{ name: qRe }, { email: qRe }, { phone: qRe }, { company: qRe }, { address: qRe }],
-    }).select('name email phone company address leadSource channel recordType customFields').limit(limit).lean();
+    }).select('name email phone company address leadSource channel recordType customFields').limit(limit).lean() : [];
 
     const customerHits: HitRecord[] = customers.map((c) => ({
       id:          String(c._id),
@@ -269,9 +289,13 @@ export async function searchRecords(req: AuthRequest, res: Response, next: NextF
       ),
     }));
 
-    // ── 4. Merge: customers first, then CRM records, native CRM — deduplicate ──
+    // ── 4. Merge: customers first, then CRM records, native CRM — deduplicate.
+    //    customerHits are already gated by canSeeCustomer above (a single
+    //    'customers.view' check regardless of source channel); crmHits/nativeHits
+    //    still need the per-channel/module check since they span every module. ──
     const seen = new Set<string>();
-    const all = [...customerHits, ...crmHits, ...nativeHits].filter((r) => {
+    const all = [...customerHits, ...[...crmHits, ...nativeHits].filter((r) => canSeeChannelModule(r.channel, r.module))]
+      .filter((r) => {
       const key = `${r.channel}|${r.module}|${r.displayName.toLowerCase()}`;
       if (seen.has(key)) return false;
       seen.add(key);

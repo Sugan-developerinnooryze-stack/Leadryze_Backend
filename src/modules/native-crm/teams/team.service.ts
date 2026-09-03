@@ -7,6 +7,7 @@ import { NativeStaff } from '../staffs/staff.model';
 import { Lead } from '../leads/lead.model';
 import { Meeting } from '../meetings/meeting.model';
 import { NativeCustomer } from '../customers/customer.model';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listTeams(tenantId: string, opts: TeamListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -33,21 +34,27 @@ export async function getTeamById(id: string, tenantId: string) {
 }
 
 export async function createTeam(data: any) {
-  return NativeTeam.create(data);
+  const doc = await NativeTeam.create(data);
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'teams', doc.toObject(), doc.name);
+  return doc;
 }
 
 export async function updateTeam(id: string, tenantId: string, data: any) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeTeam.findOneAndUpdate(
+  const updated = await NativeTeam.findOneAndUpdate(
     { _id: id, tenantId: tid },
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'teams', updated.toObject(), updated.name);
+  return updated;
 }
 
 export async function deleteTeam(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeTeam.findOneAndDelete({ _id: id, tenantId: tid });
+  const deleted = await NativeTeam.findOneAndDelete({ _id: id, tenantId: tid });
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'teams', String(deleted._id));
+  return deleted;
 }
 
 /** Real, per-TEAM Lead/Meeting/Customer counts — computed server-side from

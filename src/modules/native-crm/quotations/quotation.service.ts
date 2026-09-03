@@ -4,6 +4,7 @@ import { QuotationListOptions } from './quotation.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -49,12 +50,14 @@ export async function createQuotation(data: any) {
   const discount = Number(data.discount ?? 0);
   const gst      = Number(data.gstPercentage ?? 0);
   const after    = svcTotal + prtTotal - discount;
-  return NativeQuotation.create({
+  const created = await NativeQuotation.create({
     ...data,
     partsAmount:           prtTotal,
     servicesAmount:        after,
     servicesAmountWithTax: after + (after * gst) / 100,
   });
+  indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'quotations', created.toObject(), created.title);
+  return created;
 }
 
 export async function updateQuotation(id: string, tenantId: string, data: any, scope?: DataScope) {
@@ -75,16 +78,20 @@ export async function updateQuotation(id: string, tenantId: string, data: any, s
     data.servicesAmount        = after;
     data.servicesAmountWithTax = after + (after * gst) / 100;
   }
-  return NativeQuotation.findOneAndUpdate(
+  const updated = await NativeQuotation.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'quotations', updated.toObject(), updated.title);
+  return updated;
 }
 
 export async function deleteQuotation(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeQuotation.findOneAndDelete(filter);
+  const deleted = await NativeQuotation.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'quotations', String(deleted._id));
+  return deleted;
 }

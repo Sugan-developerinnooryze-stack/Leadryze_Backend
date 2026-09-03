@@ -4,6 +4,7 @@ import { resolveClientPrefix } from '../../../utils/client-id';
 export const taskSchema = new Schema(
   {
     tenantId:   { type: Schema.Types.ObjectId, ref: 'Tenant', required: true },
+    branchId:   { type: Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
     clientId:   { type: String, index: true },
     title:      { type: String, required: true, trim: true },
     dueDate:    { type: Date },

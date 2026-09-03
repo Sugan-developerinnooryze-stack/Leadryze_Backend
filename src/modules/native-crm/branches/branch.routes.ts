@@ -1,13 +1,13 @@
 import { Router } from 'express';
-import { authorize } from '../../../middlewares/auth.middleware';
+import { requirePermission } from '../../../middlewares/auth.middleware';
 import * as ctrl from './branch.controller';
 
 const router = Router();
 
-router.get('/',     ctrl.list);
-router.get('/:id',  ctrl.getOne);
-router.post('/',    authorize('SUPER_ADMIN', 'TENANT_ADMIN'), ctrl.create);
-router.put('/:id',  authorize('SUPER_ADMIN', 'TENANT_ADMIN'), ctrl.update);
-router.delete('/:id', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), ctrl.deactivate);
+router.get('/',     requirePermission('branches.view'), ctrl.list);
+router.get('/:id',  requirePermission('branches.view'), ctrl.getOne);
+router.post('/',    requirePermission('branches.manage'), ctrl.create);
+router.put('/:id',  requirePermission('branches.manage'), ctrl.update);
+router.delete('/:id', requirePermission('branches.manage'), ctrl.deactivate);
 
 export default router;

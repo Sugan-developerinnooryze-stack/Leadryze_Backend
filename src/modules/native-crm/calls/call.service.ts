@@ -5,6 +5,7 @@ import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listCalls(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
@@ -36,6 +37,7 @@ export async function createCall(tenantId: string, dto: CreateCallDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Call.create({ tenantId: tid, ...dto });
   void sendOnCreateConfirmation(tenantId, 'call', created.toObject()); // fire-and-forget, never throws
+  indexNativeSearchRecord(tenantId, 'native', 'calls', created.toObject(), created.contactName);
   return created;
 }
 
@@ -43,7 +45,9 @@ export async function updateCall(tenantId: string, id: string, dto: UpdateCallDT
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return Call.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  const updated = await Call.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'calls', updated, updated.contactName);
+  return updated;
 }
 
 export async function deleteCall(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
@@ -51,6 +55,7 @@ export async function deleteCall(tenantId: string, id: string, scope?: DataScope
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const res = await Call.findOneAndDelete(filter);
+  if (res) removeNativeSearchRecord(tenantId, 'native', 'calls', String(res._id));
   return !!res;
 }
 

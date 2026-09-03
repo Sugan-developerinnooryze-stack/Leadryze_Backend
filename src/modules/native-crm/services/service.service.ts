@@ -3,6 +3,7 @@ import { NativeService } from './service.model';
 import { ServiceListOptions } from './service.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listServices(tenantId: string, opts: ServiceListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -35,23 +36,29 @@ export async function getServiceById(id: string, tenantId: string, scope?: DataS
 }
 
 export async function createService(data: any) {
-  return NativeService.create(data);
+  const doc = await NativeService.create(data);
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'services', doc.toObject(), doc.name);
+  return doc;
 }
 
 export async function updateService(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeService.findOneAndUpdate(
+  const updated = await NativeService.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'services', updated.toObject(), updated.name);
+  return updated;
 }
 
 export async function deleteService(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeService.findOneAndDelete(filter);
+  const deleted = await NativeService.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'services', String(deleted._id));
+  return deleted;
 }

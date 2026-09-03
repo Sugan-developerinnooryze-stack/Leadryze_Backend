@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from 'mongoose';
+import { logger } from '../../utils/logger';
 
 export interface IAuditLog extends Document {
   tenantId?:   string;
@@ -10,6 +11,7 @@ export interface IAuditLog extends Document {
   targetId?:   string;
   detail?:     Record<string, unknown>;
   ip:          string;
+  userAgent?:  string;
   timestamp:   Date;
 }
 
@@ -24,6 +26,7 @@ const AuditLogSchema = new Schema<IAuditLog>(
     targetId:   { type: String },
     detail:     { type: Schema.Types.Mixed },
     ip:         { type: String, default: 'unknown' },
+    userAgent:  { type: String },
     timestamp:  { type: Date, default: Date.now, index: true },
   },
   { timestamps: false }
@@ -36,7 +39,7 @@ export const AuditLog = mongoose.model<IAuditLog>('AuditLog', AuditLogSchema);
 
 export async function logAuditEvent(
   action: string,
-  actor: { id: string; email: string; role: string; ip?: string },
+  actor: { id: string; email: string; role: string; ip?: string; userAgent?: string },
   options?: {
     tenantId?: string;
     target?: string;
@@ -55,9 +58,16 @@ export async function logAuditEvent(
       targetId:   options?.targetId,
       detail:     options?.detail,
       ip:         actor.ip || 'unknown',
+      userAgent:  actor.userAgent,
       timestamp:  new Date(),
     });
-  } catch {
-    // Never crash on audit failure
+  } catch (err) {
+    // Never crash on audit failure — but a silent failure here defeats the
+    // whole point of this log for compliance-sensitive actions, so make it
+    // observable in server logs instead of vanishing entirely.
+    logger.error('Audit log write failed', {
+      action, tenantId: options?.tenantId, target: options?.target,
+      error: (err as Error).message,
+    });
   }
 }

@@ -6,7 +6,7 @@ export interface INativeCrmLog extends Document {
   actorId:    string;
   actorName:  string;
   actorRole:  string;
-  action:     'create' | 'update' | 'delete' | 'error' | 'permission';
+  action:     'create' | 'update' | 'delete' | 'error' | 'permission' | 'export';
   module:     string;
   resourceId: string;
   before:     Record<string, unknown> | null;
@@ -26,7 +26,7 @@ const NativeCrmLogSchema = new Schema<INativeCrmLog>(
     actorId:    { type: String, default: 'anonymous' },
     actorName:  { type: String, default: '' },
     actorRole:  { type: String, default: '' },
-    action:     { type: String, enum: ['create', 'update', 'delete', 'error', 'permission'], required: true, index: true },
+    action:     { type: String, enum: ['create', 'update', 'delete', 'error', 'permission', 'export'], required: true, index: true },
     module:     { type: String, required: true, index: true },
     resourceId: { type: String, default: '' },
     before:     { type: Schema.Types.Mixed, default: null },

@@ -11,6 +11,7 @@ import companyRoutes  from './companies/company.routes';
 import dealRoutes     from './deals/deal.routes';
 import taskRoutes     from './tasks/task.routes';
 import ticketRoutes   from './tickets/ticket.routes';
+import ticketSlaPolicyRoutes from './tickets/ticket-sla-policy.routes';
 import callRoutes     from './calls/call.routes';
 import meetingRoutes  from './meetings/meeting.routes';
 import datasetRoutes  from './datasets/dataset.routes';
@@ -62,6 +63,8 @@ import { emailLogRoutes }   from '../notifications';
 import pipelineConfigRoutes from './pipeline-config/pipeline-config.routes';
 import automationRuleRoutes from './automation-rules/automation-rule.routes';
 import automationFlowRoutes from './automation-flows/automation-flow.routes';
+import automationTemplateRoutes from './automation-templates/automation-template.routes';
+import automationSettingsRoutes from './automation-settings/automation-settings.routes';
 
 import { Contact }  from './contacts/contact.model';
 import { Company }  from './companies/company.model';
@@ -86,6 +89,10 @@ router.use('/contacts',  contactRoutes);
 router.use('/companies', companyRoutes);
 router.use('/deals',     dealRoutes);
 router.use('/tasks',     taskRoutes);
+// Registered BEFORE '/tickets' — ticketRoutes has a GET/PUT '/:id' catch-all
+// that would otherwise swallow '/tickets/sla-policy' as if 'sla-policy' were
+// a ticket id (Express matches router.use() calls in registration order).
+router.use('/tickets/sla-policy', ticketSlaPolicyRoutes);
 router.use('/tickets',   ticketRoutes);
 router.use('/calls',     callRoutes);
 router.use('/meetings',  meetingRoutes);
@@ -135,6 +142,8 @@ router.use('/email-logs',              emailLogRoutes);
 router.use('/pipeline-config',         pipelineConfigRoutes);
 router.use('/automation-rules',        automationRuleRoutes);
 router.use('/automation-flows',        automationFlowRoutes);
+router.use('/automation-templates',    automationTemplateRoutes);
+router.use('/automation-settings',     automationSettingsRoutes);
 
 /* ── GET /fs-counts — field service module record counts ─────────────────── */
 router.get('/fs-counts', fsCounts);

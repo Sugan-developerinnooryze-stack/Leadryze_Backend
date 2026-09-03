@@ -4,14 +4,15 @@ import { sendSuccess, sendError, sendCreated } from '../../../utils/response';
 import * as svc from './ticket.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 import { resolveEffectiveScope } from '../shared/data-scope';
+import { logAuditEvent } from '../../logs/audit-log.model';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, relatedModule, relatedId } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId, slaStatus } = req.query as Record<string, string>;
     const result = await svc.listTickets(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-      relatedModule, relatedId,
-    }, resolveEffectiveScope(req, 'tickets'));
+      relatedModule, relatedId, slaStatus,
+    }, req.branchId, resolveEffectiveScope(req, 'tickets'));
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch tickets', 500); }
 }
@@ -26,7 +27,10 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.createTicket(req.tenantId!, req.body);
+    const record = await svc.createTicket(req.tenantId!, {
+      ...req.body,
+      branchId: req.body.branchId ?? req.branchId ?? null,
+    });
     runAutomationsOnCreate(req.tenantId!, 'ticket', record as any).catch(() => {});
     sendCreated(res, record, 'Ticket created');
   } catch { sendError(res, 'Failed to create ticket', 500); }
@@ -48,11 +52,15 @@ export async function remove(req: AuthRequest, res: Response) {
     const record = await svc.deleteTicket(req.tenantId!, req.params.id, resolveEffectiveScope(req, 'tickets'));
     if (!record) return void sendError(res, 'Ticket not found', 404);
     runAutomationsOnDelete(req.tenantId!, 'ticket', record as any).catch(() => {});
+    logAuditEvent('ticket.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'Ticket', targetId: req.params.id, detail: { before: { subject: record.subject, priority: record.priority, ticketStatus: record.ticketStatus } } },
+    );
     sendSuccess(res, null, 'Ticket deleted');
   } catch { sendError(res, 'Failed to delete ticket', 500); }
 }
 
 export async function stats(req: AuthRequest, res: Response) {
-  try { sendSuccess(res, await svc.getTicketStats(req.tenantId!, resolveEffectiveScope(req, 'tickets'))); }
+  try { sendSuccess(res, await svc.getTicketStats(req.tenantId!, req.branchId, resolveEffectiveScope(req, 'tickets'))); }
   catch { sendError(res, 'Failed to fetch stats', 500); }
 }

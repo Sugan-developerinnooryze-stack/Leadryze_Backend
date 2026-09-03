@@ -3,6 +3,7 @@ import { NativeActivity } from './activity.model';
 import { ActivityListOptions } from './activity.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listActivities(tenantId: string, opts: ActivityListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -35,23 +36,29 @@ export async function getActivityById(id: string, tenantId: string, scope?: Data
 }
 
 export async function createActivity(data: any) {
-  return NativeActivity.create(data);
+  const created = await NativeActivity.create(data);
+  indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'activities', created.toObject(), (created as any).subject);
+  return created;
 }
 
 export async function updateActivity(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeActivity.findOneAndUpdate(
+  const updated = await NativeActivity.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'activities', updated.toObject(), (updated as any).subject);
+  return updated;
 }
 
 export async function deleteActivity(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeActivity.findOneAndDelete(filter);
+  const deleted = await NativeActivity.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'activities', String(deleted._id));
+  return deleted;
 }

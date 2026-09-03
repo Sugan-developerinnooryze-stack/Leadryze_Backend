@@ -63,7 +63,7 @@ function refineActionShape(data: {
 
 function refineTriggerShape(data: {
   triggerType?: string; triggerStage?: string; triggerField?: string;
-  scheduleCron?: string; scheduleModule?: string;
+  scheduleCron?: string; scheduleModule?: string; branchIds?: string[];
 }, ctx: z.RefinementCtx) {
   if ((data.triggerType ?? 'status_changed') === 'status_changed' && !data.triggerStage) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['triggerStage'], message: 'triggerStage is required when triggerType is status_changed' });
@@ -77,6 +77,12 @@ function refineTriggerShape(data: {
   }
   if (data.triggerType !== 'scheduled' && (data.scheduleCron !== undefined || data.scheduleModule !== undefined)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['scheduleCron'], message: 'scheduleCron/scheduleModule/scheduleFilter are only valid when triggerType is scheduled' });
+  }
+  // Phase 6 — same reasoning as automation-flow.validation.ts's identical
+  // check: a webhook payload isn't "a record in a branch," so this is a
+  // save-time rejection, not a silently-ignored field.
+  if (data.triggerType === 'webhook' && data.branchIds && data.branchIds.length > 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['branchIds'], message: 'branchIds is not supported on webhook triggers' });
   }
 }
 
@@ -93,6 +99,7 @@ export const createAutomationRuleSchema = z.object({
   scheduleCron:      scheduleCronSchema.optional(),
   scheduleModule:    moduleSchema.optional(),
   scheduleFilter:    z.array(flowConditionSchema).optional(),
+  branchIds:         z.array(z.string().trim().min(1)).optional(),
   actionType:        actionTypeSchema,
   templateId:        z.string().trim().min(1).optional(),
   recipientStrategy: z.enum(['record_contact', 'assigned_user', 'tenant_admin', 'manager']).optional(),
@@ -115,6 +122,7 @@ export const updateAutomationRuleSchema = z.object({
   scheduleCron:      scheduleCronSchema.optional(),
   scheduleModule:    moduleSchema.optional(),
   scheduleFilter:    z.array(flowConditionSchema).optional(),
+  branchIds:         z.array(z.string().trim().min(1)).optional(),
   actionType:        actionTypeSchema.optional(),
   templateId:        z.string().trim().min(1).optional(),
   recipientStrategy: z.enum(['record_contact', 'assigned_user', 'tenant_admin', 'manager']).optional(),

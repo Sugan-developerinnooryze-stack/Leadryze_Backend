@@ -2,11 +2,12 @@ import { Router, Response } from 'express';
 import mongoose from 'mongoose';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError } from '../../../utils/response';
+import { requirePermission } from '../../../middlewares/auth.middleware';
 import { WorkflowTemplate } from './workflow-template.model';
 
 const router = Router();
 
-router.get('/', async (req: AuthRequest, res: Response) => {
+router.get('/', requirePermission('workflow_templates.view'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const items = await WorkflowTemplate.find({ tenantId: tid }).sort({ createdAt: 1 });
@@ -16,7 +17,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', async (req: AuthRequest, res: Response) => {
+router.post('/', requirePermission('workflow_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const doc = await WorkflowTemplate.create({ ...req.body, tenantId: tid });
@@ -26,7 +27,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.put('/:id', async (req: AuthRequest, res: Response) => {
+router.put('/:id', requirePermission('workflow_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const doc = await WorkflowTemplate.findOneAndUpdate(
@@ -41,7 +42,7 @@ router.put('/:id', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.delete('/:id', async (req: AuthRequest, res: Response) => {
+router.delete('/:id', requirePermission('workflow_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     await WorkflowTemplate.findOneAndDelete({ _id: req.params.id, tenantId: tid });
@@ -51,7 +52,7 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.put('/:id/set-default', async (req: AuthRequest, res: Response) => {
+router.put('/:id/set-default', requirePermission('workflow_templates.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     await WorkflowTemplate.updateMany({ tenantId: tid }, { isDefault: false });

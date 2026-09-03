@@ -3,6 +3,7 @@ import { NativeCategory } from './category.model';
 import { CategoryListOptions } from './category.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listCategories(tenantId: string, opts: CategoryListOptions, branchId?: string | null, scope?: DataScope) {
   const tid    = new mongoose.Types.ObjectId(tenantId);
@@ -30,23 +31,29 @@ export async function getCategoryById(id: string, tenantId: string, scope?: Data
 }
 
 export async function createCategory(data: any) {
-  return NativeCategory.create(data);
+  const doc = await NativeCategory.create(data);
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'categories', doc.toObject(), doc.name);
+  return doc;
 }
 
 export async function updateCategory(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeCategory.findOneAndUpdate(
+  const updated = await NativeCategory.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'categories', updated.toObject(), updated.name);
+  return updated;
 }
 
 export async function deleteCategory(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeCategory.findOneAndDelete(filter);
+  const deleted = await NativeCategory.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'categories', String(deleted._id));
+  return deleted;
 }

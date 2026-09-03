@@ -86,6 +86,12 @@ async function bootstrap(): Promise<void> {
     logger.info(`RBAC seed complete for ${tenantIds.length} tenant(s)`);
   }).catch((err) => logger.warn('RBAC seed skipped on startup', { error: (err as Error).message }));
 
+  // Seed the 5 system Automation Flow templates (idempotent upsert-by-name,
+  // global — not per-tenant, unlike RBAC above) — fire-and-forget, same posture.
+  import('./modules/native-crm/automation-templates/automation-template.service')
+    .then(({ seedDefaultTemplates }) => seedDefaultTemplates())
+    .catch((err) => logger.warn('Automation template seed skipped on startup', { error: (err as Error).message }));
+
   // Meilisearch index setup — non-blocking, falls back to MongoDB if not configured
   ensureMeiliIndex().catch((err) => logger.warn('Meilisearch init skipped', { err: (err as Error).message }));
 

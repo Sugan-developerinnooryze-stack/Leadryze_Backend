@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { NativeProduct } from './product.model';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listProducts(tenantId: string, opts: any, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -30,19 +31,25 @@ export async function getProductById(id: string, tenantId: string, scope?: DataS
 }
 
 export async function createProduct(data: any) {
-  return NativeProduct.create(data);
+  const created = await NativeProduct.create(data);
+  indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'products', created.toObject(), (created as any).name);
+  return created;
 }
 
 export async function updateProduct(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeProduct.findOneAndUpdate(filter, data, { new: true, runValidators: true });
+  const updated = await NativeProduct.findOneAndUpdate(filter, data, { new: true, runValidators: true });
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'products', updated.toObject(), (updated as any).name);
+  return updated;
 }
 
 export async function deleteProduct(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeProduct.findOneAndDelete(filter);
+  const deleted = await NativeProduct.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'products', String(deleted._id));
+  return deleted;
 }

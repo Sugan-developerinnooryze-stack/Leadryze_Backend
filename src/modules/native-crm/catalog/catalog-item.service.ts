@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import crypto from 'crypto';
 import { CatalogItem } from './catalog-item.model';
 import { KnowledgeSource } from './knowledge-source.model';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 /** Normalizes a specification/attribute key so the same real-world field
  * ("Pressure Rating", "pressure rating", "PressureRating") always collapses
@@ -68,7 +69,12 @@ export async function createCatalogItem(data: any) {
   const specifications = normalizeSpecMap(data.specifications);
   const attributes = normalizeSpecMap(data.attributes);
   const contentHash = computeContentHash({ ...data, specifications, attributes });
-  return CatalogItem.create({ ...data, specifications, attributes, contentHash });
+  const created = await CatalogItem.create({ ...data, specifications, attributes, contentHash });
+  // Grouped under module:'products' (not 'catalog') — no dedicated Catalog
+  // page exists in the frontend today; catalog items surface in search
+  // alongside NativeProduct results, routing to the same /native-crm/products page.
+  indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'products', created.toObject(), (created as any).title);
+  return created;
 }
 
 export async function updateCatalogItem(id: string, tenantId: string, data: any) {
@@ -77,12 +83,16 @@ export async function updateCatalogItem(id: string, tenantId: string, data: any)
   if (data.specifications) update.specifications = normalizeSpecMap(data.specifications);
   if (data.attributes) update.attributes = normalizeSpecMap(data.attributes);
   update.contentHash = computeContentHash(update);
-  return CatalogItem.findOneAndUpdate({ _id: id, tenantId: tid }, update, { new: true, runValidators: true });
+  const updated = await CatalogItem.findOneAndUpdate({ _id: id, tenantId: tid }, update, { new: true, runValidators: true });
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'products', updated.toObject(), (updated as any).title);
+  return updated;
 }
 
 export async function deleteCatalogItem(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return CatalogItem.findOneAndDelete({ _id: id, tenantId: tid });
+  const deleted = await CatalogItem.findOneAndDelete({ _id: id, tenantId: tid });
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'products', String(deleted._id));
+  return deleted;
 }
 
 export interface UpsertCatalogFields {
@@ -135,10 +145,11 @@ export async function upsertCatalogItemFromSource(
     else if (matchKey.sku) query.sku = matchKey.sku;
     else {
       // No stable match key at all — always a new item (e.g. an import row with no sku).
-      await CatalogItem.create({
+      const created = await CatalogItem.create({
         tenantId: tid, source, knowledgeSourceId: ksId,
         ...fields, specifications, attributes, contentHash,
       });
+      indexNativeSearchRecord(tenantId, 'native-crm', 'products', created.toObject(), fields.title);
       await KnowledgeSource.findByIdAndUpdate(ksId, { $inc: { itemsImported: 1 } });
       return { outcome: 'created' };
     }
@@ -148,11 +159,12 @@ export async function upsertCatalogItemFromSource(
       return { outcome: 'unchanged' };
     }
 
-    await CatalogItem.findOneAndUpdate(
+    const upserted = await CatalogItem.findOneAndUpdate(
       query,
       { $set: { tenantId: tid, source, knowledgeSourceId: ksId, ...fields, specifications, attributes, contentHash } },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
+    if (upserted) indexNativeSearchRecord(tenantId, 'native-crm', 'products', upserted.toObject(), fields.title);
     await KnowledgeSource.findByIdAndUpdate(ksId, { $inc: existing ? { itemsUpdated: 1 } : { itemsImported: 1 } });
     return { outcome: existing ? 'updated' : 'created' };
   } catch (err) {

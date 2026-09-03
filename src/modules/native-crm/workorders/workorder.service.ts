@@ -9,6 +9,7 @@ import { getSettings }     from '../fs-settings/fs-settings.service';
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -114,6 +115,7 @@ export async function createWorkorder(data: any) {
       if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }).catch(() => {});
     }
   }
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'workorders', doc.toObject(), (doc as any).title);
   return doc;
 }
 
@@ -148,6 +150,7 @@ export async function updateWorkorder(id: string, tenantId: string, data: any, s
       });
     }
   }
+  if (doc) indexNativeSearchRecord(tenantId, 'native-crm', 'workorders', doc.toObject(), (doc as any).title);
   return doc;
 }
 
@@ -155,7 +158,9 @@ export async function deleteWorkorder(id: string, tenantId: string, scope?: Data
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
-  return NativeWorkorder.findOneAndDelete(filter);
+  const deleted = await NativeWorkorder.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'workorders', String(deleted._id));
+  return deleted;
 }
 
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {

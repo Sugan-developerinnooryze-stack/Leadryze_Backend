@@ -96,6 +96,16 @@ export interface IFlowNode {
    * automation-rule.model.ts's matching field for the full doc, shared
    * verbatim between both engines. */
   webhookToken?:        string;
+  /** Phase 6 branch scoping — Branch document ids (this tenant's own,
+   * validated at save time). Absent/empty = unscoped, matches every branch
+   * (today's exact behavior, so every pre-existing flow is unaffected).
+   * When present, a record whose own `branchId` is null never matches (see
+   * matchesBranchScope in automation-rule.service.ts, the shared home for
+   * both engines) — not meaningful on a `triggerType:'webhook'` node (no
+   * record, no branch concept), rejected at save time if set there. See
+   * automation-rule.model.ts's matching field for the full doc, shared
+   * verbatim between both engines. */
+  branchIds?: string[];
 
   // ── Action node fields (present only when type === 'action') ────────────
   actionType?: AutomationActionType;
@@ -114,6 +124,31 @@ export interface IFlowNode {
   /** Fixed delay between attempts (not exponential) — one of 4 presets.
    * Meaningless when retryCount is 0/absent. */
   retryBackoffMs?: 1000 | 5000 | 30000 | 60000;
+
+  // ── Add Note action fields (actionType === 'add_note' only) ─────────────
+  /** Required — NativeActivity.subject, template-rendered. */
+  noteSubject?: string;
+  /** Optional, template-rendered — NativeActivity.description. */
+  noteBody?: string;
+  /** Optional — NativeActivity.assignedTo (a plain string on that model,
+   * same as it is there — no FK typing to match). */
+  noteAssignedTo?: string;
+
+  // ── Webhook action fields (actionType === 'webhook_call' only) ──────────
+  /** Required. Validated both at save time (automation-flow.validation.ts's
+   * superRefine, best-effort — an obviously-bad URL is rejected in the
+   * builder) and, authoritatively, immediately before every actual call
+   * (including every retry) via resolveAndPinSafeUrl (utils/url-safety.ts)
+   * — DNS can legitimately change between the two. */
+  webhookUrl?: string;
+  webhookMethod?: 'POST' | 'PUT' | 'PATCH';
+  /** A sensitive-named entry's `value` (see webhook-secret.util.ts's
+   * SENSITIVE_HEADER_NAMES) is encrypted at rest on save and never returned
+   * by any GET — only a fixed masked placeholder is. Body reuses the
+   * existing fieldMappings field below (same readSourceField/
+   * setPayloadField machinery create_linked_record already uses) — no
+   * separate "webhook body" field. */
+  webhookHeaders?: { key: string; value: string }[];
 
   // ── Condition node fields (present only when type === 'condition') ──────
   /** AND-combined in v1 (every condition must pass) — matches the array
@@ -190,10 +225,31 @@ export interface IFlowEdge {
   fromPort?: 'true' | 'false' | 'success' | 'failure' | 'approve' | 'reject';
 }
 
+/** A staged, unpublished copy of the whole graph — same shape as the live
+ * nodes/edges/canvasPositions, never a partial diff. Present only while
+ * there's an edit pending publish; absent the rest of the time (including
+ * for every flow that predates versioning — an absent draft simply means
+ * "nothing staged," which is also the correct, zero-migration reading for
+ * pre-existing data). Trigger-matching queries (runFlows/runFlowsOnCreate/
+ * etc in automation-flow.service.ts) only ever read the top-level nodes/
+ * edges below, never this — so a draft can never accidentally fire before
+ * it's published, without those query sites needing to know this exists. */
+export interface IFlowDraft {
+  nodes: IFlowNode[];
+  edges: IFlowEdge[];
+  canvasPositions?: Record<string, { x: number; y: number }>;
+  updatedAt: Date;
+}
+
 export interface IAutomationFlow extends Document {
   tenantId:   mongoose.Types.ObjectId;
   name:       string;
   enabled:    boolean;
+  /** The LIVE, executable graph — what every trigger-matching query and
+   * executeFlow() itself reads. createFlow() writes here directly (a brand
+   * new flow has no prior "published" behavior to protect); updateFlow()
+   * on an EXISTING flow never touches this — it stages into `draft` below
+   * instead, per publishFlow()'s own doc comment. */
   nodes:      IFlowNode[];
   edges:      IFlowEdge[];
   /** Per-node canvas position, keyed by node id — optional, populated once
@@ -202,6 +258,13 @@ export interface IAutomationFlow extends Document {
    * layer, that's a frontend rendering concern same as AutomationRule's own
    * canvasPosition. */
   canvasPositions?: Record<string, { x: number; y: number }>;
+  /** Bumped only by publishFlow() — starts at 1 (the create-time content
+   * counts as the implicit first published version). Stamped onto each
+   * AutomationFlowRun (flowVersion) so execution history stays meaningful
+   * across later publishes — "this run executed v3" even after v5 is live. */
+  version:      number;
+  publishedAt?: Date;
+  draft?:       IFlowDraft;
   createdBy?: string;
   createdAt:  Date;
   updatedAt:  Date;
@@ -213,6 +276,14 @@ const fieldMappingSchema = new Schema<IFieldMapping>(
     sourceType:  { type: String, enum: ['field', 'static'], required: true },
     sourceField: { type: String, trim: true },
     staticValue: { type: String },
+  },
+  { _id: false },
+);
+
+const webhookHeaderSchema = new Schema<{ key: string; value: string }>(
+  {
+    key:   { type: String, required: true, trim: true },
+    value: { type: String, required: true },
   },
   { _id: false },
 );
@@ -230,7 +301,11 @@ const flowConditionSchema = new Schema<IFlowCondition>(
   { _id: false },
 );
 
-const flowNodeSchema = new Schema<IFlowNode>(
+// Exported (was bare `const`) so automation-templates/automation-template.model.ts
+// (Phase 4) can reuse these exact sub-schemas for its own nodes/edges fields
+// rather than duplicating a ~90-line schema — purely additive, zero behavior
+// change for anything already using this file.
+export const flowNodeSchema = new Schema<IFlowNode>(
   {
     id:   { type: String, required: true, trim: true },
     type: { type: String, enum: ['trigger', 'action', 'condition', 'delay', 'merge', 'subFlow', 'loop', 'approval'], required: true },
@@ -245,8 +320,12 @@ const flowNodeSchema = new Schema<IFlowNode>(
     scheduleLastFiredAt: { type: Date },
     scheduleCursor:      { type: String },
     webhookToken:        { type: String, trim: true },
+    branchIds:           { type: [String], default: undefined },
 
-    actionType:        { type: String, enum: ['send_email', 'send_sms', 'send_whatsapp', 'create_linked_record'] },
+    actionType:        {
+      type: String,
+      enum: ['send_email', 'send_sms', 'send_whatsapp', 'create_linked_record', 'update_record', 'assign_record', 'change_status', 'add_note', 'webhook_call'],
+    },
     templateId:        { type: String },
     recipientStrategy: { type: String, enum: ['record_contact', 'assigned_user', 'tenant_admin', 'manager'] },
     targetModule:       { type: String, trim: true },
@@ -254,6 +333,14 @@ const flowNodeSchema = new Schema<IFlowNode>(
     backReferenceField: { type: String, trim: true },
     retryCount:         { type: Number, enum: [0, 1, 2, 3] },
     retryBackoffMs:     { type: Number, enum: [1000, 5000, 30000, 60000] },
+
+    noteSubject:     { type: String, trim: true },
+    noteBody:        { type: String },
+    noteAssignedTo:  { type: String, trim: true },
+
+    webhookUrl:     { type: String, trim: true },
+    webhookMethod:  { type: String, enum: ['POST', 'PUT', 'PATCH'] },
+    webhookHeaders: { type: [webhookHeaderSchema], default: undefined },
 
     conditions: { type: [flowConditionSchema], default: undefined },
 
@@ -273,11 +360,21 @@ const flowNodeSchema = new Schema<IFlowNode>(
   { _id: false },
 );
 
-const flowEdgeSchema = new Schema<IFlowEdge>(
+export const flowEdgeSchema = new Schema<IFlowEdge>(
   {
     from:     { type: String, required: true, trim: true },
     to:       { type: String, required: true, trim: true },
     fromPort: { type: String, enum: ['true', 'false', 'success', 'failure', 'approve', 'reject'], trim: true },
+  },
+  { _id: false },
+);
+
+const flowDraftSchema = new Schema<IFlowDraft>(
+  {
+    nodes: { type: [flowNodeSchema], default: [] },
+    edges: { type: [flowEdgeSchema], default: [] },
+    canvasPositions: { type: Schema.Types.Mixed },
+    updatedAt: { type: Date, required: true },
   },
   { _id: false },
 );
@@ -290,6 +387,9 @@ const schema = new Schema<IAutomationFlow>(
     nodes:    { type: [flowNodeSchema], default: [] },
     edges:    { type: [flowEdgeSchema], default: [] },
     canvasPositions: { type: Schema.Types.Mixed },
+    version:      { type: Number, default: 1 },
+    publishedAt:  { type: Date },
+    draft:        { type: flowDraftSchema },
     createdBy: { type: String },
   },
   { timestamps: true },

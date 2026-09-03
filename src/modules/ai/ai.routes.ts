@@ -1,7 +1,9 @@
 import { Router, Response, NextFunction } from 'express';
 import axios from 'axios';
+import jwt from 'jsonwebtoken';
 import { authenticate, authorize } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { resolveBranch } from '../../middlewares/branch.middleware';
 import { uploadAudio } from '../../middlewares/upload.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
@@ -16,7 +18,7 @@ const router = Router();
  *   description: AI chat and knowledge base (proxied to AI microservice)
  */
 
-router.use(authenticate, requireTenant);
+router.use(authenticate, requireTenant, resolveBranch);
 
 const aiHeaders = { 'x-api-key': config.ai.internalApiKey };
 const AI_URL = config.app.aiServiceUrl;
@@ -43,9 +45,23 @@ const AI_URL = config.app.aiServiceUrl;
  */
 router.post('/chat', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // Signed, short-lived identity assertion for the internal CRM-search
+    // path (base.agent.ts -> backend.client.ts -> /api/internal/crm-search)
+    // to authorize against — reusing the exact same signed-JWT technique
+    // already used for OAuth's `state` param, rather than forwarding
+    // role/roleId/userId/branchId as plain, independently-trusted query
+    // params an internal-key holder could otherwise forge. The AI service
+    // never interprets this token, only passes it through unmodified.
+    const internalAuth = jwt.sign(
+      {
+        tenantId: req.tenantId, role: req.user!.role, roleId: req.user!.roleId,
+        userId: req.user!.userId, branchId: req.branchId ?? null,
+      },
+      config.jwt.secret, { expiresIn: '2m' },
+    );
     const response = await axios.post(
       `${AI_URL}/api/chat`,
-      { ...req.body, tenantId: req.tenantId },
+      { ...req.body, tenantId: req.tenantId, internalAuth },
       // Raised from 70s: the tool-calling loop (up to 3 rounds, each
       // possibly needing a primary+fallback retry) legitimately needs more
       // room than a single plain completion did when 70s was chosen.

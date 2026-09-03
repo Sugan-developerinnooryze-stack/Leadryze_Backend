@@ -4,6 +4,14 @@ import { LeadListOptions } from './lead.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { customFieldsSearchExpr } from '../shared/custom-field-query';
+import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
+import { IFlowCondition } from '../automation-rules/automation-rule.model';
+
+function leadDisplayName(l: any): string {
+  return [l.firstName, l.lastName].filter(Boolean).join(' ') || l.company || l.leadId;
+}
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -31,9 +39,27 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
     filter.$or = [
       { firstName: re }, { lastName: re },
       { company: re }, { email: re }, { phone: re }, { leadId: re },
+      customFieldsSearchExpr(opts.search),
     ];
   }
+
+  if (opts.customFieldFilters) {
+    try {
+      const conditions: IFlowCondition[] = JSON.parse(opts.customFieldFilters);
+      const cfFilter = conditionsToMongoFilter(conditions);
+      if (Object.keys(cfFilter).length > 0) filter.$and = [...(filter.$and ?? []), cfFilter];
+    } catch { /* malformed filter payload from the client — ignored, not a 500 */ }
+  }
   return filter;
+}
+
+/** `sortBy` accepts a built-in field name or `customFields.<key>` — both
+ * sort identically via Mongo's native dot-path sort, no special-casing
+ * needed. Falls back to the original hardcoded sort when omitted, so every
+ * existing caller's behavior is unchanged. */
+function resolveLeadSort(opts: LeadListOptions): Record<string, 1 | -1> {
+  if (!opts.sortBy) return { lastActivityAt: -1, createdAt: -1 };
+  return { [opts.sortBy]: opts.sortDir === 'asc' ? 1 : -1 };
 }
 
 export async function listLeads(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope) {
@@ -43,7 +69,7 @@ export async function listLeads(tenantId: string, opts: LeadListOptions, branchI
 
   const [items, total] = await Promise.all([
     Lead.find(filter)
-      .sort({ lastActivityAt: -1, createdAt: -1 })
+      .sort(resolveLeadSort(opts))
       .skip((page - 1) * limit)
       .limit(limit)
       .lean(),
@@ -56,7 +82,7 @@ export async function listLeads(tenantId: string, opts: LeadListOptions, branchI
  * return every matching record rather than one page of results. */
 export async function listLeadsForExport(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope) {
   const filter = buildLeadFilter(tenantId, opts, branchId, scope);
-  return Lead.find(filter).sort({ lastActivityAt: -1, createdAt: -1 }).lean();
+  return Lead.find(filter).sort(resolveLeadSort(opts)).lean();
 }
 
 export async function getLeadById(id: string, tenantId: string, scope?: DataScope) {
@@ -68,7 +94,9 @@ export async function getLeadById(id: string, tenantId: string, scope?: DataScop
 
 export async function createLead(data: any) {
   await assertValidStatus(String(data.tenantId), data.status);
-  return Lead.create(data);
+  const doc = await Lead.create(data);
+  indexNativeSearchRecord(String(doc.tenantId), 'native', 'leads', doc.toObject(), leadDisplayName(doc));
+  return doc;
 }
 
 export async function updateLead(id: string, tenantId: string, data: any, scope?: DataScope) {
@@ -76,11 +104,13 @@ export async function updateLead(id: string, tenantId: string, data: any, scope?
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
-  return Lead.findOneAndUpdate(
+  const updated = await Lead.findOneAndUpdate(
     filter,
     { ...data, lastActivityAt: new Date() },
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
+  return updated;
 }
 
 export async function updateLeadStage(id: string, tenantId: string, status: string, scope?: DataScope) {
@@ -88,18 +118,22 @@ export async function updateLeadStage(id: string, tenantId: string, status: stri
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
-  return Lead.findOneAndUpdate(
+  const updated = await Lead.findOneAndUpdate(
     filter,
     { status, lastActivityAt: new Date() },
     { new: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
+  return updated;
 }
 
 export async function deleteLead(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
-  return Lead.findOneAndDelete(filter);
+  const deleted = await Lead.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native', 'leads', String(deleted._id));
+  return deleted;
 }
 
 export async function getLeadRaw(id: string, tenantId: string, scope?: DataScope) {

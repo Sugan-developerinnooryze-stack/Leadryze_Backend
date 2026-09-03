@@ -19,6 +19,8 @@ import { NativeActivity }  from './activities/activity.model';
 import { NativeProduct }   from './products/product.model';
 import { NativeAsset }     from './assets/asset.model';
 import { NativeVehicle }   from './vehicles/vehicle.model';
+import { Lead }            from './leads/lead.model';
+import { Deal }            from './deals/deal.model';
 import {
   resolveEffectiveScope, applyDataScopeToFilter, applyDataScopeToCreatedByFilter, applyDataScopeToTeamFilter,
 } from './shared/data-scope';
@@ -52,10 +54,13 @@ export async function fsCounts(req: AuthRequest, res: Response) {
     })();
 
     const [
+      leads, deals,
       categories, services, teams, staffs, customers, sites, parts,
       workorders, quotations, contracts, invoices, receipts,
       expenses, activities, products, assets, vehicles,
     ] = await Promise.all([
+      Lead.countDocuments(staffAnchored('leads', 'leadOwnerStaffId')),
+      Deal.countDocuments(staffAnchored('deals', 'assignedStaffId')),
       NativeCategory.countDocuments(createdByAnchored('categories')),
       NativeService.countDocuments(createdByAnchored('services')),
       NativeTeam.countDocuments(teamFilter),
@@ -76,6 +81,7 @@ export async function fsCounts(req: AuthRequest, res: Response) {
     ]);
 
     sendSuccess(res, {
+      leads, deals,
       categories, services, teams, staffs, customers, sites, parts,
       workorders, quotations, contracts, invoices, receipts,
       expenses, activities, products, assets, vehicles,

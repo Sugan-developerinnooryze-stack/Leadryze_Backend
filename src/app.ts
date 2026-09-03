@@ -20,6 +20,7 @@ import campaignRoutes from './modules/campaigns/campaign.routes';
 import templateRoutes from './modules/templates/template.routes';
 import messageRoutes from './modules/messages/message.routes';
 import connectorRoutes from './modules/connectors/connector.routes';
+import connectorOAuthRoutes from './modules/connectors/connector-oauth.routes';
 import analyticsRoutes from './modules/analytics/analytics.routes';
 import webhookRoutes from './modules/webhooks/webhook.routes';
 import automationWebhookRoutes from './modules/native-crm/automation-webhooks/automation-webhook.routes';
@@ -148,6 +149,12 @@ app.use(`${V}/customers`, customerRoutes);
 app.use(`${V}/campaigns`, campaignRoutes);
 app.use(`${V}/templates`, templateRoutes);
 app.use(`${V}/messages`, messageRoutes);
+// Mounted BEFORE connectorRoutes at the same path — its /:type/callback
+// route must win the match ahead of connectorRoutes' own blanket
+// authenticate/requireTenant middleware, since that callback is hit by a
+// browser redirect from Zoho/HubSpot's own server (no Authorization
+// header possible). See connector-oauth.routes.ts's own comment.
+app.use(`${V}/connectors`, connectorOAuthRoutes);
 app.use(`${V}/connectors`, connectorRoutes);
 app.use(`${V}/analytics`, analyticsRoutes);
 app.use(`${V}/webhooks`, webhookRoutes);

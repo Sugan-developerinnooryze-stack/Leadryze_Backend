@@ -101,6 +101,7 @@ export interface ITenant extends Document {
     timezone: string;
     language: string;
     crmOption: 'with_crm' | 'no_crm';
+    automationsPaused: boolean;
   };
   branding: {
     logoUrl?: string;
@@ -346,6 +347,13 @@ const tenantSchema = new Schema<ITenant>(
       timezone: { type: String, default: 'Asia/Singapore' },
       language: { type: String, default: 'en' },
       crmOption: { type: String, enum: ['with_crm', 'no_crm'], default: 'no_crm' },
+      // Emergency tenant-wide automation kill switch (Phase 5) — checked at
+      // the Flow engine's executeFlow/resumeFlow/decideApproval and Simple
+      // Mode's runOneRule, the single choke points every trigger/resume path
+      // funnels through. See automation-settings module for the read/write
+      // endpoint (never edited via the generic tenant PUT — updateTenant()'s
+      // own dot-notation merge protection doesn't cover `settings`).
+      automationsPaused: { type: Boolean, default: false },
     },
     branding: {
       logoUrl: String,

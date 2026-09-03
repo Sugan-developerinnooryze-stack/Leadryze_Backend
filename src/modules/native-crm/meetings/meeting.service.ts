@@ -5,6 +5,7 @@ import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { resolveTeamFromStaffId } from '../shared/team-resolution';
 import { NativeTimeline } from '../timeline/timeline.model';
 import { Tenant } from '../../tenants/tenant.model';
@@ -43,6 +44,7 @@ export async function createMeeting(tenantId: string, dto: CreateMeetingDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Meeting.create({ tenantId: tid, ...dto });
   void sendOnCreateConfirmation(tenantId, 'meeting', created.toObject()); // fire-and-forget, never throws
+  indexNativeSearchRecord(tenantId, 'native', 'meetings', created.toObject(), created.title);
   return created;
 }
 
@@ -80,6 +82,7 @@ export async function updateMeeting(
 
   const updated = await Meeting.findOneAndUpdate(filter, { $set: update }, { new: true }).lean();
   if (!updated) return null;
+  indexNativeSearchRecord(tenantId, 'native', 'meetings', updated, (updated as any).title);
 
   if (isReassignment) {
     const prevName = (prev as any).assignedStaffName || 'Unassigned';
@@ -127,6 +130,7 @@ export async function deleteMeeting(tenantId: string, id: string, scope?: DataSc
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   const res = await Meeting.findOneAndDelete(filter);
+  if (res) removeNativeSearchRecord(tenantId, 'native', 'meetings', String(res._id));
   return !!res;
 }
 

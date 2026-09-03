@@ -45,7 +45,17 @@ export async function ensureMeiliIndex(): Promise<void> {
       searchableAttributes: ['displayName', 'searchText'],
       filterableAttributes: ['tenantId', 'channel', 'module', 'isSecondary'],
       sortableAttributes: ['displayName', 'isSecondary'],
-      rankingRules: ['words', 'typo', 'proximity', 'attribute', 'sort', 'exactness'],
+      // 'exactness' sits before 'attribute' deliberately: without this, a
+      // partial/prefix match buried in a record's own title/displayName
+      // (e.g. "infra" inside "IT Infrastructure Support") always outranks a
+      // genuine whole-word match that only lives in a secondary field (e.g.
+      // a custom module record whose Team field resolves to "Infra Squad") —
+      // 'attribute' only rewards WHICH field matched, not how well, so it
+      // was drowning out real matches once resolveable relationship labels
+      // (customer/staff/team names, etc.) started landing in `searchText`
+      // instead of `displayName`. Prioritizing exactness first means a whole-
+      // word match wins regardless of which searchable field it's in.
+      rankingRules: ['words', 'typo', 'exactness', 'proximity', 'attribute', 'sort'],
       typoTolerance: {
         enabled: true,
         minWordSizeForTypos: { oneTypo: 4, twoTypos: 8 },
@@ -101,10 +111,29 @@ function buildSearchText(displayName: string, data: Record<string, unknown>): st
   return unique.join(' | ').slice(0, 4000);
 }
 
-/** Flatten data to flat string map — nested objects become their leaf values joined */
+/** Flatten data to flat string map — nested objects become their leaf values
+ * joined, EXCEPT `customFields` (native-crm's tenant-defined Mixed bag),
+ * which is expanded into one `customFields.<fieldKey>` entry per field
+ * instead of one joined blob under a single generic `customFields` key.
+ * Without this, an AI answering "what's this Lead's budget?" would see
+ * `customFields: "150000, Enterprise"` — every custom field's value joined
+ * together with no way to tell which value is which. Same
+ * `customFields.<key>` convention already used by automation conditions,
+ * list search, and list filtering, so a search-result field lines up with
+ * the same dot-path everywhere else in the app. Field LABELS aren't
+ * resolved here (would need an async per-tenant lookup this fire-and-forget
+ * indexing path doesn't have) — the raw field key is still far more useful
+ * to an LLM than an unlabeled blob. */
 function flattenDataToStrings(data: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(data)) {
+    if (k === 'customFields' && v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const [cfKey, cfVal] of Object.entries(v as Record<string, unknown>)) {
+        const leaves = extractLeafValues(cfVal);
+        if (leaves.length > 0) out[`customFields.${cfKey}`] = leaves.join(', ').slice(0, 500);
+      }
+      continue;
+    }
     const leaves = extractLeafValues(v);
     if (leaves.length > 0) out[k] = leaves.join(', ').slice(0, 500);
   }
@@ -156,7 +185,10 @@ export async function removeMeiliRecords(ids: string[]): Promise<void> {
 
 /** Search — returns null if MeiliSearch is not configured (caller should fall back to MongoDB).
  *  Pass activeChannels to restrict results to only connected connectors.
- *  Always includes 'native' and 'web' (own-data channels that are never deactivated). */
+ *  Always includes 'native'/'web' (own-data channels that are never deactivated) plus
+ *  'native-crm'/'custom-module' (Field Service + Custom Module records — see
+ *  native-crm/shared/search-index.ts — these have no "connector" concept at all,
+ *  so they must always be searchable regardless of which connectors are active). */
 export async function searchMeili(
   tenantId: string,
   query: string,
@@ -169,7 +201,7 @@ export async function searchMeili(
   const tid = tenantId.replace(/"/g, '');
   let filter = `tenantId = "${tid}"`;
   if (activeChannels && activeChannels.length > 0) {
-    const always = ['native', 'web'];
+    const always = ['native', 'web', 'native-crm', 'custom-module'];
     const allowed = [...new Set([...activeChannels, ...always])];
     const channelFilter = allowed.map((c) => `channel = "${c}"`).join(' OR ');
     filter = `${filter} AND (${channelFilter})`;

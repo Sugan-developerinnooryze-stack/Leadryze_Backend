@@ -10,6 +10,7 @@ import { RolePermission } from './role-permission.model';
 import { getPermissionArray, invalidateRoleCache } from './permission.service';
 import { User } from '../auth/auth.model';
 import { NativeCrmLog } from '../logs/native-crm-log.model';
+import { logAuditEvent } from '../logs/audit-log.model';
 
 const router = Router();
 
@@ -108,6 +109,8 @@ router.put('/:id', requirePermission('roles.edit'), async (req: AuthRequest, res
 
     const role = await Role.findOne({ _id: req.params.id, tenantId });
     if (!role) return sendError(res, 'Role not found', 404);
+    const prevName = role.name;
+    const prevDescription = role.description;
 
     if (name?.trim() && name.trim() !== role.name) {
       const exists = await Role.findOne({ tenantId, name: name.trim(), _id: { $ne: role._id } });
@@ -117,6 +120,11 @@ router.put('/:id', requirePermission('roles.edit'), async (req: AuthRequest, res
 
     if (description !== undefined) role.description = description.trim();
     await role.save();
+
+    logAuditEvent('role.updated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId, target: 'Role', targetId: role._id.toString(), detail: { before: { name: prevName, description: prevDescription }, after: { name: role.name, description: role.description } } },
+    );
 
     return sendSuccess(res, role);
   } catch (err) {
@@ -145,6 +153,11 @@ router.delete('/:id', requirePermission('roles.delete'), async (req: AuthRequest
     await invalidateRoleCache(tenantId, (role._id as mongoose.Types.ObjectId).toString());
 
     await role.deleteOne();
+
+    logAuditEvent('role.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId, target: 'Role', targetId: req.params.id, detail: { before: { name: role.name } } },
+    );
 
     return sendSuccess(res, null, 'Role deleted');
   } catch (err) {
@@ -247,6 +260,18 @@ router.put('/:id/permissions', requirePermission('roles.edit'), async (req: Auth
       url:        req.originalUrl,
       timestamp:  new Date(),
     }).catch(() => {});
+
+    logAuditEvent('role.permissions_updated',
+      { id: userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      {
+        tenantId, target: 'Role', targetId: req.params.id,
+        detail: {
+          roleId: req.params.id, roleName: role.name,
+          before: { permissions: prevPermKeys }, after: { permissions: grantedKeys },
+          changed: { added: grantedKeys.filter((k) => !prevPermKeys.includes(k)), removed: prevPermKeys.filter((k) => !grantedKeys.includes(k)) },
+        },
+      },
+    );
 
     return sendSuccess(res, { granted: newPerms.length }, 'Permissions updated');
   } catch (err) {

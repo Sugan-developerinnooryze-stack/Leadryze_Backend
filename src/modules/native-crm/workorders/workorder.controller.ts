@@ -11,6 +11,7 @@ import {
   findNearestStaff,
 } from './workorder.service';
 import { logTimeline } from '../timeline/timeline.service';
+import { logAuditEvent } from '../../logs/audit-log.model';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { uploadToS3 } from '../../../services/s3.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
@@ -44,7 +45,8 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
-    logTimeline(req.tenantId!, 'workorder', String(item._id), 'created', `Work order ${(item as any).workOrderId} created`, req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'workorder', String(item._id), 'created', `Work order ${(item as any).workOrderId} created`, req.user?.userId,
+      { status: (item as any).status, scheduledDate: (item as any).scheduledDate }).catch(() => {});
     runAutomationsOnCreate(req.tenantId!, 'workorder', item as any).catch(() => {});
     sendCreated(res, item);
   } catch (err: any) {
@@ -61,7 +63,8 @@ export async function update(req: AuthRequest, res: Response) {
     const desc   = req.body.status
       ? `Status changed to ${req.body.status}`
       : `Work order ${(item as any).workOrderId} updated`;
-    logTimeline(req.tenantId!, 'workorder', String(item._id), action as any, desc, req.user?.userId, req.body.status ? { status: req.body.status } : undefined).catch(() => {});
+    logTimeline(req.tenantId!, 'workorder', String(item._id), action as any, desc, req.user?.userId,
+      req.body.status ? { previousStatus: (prev as any)?.status, newStatus: req.body.status } : undefined).catch(() => {});
     if (req.body.status) {
       const completedKey = await getOutcomeStageKey(req.tenantId!, 'workorder', 'completed', 'completed');
       if (req.body.status === completedKey) {
@@ -80,8 +83,13 @@ export async function remove(req: AuthRequest, res: Response) {
   try {
     const item = await deleteWorkorder(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'workorders'));
     if (!item) return sendError(res, 'Work order not found', 404);
-    logTimeline(req.tenantId!, 'workorder', req.params.id, 'deleted', `Work order deleted`, req.user?.userId).catch(() => {});
+    logTimeline(req.tenantId!, 'workorder', req.params.id, 'deleted', `Work order deleted`, req.user?.userId,
+      { status: (item as any).status }).catch(() => {});
     runAutomationsOnDelete(req.tenantId!, 'workorder', item as any).catch(() => {});
+    logAuditEvent('workorder.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'WorkOrder', targetId: req.params.id, detail: { before: { status: (item as any).status } } },
+    );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);

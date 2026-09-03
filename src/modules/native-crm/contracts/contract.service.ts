@@ -7,6 +7,7 @@ import { generateVisits, computeBalance, serviceRangeSummary } from './schedule.
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -88,6 +89,7 @@ export async function createContract(data: any) {
     const src = await NativeQuotation.findOne({ quotationId: data.quotationId }).select('_id').lean();
     if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'contract', mongoId }).catch(() => {});
   }
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'contracts', doc.toObject(), (doc as any).title);
   return doc;
 }
 
@@ -126,18 +128,22 @@ export async function updateContract(id: string, tenantId: string, data: any, sc
       }
     }
   }
-  return NativeContract.findOneAndUpdate(
+  const updated = await NativeContract.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'contracts', updated.toObject(), (updated as any).title);
+  return updated;
 }
 
 export async function deleteContract(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
-  return NativeContract.findOneAndDelete(filter);
+  const deleted = await NativeContract.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'contracts', String(deleted._id));
+  return deleted;
 }
 
 /** Patch one visit in place (positional operator — never rewrites the array). */

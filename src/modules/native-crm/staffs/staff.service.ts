@@ -4,6 +4,7 @@ import { StaffListOptions } from './staff.types';
 import { ensureCredentials } from '../shared/app-credentials.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listStaffs(tenantId: string, opts: StaffListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -54,19 +55,24 @@ export async function createStaff(data: any) {
   const doc = await NativeStaff.create(data);
   // Auto-generate staff-app login credentials — never blocks/breaks creation
   await ensureCredentials(NativeStaff, doc._id, doc.tenantId, data.firstName ?? '');
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'staffs', doc.toObject(), [doc.firstName, doc.lastName].filter(Boolean).join(' '));
   return doc;
 }
 
 export async function updateStaff(id: string, tenantId: string, data: any) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeStaff.findOneAndUpdate(
+  const updated = await NativeStaff.findOneAndUpdate(
     { _id: id, tenantId: tid },
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'staffs', updated.toObject(), [updated.firstName, updated.lastName].filter(Boolean).join(' '));
+  return updated;
 }
 
 export async function deleteStaff(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeStaff.findOneAndDelete({ _id: id, tenantId: tid });
+  const deleted = await NativeStaff.findOneAndDelete({ _id: id, tenantId: tid });
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'staffs', String(deleted._id));
+  return deleted;
 }

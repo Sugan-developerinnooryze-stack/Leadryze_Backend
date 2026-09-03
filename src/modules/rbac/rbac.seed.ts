@@ -94,10 +94,17 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
     ])
   ),
 
+  // One-off Ticket SLA policy permission — the flatMap above only generates
+  // view/create/edit/delete/export, not this custom action.
+  { key: 'native_crm.tickets.manage_sla', module: 'native_crm', resource: 'tickets', action: 'manage_sla', label: 'CRM Tickets — Manage SLA Policy' },
+
   // Field Service modules
+  // 'datasets' added after dataset.routes.ts's own requirePermission()
+  // calls (fs.datasets.*) were found to reference a key that never existed
+  // here — every non-admin role was silently 403ing on the whole module.
   ...(['workorders', 'quotations', 'contracts', 'invoices', 'receipts', 'expenses',
        'customers', 'sites', 'teams', 'staffs', 'parts', 'categories', 'services',
-       'products', 'assets', 'vehicles', 'activities', 'catalog'] as const).flatMap(
+       'products', 'assets', 'vehicles', 'activities', 'catalog', 'datasets'] as const).flatMap(
     (mod) => ([
       { key: `fs.${mod}.view`,   module: 'fs', resource: mod, action: 'view',   label: `FS ${mod} — View`   },
       { key: `fs.${mod}.create`, module: 'fs', resource: mod, action: 'create', label: `FS ${mod} — Create` },
@@ -110,6 +117,68 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
   { key: 'fs.settings.edit',         module: 'fs', resource: 'settings',      action: 'edit',   label: 'FS Settings — Edit'          },
   { key: 'fs.custom_fields.view',    module: 'fs', resource: 'custom_fields', action: 'view',   label: 'FS Custom Fields — View'     },
   { key: 'fs.custom_fields.manage',  module: 'fs', resource: 'custom_fields', action: 'manage', label: 'FS Custom Fields — Manage'   },
+
+  // Custom Modules — split in two: 'definitions' is the module BUILDER
+  // (schema design — create/edit/delete a module's own fields), kept
+  // admin/manager-only like fs.custom_fields.manage above; 'records' is the
+  // actual DATA within a module (e.g. a tenant's own "Site Visit Reports"
+  // entries) — genuinely day-to-day operational data, not config, so it
+  // follows the Companies/Deals/Tickets/Calls precedent below instead.
+  { key: 'custom_modules.definitions.view',   module: 'custom_modules', resource: 'definitions', action: 'view',   label: 'Custom Modules — View Definitions'   },
+  { key: 'custom_modules.definitions.manage', module: 'custom_modules', resource: 'definitions', action: 'manage', label: 'Custom Modules — Manage Definitions' },
+  { key: 'custom_modules.records.view',       module: 'custom_modules', resource: 'records',     action: 'view',   label: 'Custom Modules — View Records'       },
+  { key: 'custom_modules.records.create',     module: 'custom_modules', resource: 'records',     action: 'create', label: 'Custom Modules — Create Records'     },
+  { key: 'custom_modules.records.edit',       module: 'custom_modules', resource: 'records',     action: 'edit',   label: 'Custom Modules — Edit Records'       },
+  { key: 'custom_modules.records.delete',     module: 'custom_modules', resource: 'records',     action: 'delete', label: 'Custom Modules — Delete Records'     },
+
+  // Automation Flows (Advanced Mode workflow builder) — deliberately its own
+  // tier rather than folded into native_crm.* or fs.*: a workflow can send
+  // messages and create/mutate records across every other module, so it's
+  // more powerful than editing a normal record and is gated more tightly
+  // (Manager+ for day-to-day authoring, Admin-only for publish/delete).
+  { key: 'automation.view',            module: 'automation', resource: 'flows',      action: 'view',            label: 'Automation — View Flows'       },
+  { key: 'automation.create',          module: 'automation', resource: 'flows',      action: 'create',          label: 'Automation — Create Flows'     },
+  { key: 'automation.edit',            module: 'automation', resource: 'flows',      action: 'edit',            label: 'Automation — Edit Flows'       },
+  { key: 'automation.delete',          module: 'automation', resource: 'flows',      action: 'delete',          label: 'Automation — Delete Flows'     },
+  { key: 'automation.publish',         module: 'automation', resource: 'flows',      action: 'publish',         label: 'Automation — Publish Flows'    },
+  { key: 'automation.execute',         module: 'automation', resource: 'flows',      action: 'execute',         label: 'Automation — Test/Execute Flows' },
+  { key: 'automation.view_executions', module: 'automation', resource: 'executions', action: 'view_executions', label: 'Automation — View Execution History' },
+  // Phase 5 emergency kill switch — tenant-wide "stop all automation right
+  // now," strictly more consequential than publish/delete (those affect one
+  // flow; this affects every flow AND every Simple Mode rule at once), so
+  // it gets the same Admin-only treatment (excluded from MANAGER_PERMISSIONS
+  // below, falls to Admin-only via the '*' wildcard) rather than Manager access.
+  { key: 'automation.manage_settings', module: 'automation', resource: 'settings',   action: 'manage',          label: 'Automation — Manage Settings (Kill Switch)' },
+
+  // Tenant-wide configuration surfaces found with ZERO requirePermission()
+  // coverage in the Phase 4 RBAC audit (any authenticated user of any role
+  // previously had full access) — admin/manager-only, same posture as
+  // fs.settings/fs.custom_fields above, since these affect every user in
+  // the tenant, not just the editor's own records.
+  { key: 'pipeline_config.view',        module: 'pipeline_config',        resource: 'stages',   action: 'view',   label: 'Pipeline Config — View'   },
+  { key: 'pipeline_config.manage',      module: 'pipeline_config',        resource: 'stages',   action: 'manage', label: 'Pipeline Config — Manage' },
+  { key: 'doc_templates.view',          module: 'doc_templates',          resource: 'templates', action: 'view',   label: 'Document Templates — View'   },
+  { key: 'doc_templates.manage',        module: 'doc_templates',          resource: 'templates', action: 'manage', label: 'Document Templates — Manage' },
+  { key: 'notification_settings.view',   module: 'notification_settings', resource: 'settings',  action: 'view',   label: 'Notification Settings — View'   },
+  { key: 'notification_settings.manage', module: 'notification_settings', resource: 'settings',  action: 'manage', label: 'Notification Settings — Manage' },
+  { key: 'form_templates.view',         module: 'form_templates',         resource: 'templates', action: 'view',   label: 'Form Templates — View'   },
+  { key: 'form_templates.manage',       module: 'form_templates',         resource: 'templates', action: 'manage', label: 'Form Templates — Manage' },
+  { key: 'workflow_templates.view',     module: 'workflow_templates',     resource: 'templates', action: 'view',   label: 'Workflow Templates — View'   },
+  { key: 'workflow_templates.manage',   module: 'workflow_templates',     resource: 'templates', action: 'manage', label: 'Workflow Templates — Manage' },
+  // Read-only, tied to records the viewer can already reasonably see
+  // elsewhere (an activity feed or timeline entry only ever surfaces on a
+  // record's own detail page) — granted broadly rather than Manager-only.
+  { key: 'activity_feed.view',          module: 'activity_feed',          resource: 'feed',      action: 'view',   label: 'Activity Feed — View' },
+  { key: 'timeline.view',               module: 'timeline',               resource: 'timeline',  action: 'view',   label: 'Timeline — View'      },
+  // Branches/Record Lock previously used a hardcoded authorize('SUPER_ADMIN',
+  // 'TENANT_ADMIN') for mutations (now requirePermission('*.manage'), same
+  // posture, not loosened) and had NO check at all on several GET routes
+  // (now '*.view', granted more broadly since the branch-filter dropdown and
+  // record-lock status banners are used tenant-wide, including by Agents).
+  { key: 'branches.view',               module: 'branches',               resource: 'branches',  action: 'view',   label: 'Branches — View'   },
+  { key: 'branches.manage',             module: 'branches',               resource: 'branches',  action: 'manage', label: 'Branches — Manage' },
+  { key: 'record_lock.view',            module: 'record_lock',            resource: 'locks',      action: 'view',   label: 'Record Lock — View'   },
+  { key: 'record_lock.manage',          module: 'record_lock',            resource: 'locks',      action: 'manage', label: 'Record Lock — Manage' },
 ];
 
 // ── Default permission sets per system role ───────────────────────────────────
@@ -124,6 +193,19 @@ const MANAGER_PERMISSIONS = [
   'connector.view', 'connector.sync',
   'native_crm.*',
   'fs.*',
+  'custom_modules.*',
+  // publish/delete deliberately excluded — Admin-only, per this section's
+  // own comment on why Automation Flows are gated tighter than a normal
+  // record: a Manager can author/test a flow but not put it live or remove
+  // one outright.
+  'automation.view', 'automation.create', 'automation.edit',
+  'automation.execute', 'automation.view_executions',
+  'pipeline_config.*', 'doc_templates.*', 'notification_settings.*',
+  'form_templates.*', 'workflow_templates.*',
+  'activity_feed.view', 'timeline.view',
+  // .manage stays out — same admin-only posture the prior authorize()
+  // hardcode already enforced for branch/lock mutations.
+  'branches.view', 'record_lock.view',
   'users.view',
   'roles.view',
   'settings.view',
@@ -162,6 +244,34 @@ const AGENT_PERMISSIONS = [
   'native_crm.deals.view',     'native_crm.deals.create',     'native_crm.deals.edit',
   'native_crm.tickets.view',   'native_crm.tickets.create',   'native_crm.tickets.edit',
   'native_crm.calls.view',     'native_crm.calls.create',     'native_crm.calls.edit',
+  // Added when Custom Module records first got a real requirePermission gate
+  // (previously wide open to any authenticated user, same starting point as
+  // Companies/Deals/Tickets/Calls above) — same view/create/edit tier, no
+  // delete, matching that exact precedent. Module BUILDING (definitions.*)
+  // deliberately stays Manager+Admin-only, same posture as fs.custom_fields.
+  'custom_modules.records.view', 'custom_modules.records.create', 'custom_modules.records.edit',
+  // Read-only and tied to whatever record the Agent is already viewing (the
+  // Activity/Timeline tabs on a Contract/Customer/Deal detail page) — not
+  // granting these would break tabs Agents already use day to day.
+  // Branches/Record Lock .view mirror the same "was unenforced, don't make
+  // it MORE restrictive than it already was" reasoning as fs.customers.view
+  // above — an Agent could already list branches / see lock status before
+  // enforcement existed.
+  'activity_feed.view', 'timeline.view', 'branches.view', 'record_lock.view',
+  // pipeline_config.view: read-only stage labels rendered on nearly every
+  // module page (Leads/Deals/Tasks/Tickets/etc, via usePipelineStages) —
+  // without it, an Agent viewing a tenant that renamed its stages would
+  // silently fall back to hardcoded default labels instead of the real
+  // configured ones. form_templates.view: needed to render the correct
+  // form when creating/editing a Custom Module record, which Agent already
+  // has data-level access to above (custom_modules.records.*).
+  'pipeline_config.view', 'form_templates.view',
+  // fs.custom_fields.view: Lead/Deal create/edit forms render tenant-defined
+  // custom fields via CustomFieldRenderer (useCustomFieldsQuery) — without
+  // this, an Agent's Lead/Deal forms would silently hide any custom field
+  // the tenant configured, even though Agent already has create/edit on
+  // both of those modules above.
+  'fs.custom_fields.view',
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────

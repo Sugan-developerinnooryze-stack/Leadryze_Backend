@@ -15,6 +15,8 @@ import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 import { resolveEffectiveScope } from '../shared/data-scope';
+import { logTimeline } from '../timeline/timeline.service';
+import { logAuditEvent } from '../../logs/audit-log.model';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -43,6 +45,8 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
+    logTimeline(req.tenantId!, 'contract', String(item._id), 'created', `Contract "${(item as any).title}" created`, req.user?.userId,
+      { status: (item as any).status, servicesAmountWithTax: (item as any).servicesAmountWithTax }).catch(() => {});
     runAutomationsOnCreate(req.tenantId!, 'contract', item as any).catch(() => {});
     sendCreated(res, item);
   } catch (err: any) {
@@ -55,6 +59,15 @@ export async function update(req: AuthRequest, res: Response) {
     const prev = await getContractById(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'contracts'));
     const item = await updateContract(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'contracts'));
     if (!item) return sendError(res, 'Contract not found', 404);
+    const statusChanged = req.body.status && prev && (prev as any).status !== req.body.status;
+    logTimeline(
+      req.tenantId!, 'contract', String(item._id), statusChanged ? 'status_changed' : 'updated',
+      statusChanged ? `Status changed to ${req.body.status}` : `Contract "${(item as any).title}" updated`,
+      req.user?.userId,
+      statusChanged
+        ? { previousStatus: (prev as any).status, newStatus: req.body.status, amount: (item as any).servicesAmountWithTax }
+        : undefined,
+    ).catch(() => {});
     if (req.body.status) {
       const activeKey = await getOutcomeStageKey(req.tenantId!, 'contract', 'active', 'active');
       if (req.body.status === activeKey) {
@@ -73,7 +86,13 @@ export async function remove(req: AuthRequest, res: Response) {
   try {
     const item = await deleteContract(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'contracts'));
     if (!item) return sendError(res, 'Contract not found', 404);
+    logTimeline(req.tenantId!, 'contract', req.params.id, 'deleted', `Contract "${(item as any).title}" deleted`, req.user?.userId,
+      { status: (item as any).status }).catch(() => {});
     runAutomationsOnDelete(req.tenantId!, 'contract', item as any).catch(() => {});
+    logAuditEvent('contract.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'Contract', targetId: req.params.id, detail: { before: { title: (item as any).title, status: (item as any).status } } },
+    );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
     sendError(res, err.message, 500);

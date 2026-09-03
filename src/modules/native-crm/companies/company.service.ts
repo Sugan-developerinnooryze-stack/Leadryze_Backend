@@ -4,6 +4,7 @@ import { CreateCompanyDTO, UpdateCompanyDTO } from './company.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 export async function listCompanies(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status } = opts;
@@ -31,14 +32,18 @@ export async function getCompanyById(tenantId: string, id: string, scope?: DataS
 
 export async function createCompany(tenantId: string, dto: CreateCompanyDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Company.create({ tenantId: tid, ...dto });
+  const created = await Company.create({ tenantId: tid, ...dto });
+  indexNativeSearchRecord(tenantId, 'native', 'companies', created.toObject(), created.name);
+  return created;
 }
 
 export async function updateCompany(tenantId: string, id: string, dto: UpdateCompanyDTO, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return Company.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  const updated = await Company.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'companies', updated, updated.name);
+  return updated;
 }
 
 export async function deleteCompany(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
@@ -46,6 +51,7 @@ export async function deleteCompany(tenantId: string, id: string, scope?: DataSc
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const res = await Company.findOneAndDelete(filter);
+  if (res) removeNativeSearchRecord(tenantId, 'native', 'companies', String(res._id));
   return !!res;
 }
 

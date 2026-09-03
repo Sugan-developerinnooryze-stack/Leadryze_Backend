@@ -8,6 +8,7 @@ import { NativeContract }  from '../contracts/contract.model';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -70,6 +71,7 @@ export async function createInvoice(data: any) {
     const src = await NativeContract.findOne({ contractId: data.contractId }).select('_id').lean();
     if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'invoice', mongoId }).catch(() => {});
   }
+  indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'invoices', doc.toObject(), (doc as any).invoiceId);
   return doc;
 }
 
@@ -91,16 +93,20 @@ export async function updateInvoice(id: string, tenantId: string, data: any, sco
     data.servicesAmount        = after;
     data.servicesAmountWithTax = after + (after * gst) / 100;
   }
-  return NativeInvoice.findOneAndUpdate(
+  const updated = await NativeInvoice.findOneAndUpdate(
     filter,
     data,
     { new: true, runValidators: true }
   );
+  if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'invoices', updated.toObject(), (updated as any).invoiceId);
+  return updated;
 }
 
 export async function deleteInvoice(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeInvoice.findOneAndDelete(filter);
+  const deleted = await NativeInvoice.findOneAndDelete(filter);
+  if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'invoices', String(deleted._id));
+  return deleted;
 }

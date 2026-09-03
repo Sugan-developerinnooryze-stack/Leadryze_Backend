@@ -10,6 +10,7 @@ import { Role } from '../rbac/role.model';
 import { invalidateRoleCache } from '../rbac/permission.service';
 import { sendEmailNow } from '../messages/brevo.service';
 import { config } from '../../config';
+import { logAuditEvent } from '../logs/audit-log.model';
 
 const router = Router();
 
@@ -162,8 +163,11 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
     if (typeof isActive === 'boolean') user.isActive = isActive;
 
     // Reassign role — invalidate old role cache before switching
+    let oldRoleIdForAudit: string | undefined;
+    let roleChanged = false;
     if (roleId !== undefined) {
       const oldRoleId = user.roleId?.toString();
+      oldRoleIdForAudit = oldRoleId;
 
       if (roleId === null || roleId === '') {
         user.roleId = null;
@@ -173,10 +177,18 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
         user.roleId = roleDoc._id as mongoose.Types.ObjectId;
       }
 
+      roleChanged = (oldRoleId ?? '') !== (user.roleId?.toString() ?? '');
       if (oldRoleId) await invalidateRoleCache(tenantId, oldRoleId);
     }
 
     await user.save();
+
+    if (roleChanged) {
+      logAuditEvent('user.role_reassigned',
+        { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+        { tenantId, target: 'User', targetId: user._id.toString(), detail: { userEmail: user.email, before: { roleId: oldRoleIdForAudit ?? null }, after: { roleId: user.roleId?.toString() ?? null } } },
+      );
+    }
 
     const userObj = user.toObject() as unknown as Record<string, unknown>;
     delete userObj.password;

@@ -18,6 +18,19 @@ export interface ITargetFieldDef {
    * own currently-configured stages (native-crm/pipeline-config), since
    * those can't be hand-authored here the way a fixed enum can. */
   isStageField?: boolean;
+  /** True for the one field per module that is the module's real
+   * owner/assignee FK (a NativeStaff.staffId reference) — drives the
+   * Assign Record action's staff-picker. Distinct from a cosmetic
+   * free-text "owner" field where one happens to exist (e.g. Lead's own
+   * `leadOwner` text field, left un-flagged, untouched) — this must be the
+   * real, queryable assignment field the rest of the app's own
+   * scope/recipient resolution already treats as canonical (see
+   * resolveAutomationRecipient's 'assigned_user' strategy). Absent for a
+   * module with no assignee concept at all (Ticket/Quotation/Invoice) —
+   * Assign Record has nothing to offer there, computed dynamically from
+   * whether this flag appears anywhere in the module's catalog, never
+   * hardcoded per-module in the UI. */
+  isAssigneeField?: boolean;
 }
 
 /**
@@ -53,10 +66,14 @@ export const BUILT_IN_TARGET_FIELDS: Record<BuiltInPipelineModule, ITargetFieldD
       { value: 'api', label: 'API' }, { value: 'referral', label: 'Referral' }, { value: 'other', label: 'Other' },
     ] },
     { key: 'status',         label: 'Status',           type: 'select', isStageField: true },
+    { key: 'rating',         label: 'Rating',           type: 'select', options: [
+      { value: 'hot', label: 'Hot' }, { value: 'warm', label: 'Warm' }, { value: 'cold', label: 'Cold' },
+    ] },
     { key: 'city',           label: 'City',             type: 'text' },
     { key: 'state',          label: 'State',            type: 'text' },
     { key: 'country',        label: 'Country',          type: 'text' },
     { key: 'leadOwner',      label: 'Owner',            type: 'text' },
+    { key: 'leadOwnerStaffId', label: 'Owner (Staff)',  type: 'text', isAssigneeField: true },
     { key: 'expectedRevenue',label: 'Expected Revenue', type: 'number' },
     { key: 'notes',          label: 'Notes',            type: 'text' },
   ],
@@ -68,6 +85,7 @@ export const BUILT_IN_TARGET_FIELDS: Record<BuiltInPipelineModule, ITargetFieldD
     { key: 'closeDate',    label: 'Close Date', type: 'date' },
     { key: 'contactName',  label: 'Contact',    type: 'text' },
     { key: 'companyName',  label: 'Company',    type: 'text' },
+    { key: 'assignedStaffId', label: 'Assigned Staff', type: 'text', isAssigneeField: true },
     { key: 'notes',        label: 'Notes',      type: 'text' },
   ],
   task: [
@@ -77,7 +95,7 @@ export const BUILT_IN_TARGET_FIELDS: Record<BuiltInPipelineModule, ITargetFieldD
       { value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' },
     ] },
     { key: 'taskStatus',   label: 'Status',       type: 'select', isStageField: true },
-    { key: 'assignedTo',   label: 'Assigned To',  type: 'text' },
+    { key: 'assignedTo',   label: 'Assigned To',  type: 'text', isAssigneeField: true },
     { key: 'notes',        label: 'Notes',        type: 'text' },
   ],
   ticket: [
@@ -109,7 +127,7 @@ export const BUILT_IN_TARGET_FIELDS: Record<BuiltInPipelineModule, ITargetFieldD
     { key: 'contractId',         label: 'Contract',      type: 'text' },
     { key: 'siteId',             label: 'Site',          type: 'text' },
     { key: 'teamId',             label: 'Team',          type: 'text' },
-    { key: 'staffId',            label: 'Staff',         type: 'text' },
+    { key: 'staffId',            label: 'Staff',         type: 'text', isAssigneeField: true },
     { key: 'title',              label: 'Title',         type: 'text' },
     { key: 'scheduledDate',      label: 'Scheduled Date',type: 'date' },
     { key: 'durationHours',      label: 'Duration (hrs)',type: 'number' },
@@ -127,7 +145,7 @@ export const BUILT_IN_TARGET_FIELDS: Record<BuiltInPipelineModule, ITargetFieldD
     { key: 'quotationId',        label: 'Quotation',     type: 'text' },
     { key: 'title',              label: 'Title',         type: 'text' },
     { key: 'siteId',             label: 'Site',          type: 'text' },
-    { key: 'staffId',            label: 'Staff',         type: 'text' },
+    { key: 'staffId',            label: 'Staff',         type: 'text', isAssigneeField: true },
     { key: 'teamId',             label: 'Team',          type: 'text' },
     { key: 'startDate',          label: 'Start Date',    type: 'date' },
     { key: 'endDate',            label: 'End Date',      type: 'date' },

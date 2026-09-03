@@ -1,7 +1,11 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../utils/response';
-import { listFlows, getFlowById, createFlow, updateFlow, deleteFlow, listFlowRuns, getFlowRunById, decideApproval } from './automation-flow.service';
+import {
+  listFlows, getFlowById, createFlow, updateFlow, deleteFlow, listFlowRuns, getFlowRunById, getFlowRunStats, decideApproval,
+  publishFlow, discardDraft, dryRunFlow,
+} from './automation-flow.service';
+import { logAuditEvent } from '../../logs/audit-log.model';
 
 // Everyone Error Branch's own 'tenant_admin' recipient already covers, PLUS
 // 'manager' — a Manager deciding their own Approval gate is the whole point
@@ -41,6 +45,12 @@ export async function update(req: AuthRequest, res: Response) {
   try {
     const item = await updateFlow(req.tenantId!, req.params.id, req.body);
     if (!item) return sendError(res, 'Automation flow not found', 404);
+    if (req.body.enabled !== undefined) {
+      logAuditEvent(req.body.enabled ? 'workflow.enabled' : 'workflow.disabled',
+        { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+        { tenantId: req.tenantId!, target: 'AutomationFlow', targetId: req.params.id, detail: { flowId: req.params.id, flowName: (item as any).name } },
+      );
+    }
     sendSuccess(res, item);
   } catch (err: any) {
     sendError(res, err.message, 400);
@@ -73,6 +83,15 @@ export async function listRuns(req: AuthRequest, res: Response) {
   }
 }
 
+export async function getStats(req: AuthRequest, res: Response) {
+  try {
+    const stats = await getFlowRunStats(req.tenantId!);
+    sendSuccess(res, stats);
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
 export async function getOneRun(req: AuthRequest, res: Response) {
   try {
     const item = await getFlowRunById(req.tenantId!, req.params.id);
@@ -80,6 +99,43 @@ export async function getOneRun(req: AuthRequest, res: Response) {
     sendSuccess(res, item);
   } catch (err: any) {
     sendError(res, err.message, 500);
+  }
+}
+
+export async function publish(req: AuthRequest, res: Response) {
+  try {
+    const item = await publishFlow(req.tenantId!, req.params.id);
+    if (!item) return sendError(res, 'Automation flow not found', 404);
+    logAuditEvent('workflow.published',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'AutomationFlow', targetId: req.params.id, detail: { flowId: req.params.id, flowName: (item as any).name, after: { version: (item as any).version } } },
+    );
+    sendSuccess(res, item, 'Flow published');
+  } catch (err: any) {
+    sendError(res, err.message, 400);
+  }
+}
+
+export async function discardDraftHandler(req: AuthRequest, res: Response) {
+  try {
+    const item = await discardDraft(req.tenantId!, req.params.id);
+    if (!item) return sendError(res, 'Automation flow not found', 404);
+    logAuditEvent('workflow.draft_discarded',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId: req.tenantId!, target: 'AutomationFlow', targetId: req.params.id, detail: { flowId: req.params.id, flowName: (item as any).name } },
+    );
+    sendSuccess(res, item, 'Draft discarded');
+  } catch (err: any) {
+    sendError(res, err.message, 400);
+  }
+}
+
+export async function dryRun(req: AuthRequest, res: Response) {
+  try {
+    const result = await dryRunFlow(req.tenantId!, req.params.id, req.body.sampleModule, req.body.sampleRecordId);
+    sendSuccess(res, result);
+  } catch (err: any) {
+    sendError(res, err.message, 400);
   }
 }
 

@@ -3,7 +3,7 @@ import { Template, ITemplate } from './template.model';
 import { parsePagination, buildSkip } from '../../utils/pagination';
 
 function extractVariables(body: string): string[] {
-  const matches = body.match(/\{\{(\w+)\}\}/g) || [];
+  const matches = body.match(/\{\{([\w.]+)\}\}/g) || [];
   return [...new Set(matches.map((m) => m.replace(/\{\{|\}\}/g, '')))];
 }
 
@@ -50,7 +50,7 @@ export async function deleteTemplate(tenantId: string, id: string): Promise<void
 // template), which is why this checks `key in variables` rather than
 // truthiness.
 export function renderTemplate(body: string, variables: Record<string, string>): string {
-  return body.replace(/\{\{(\w+)\}\}/g, (match, key) => (key in variables ? variables[key] : match));
+  return body.replace(/\{\{([\w.]+)\}\}/g, (match, key) => (key in variables ? variables[key] : match));
 }
 
 const DEFAULT_TEMPLATES: Array<{

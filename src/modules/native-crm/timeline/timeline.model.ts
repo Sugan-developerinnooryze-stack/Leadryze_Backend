@@ -6,7 +6,7 @@ export interface ITimelineDoc extends Document {
   clientId?:    string;
   entityModule: string;
   entityId:     string;
-  action:       'created' | 'updated' | 'deleted' | 'status_changed' | 'note_added' | 'assigned' | 'reassigned' | 'converted' | 'uploaded' | 'locked' | 'unlocked';
+  action:       'created' | 'updated' | 'deleted' | 'status_changed' | 'stage_changed' | 'note_added' | 'assigned' | 'reassigned' | 'converted' | 'uploaded' | 'locked' | 'unlocked';
   description:  string;
   performedBy?: string;
   metadata?:    Record<string, any>;
@@ -19,7 +19,7 @@ const schema = new Schema<ITimelineDoc>(
     clientId:     { type: String, index: true },
     entityModule: { type: String, required: true },
     entityId:     { type: String, required: true },
-    action:       { type: String, enum: ['created','updated','deleted','status_changed','note_added','assigned','reassigned','converted','uploaded','locked','unlocked'], required: true },
+    action:       { type: String, enum: ['created','updated','deleted','status_changed','stage_changed','note_added','assigned','reassigned','converted','uploaded','locked','unlocked'], required: true },
     description:  { type: String, required: true },
     performedBy:  { type: String },
     metadata:     { type: Schema.Types.Mixed },

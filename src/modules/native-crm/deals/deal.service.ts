@@ -5,6 +5,10 @@ import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { customFieldsSearchExpr } from '../shared/custom-field-query';
+import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
+import { IFlowCondition } from '../automation-rules/automation-rule.model';
 
 async function assertValidStage(tenantId: string, stage: string | undefined): Promise<void> {
   if (!stage) return;
@@ -14,7 +18,7 @@ async function assertValidStage(tenantId: string, stage: string | undefined): Pr
 }
 
 export async function listDeals(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status } = opts;
+  const { page = 1, limit = 20, search, status, sortBy, sortDir, customFieldFilters } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
@@ -22,10 +26,18 @@ export async function listDeals(tenantId: string, opts: ListOptions = {}, branch
   if (status) filter.stage = status;
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-    filter.$or = [{ title: re }, { contactName: re }, { companyName: re }];
+    filter.$or = [{ title: re }, { contactName: re }, { companyName: re }, customFieldsSearchExpr(search)];
   }
+  if (customFieldFilters) {
+    try {
+      const conditions: IFlowCondition[] = JSON.parse(customFieldFilters);
+      const cfFilter = conditionsToMongoFilter(conditions);
+      if (Object.keys(cfFilter).length > 0) filter.$and = [...((filter.$and as any[]) ?? []), cfFilter];
+    } catch { /* malformed filter payload from the client — ignored, not a 500 */ }
+  }
+  const sort: Record<string, 1 | -1> = sortBy ? { [sortBy]: sortDir === 'asc' ? 1 : -1 } : { createdAt: -1 };
   const [items, total] = await Promise.all([
-    Deal.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Deal.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
     Deal.countDocuments(filter),
   ]);
   return { items, total, page, pages: Math.ceil(total / limit) };
@@ -41,7 +53,9 @@ export async function getDealById(tenantId: string, id: string, scope?: DataScop
 export async function createDeal(tenantId: string, dto: CreateDealDTO) {
   await assertValidStage(tenantId, dto.stage);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return Deal.create({ tenantId: tid, ...dto });
+  const created = await Deal.create({ tenantId: tid, ...dto });
+  indexNativeSearchRecord(tenantId, 'native', 'deals', created.toObject(), created.title);
+  return created;
 }
 
 export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDTO, scope?: DataScope) {
@@ -49,14 +63,18 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
-  return Deal.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  const updated = await Deal.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  if (updated) indexNativeSearchRecord(tenantId, 'native', 'deals', updated, updated.title);
+  return updated;
 }
 
 export async function deleteDeal(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
-  return Deal.findOneAndDelete(filter).lean();
+  const deleted = await Deal.findOneAndDelete(filter).lean();
+  if (deleted) removeNativeSearchRecord(tenantId, 'native', 'deals', String(deleted._id));
+  return deleted;
 }
 
 export async function getDealStats(tenantId: string, scope?: DataScope) {

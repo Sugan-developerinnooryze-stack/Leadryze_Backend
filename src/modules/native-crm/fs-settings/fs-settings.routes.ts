@@ -1,13 +1,14 @@
 import { Router } from 'express';
 import { upload } from '../../../middlewares/upload.middleware';
 import * as ctrl from './fs-settings.controller';
+import { requirePermission } from '../../../middlewares/auth.middleware';
 
 const router = Router();
 
-router.get('/',                      ctrl.get);
-router.put('/',                      ctrl.upsert);
-router.post('/upload',               upload.single('file'), ctrl.uploadFile);
-router.get('/template-preferences',  ctrl.getTemplatePreferences);
-router.put('/template-preferences',  ctrl.setTemplatePreferences);
+router.get('/',                      requirePermission('fs.settings.view'), ctrl.get);
+router.put('/',                      requirePermission('fs.settings.edit'), ctrl.upsert);
+router.post('/upload',               requirePermission('fs.settings.edit'), upload.single('file'), ctrl.uploadFile);
+router.get('/template-preferences',  requirePermission('fs.settings.view'), ctrl.getTemplatePreferences);
+router.put('/template-preferences',  requirePermission('fs.settings.edit'), ctrl.setTemplatePreferences);
 
 export default router;

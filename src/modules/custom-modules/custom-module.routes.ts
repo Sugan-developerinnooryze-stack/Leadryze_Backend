@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
@@ -23,7 +23,7 @@ router.use(authenticate, requireTenant);
 /* ── Module Definition CRUD ───────────────────────────────────────────────── */
 
 // GET /api/v1/custom-modules
-router.get('/', async (req: AuthRequest, res: Response) => {
+router.get('/', requirePermission('custom_modules.definitions.view'), async (req: AuthRequest, res: Response) => {
   try {
     const mods = await listCustomModules(req.tenantId!);
     sendSuccess(res, mods);
@@ -33,7 +33,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
 });
 
 // POST /api/v1/custom-modules
-router.post('/', async (req: AuthRequest, res: Response) => {
+router.post('/', requirePermission('custom_modules.definitions.manage'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.body.name) { sendError(res, 'name is required', 400); return; }
     const mod = await createCustomModule(req.tenantId!, req.body);
@@ -44,7 +44,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
 });
 
 // GET /api/v1/custom-modules/by-slug/:slug  (before /:id to avoid collision)
-router.get('/by-slug/:slug', async (req: AuthRequest, res: Response) => {
+router.get('/by-slug/:slug', requirePermission('custom_modules.definitions.view'), async (req: AuthRequest, res: Response) => {
   try {
     const mod = await getCustomModuleBySlug(req.tenantId!, req.params.slug);
     if (!mod) { sendError(res, 'Module not found', 404); return; }
@@ -55,7 +55,7 @@ router.get('/by-slug/:slug', async (req: AuthRequest, res: Response) => {
 });
 
 // GET /api/v1/custom-modules/:id
-router.get('/:id', async (req: AuthRequest, res: Response) => {
+router.get('/:id', requirePermission('custom_modules.definitions.view'), async (req: AuthRequest, res: Response) => {
   try {
     const mod = await getCustomModuleById(req.tenantId!, req.params.id);
     if (!mod) { sendError(res, 'Module not found', 404); return; }
@@ -66,7 +66,7 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
 });
 
 // PUT /api/v1/custom-modules/:id
-router.put('/:id', async (req: AuthRequest, res: Response) => {
+router.put('/:id', requirePermission('custom_modules.definitions.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const mod = await updateCustomModule(req.tenantId!, req.params.id, req.body);
     if (!mod) { sendError(res, 'Module not found', 404); return; }
@@ -77,7 +77,7 @@ router.put('/:id', async (req: AuthRequest, res: Response) => {
 });
 
 // DELETE /api/v1/custom-modules/:id
-router.delete('/:id', async (req: AuthRequest, res: Response) => {
+router.delete('/:id', requirePermission('custom_modules.definitions.manage'), async (req: AuthRequest, res: Response) => {
   try {
     const ok = await deleteCustomModule(req.tenantId!, req.params.id);
     if (!ok) { sendError(res, 'Module not found', 404); return; }
@@ -90,7 +90,7 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
 /* ── Record CRUD (per module slug) ───────────────────────────────────────── */
 
 // GET /api/v1/custom-modules/:slug/records
-router.get('/:slug/records', async (req: AuthRequest, res: Response) => {
+router.get('/:slug/records', requirePermission('custom_modules.records.view'), async (req: AuthRequest, res: Response) => {
   try {
     const page   = Math.max(1, parseInt(String(req.query.page  || '1')));
     const limit  = Math.min(100, parseInt(String(req.query.limit || '20')));
@@ -103,7 +103,7 @@ router.get('/:slug/records', async (req: AuthRequest, res: Response) => {
 });
 
 // POST /api/v1/custom-modules/:slug/records
-router.post('/:slug/records', async (req: AuthRequest, res: Response) => {
+router.post('/:slug/records', requirePermission('custom_modules.records.create'), async (req: AuthRequest, res: Response) => {
   try {
     const rec = await createCustomRecord(req.tenantId!, req.params.slug, req.body, req.user?.userId);
     res.status(201).json({ success: true, data: rec });
@@ -113,7 +113,7 @@ router.post('/:slug/records', async (req: AuthRequest, res: Response) => {
 });
 
 // GET /api/v1/custom-modules/:slug/records/:id
-router.get('/:slug/records/:id', async (req: AuthRequest, res: Response) => {
+router.get('/:slug/records/:id', requirePermission('custom_modules.records.view'), async (req: AuthRequest, res: Response) => {
   try {
     const rec = await getCustomRecord(req.tenantId!, req.params.slug, req.params.id);
     if (!rec) { sendError(res, 'Record not found', 404); return; }
@@ -124,7 +124,7 @@ router.get('/:slug/records/:id', async (req: AuthRequest, res: Response) => {
 });
 
 // PUT /api/v1/custom-modules/:slug/records/:id
-router.put('/:slug/records/:id', async (req: AuthRequest, res: Response) => {
+router.put('/:slug/records/:id', requirePermission('custom_modules.records.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const rec = await updateCustomRecord(req.tenantId!, req.params.slug, req.params.id, req.body);
     if (!rec) { sendError(res, 'Record not found', 404); return; }
@@ -135,7 +135,7 @@ router.put('/:slug/records/:id', async (req: AuthRequest, res: Response) => {
 });
 
 // DELETE /api/v1/custom-modules/:slug/records/:id
-router.delete('/:slug/records/:id', async (req: AuthRequest, res: Response) => {
+router.delete('/:slug/records/:id', requirePermission('custom_modules.records.delete'), async (req: AuthRequest, res: Response) => {
   try {
     const ok = await deleteCustomRecord(req.tenantId!, req.params.slug, req.params.id);
     if (!ok) { sendError(res, 'Record not found', 404); return; }
