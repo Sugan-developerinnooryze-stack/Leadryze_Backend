@@ -1,6 +1,7 @@
 import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { config } from '../config';
+import { logger } from '../utils/logger';
 
 export const s3Client = new S3Client({
   endpoint:        config.s3.endpoint,
@@ -63,8 +64,27 @@ export async function uploadToS3(params: {
     },
   });
 
-  await upload.done();
+  try {
+    await upload.done();
+  } catch (err) {
+    throw toStorageError(err, 'upload');
+  }
   return buildPublicUrl(key);
+}
+
+/**
+ * The S3 client talks to Supabase Storage, whose own errors (e.g. its
+ * backing Postgres being unreachable — "DatabaseTimeout", HTTP 544) read as
+ * if OUR database failed, which is misleading since this app's own MongoDB
+ * is unrelated. Re-attribute any storage-layer failure to "file storage"
+ * with a 502 (upstream dependency unavailable) so it's never confused with
+ * a MongoDB outage, while still logging the real error for diagnostics.
+ */
+function toStorageError(err: unknown, action: 'upload' | 'delete'): Error & { statusCode: number } {
+  logger.error(`S3-compatible storage ${action} failed`, { error: err instanceof Error ? err.message : err });
+  const wrapped = new Error('Could not reach file storage — please try again in a moment.') as Error & { statusCode: number };
+  wrapped.statusCode = 502;
+  return wrapped;
 }
 
 /**
@@ -72,9 +92,13 @@ export async function uploadToS3(params: {
  * Pass the key extracted from the stored URL, not the full URL.
  */
 export async function deleteFromS3(key: string): Promise<void> {
-  await s3Client.send(
-    new DeleteObjectCommand({ Bucket: config.s3.bucket, Key: key })
-  );
+  try {
+    await s3Client.send(
+      new DeleteObjectCommand({ Bucket: config.s3.bucket, Key: key })
+    );
+  } catch (err) {
+    throw toStorageError(err, 'delete');
+  }
 }
 
 /**
