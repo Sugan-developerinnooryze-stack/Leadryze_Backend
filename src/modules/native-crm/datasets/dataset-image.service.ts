@@ -36,6 +36,22 @@ export function normalizeImageFilename(name: string): string {
   return name.trim().toLowerCase().normalize('NFC');
 }
 
+/** ZIP entry paths are untrusted, author-supplied strings whose separator
+ * depends on whatever tool built the ZIP, not on the OS this server happens
+ * to run on. Windows' own built-in zip tools (Explorer's "Compress to ZIP
+ * file", PowerShell's Compress-Archive) both store entries with backslash
+ * separators (e.g. "product_image\photo.jpg") despite the ZIP spec calling
+ * for forward slashes — confirmed directly against Compress-Archive's own
+ * output. Node's `path.basename()` is OS-dependent: it strips backslashes
+ * on Windows but NOT on Linux/Mac, where production actually runs — so a
+ * ZIP built by zipping a folder in Windows Explorer would silently fail to
+ * match ANY of its images once deployed, with no indication why. Normalize
+ * both separators to "/" first so basename extraction is correct regardless
+ * of which OS built the ZIP or which OS is running this code. */
+function crossPlatformBasename(entryName: string): string {
+  return path.posix.basename(entryName.replace(/\\/g, '/'));
+}
+
 interface SafeZipEntry {
   buffer: Buffer;
 }
@@ -85,7 +101,7 @@ export function openImageZipSafely(zipPath: string): {
       // normal missing/invalid accounting in processDatasetImages().
       continue;
     }
-    const base = normalizeImageFilename(path.basename(entryName));
+    const base = normalizeImageFilename(crossPlatformBasename(entryName));
     const list = pathsByBasename.get(base) ?? [];
     list.push(entryName);
     pathsByBasename.set(base, list);
