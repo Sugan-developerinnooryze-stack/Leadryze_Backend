@@ -123,7 +123,7 @@ function toResult(rec: any, datasetName: string): DatasetQueryResult {
  */
 export async function executeDatasetQuery(
   tenantId: string, datasetId: string, plan: QueryPlan,
-): Promise<{ results: DatasetQueryResult[]; count?: number; datasetName: string } | null> {
+): Promise<{ results: DatasetQueryResult[]; count?: number; datasetName: string; degraded?: boolean } | null> {
   const dataset = await Dataset.findOne({ _id: datasetId, tenantId, availableToChatbot: true }).lean();
   if (!dataset || !dataset.activeVersion) return null;
 
@@ -144,6 +144,19 @@ export async function executeDatasetQuery(
   if (plan.intent === 'semantic' || plan.intent === 'hybrid') {
     const semanticQuery = plan.semanticQuery ?? '';
     let semanticRecordIds: string[] = [];
+    // Real, confirmed live bug this closes: a semantic-search call that
+    // genuinely THREW (Voyage rate-limited, AI service unreachable, etc.)
+    // was silently treated identically to "the search ran and confirmed
+    // zero matches" — semanticRecordIds just stayed [], producing an
+    // honest-looking empty result for a dataset that may have plenty of
+    // real matching records. response-confidence.ts then correctly (by ITS
+    // own logic) downgrades an empty/no-data tool result to the
+    // low-confidence handoff message — so a transient embedding-provider
+    // hiccup was surfacing to a real visitor as "I don't have a confident
+    // answer," even though 18 real products existed the whole time. This
+    // flag lets the two failure modes be told apart and handled
+    // differently below.
+    let semanticSearchFailed = false;
     if (semanticQuery) {
       try {
         const res = await axios.post(
@@ -154,10 +167,20 @@ export async function executeDatasetQuery(
         semanticRecordIds = (res.data?.data?.results ?? []).map((r: any) => r.recordId);
       } catch (err) {
         logger.warn('Dataset semantic search call failed', { tenantId, datasetId, error: (err as Error).message });
+        semanticSearchFailed = true;
       }
     }
 
     if (plan.intent === 'semantic') {
+      if (semanticSearchFailed) {
+        // Degrade to a plain, unranked listing from this dataset rather
+        // than reporting zero results — not as precisely matched as a real
+        // semantic search would give, but a visitor seeing SOME real,
+        // honestly-labeled products beats a false "nothing found" leading
+        // straight to a human handoff.
+        const records = await DatasetRecord.find(baseFilter).limit(SEMANTIC_LIMIT).lean();
+        return { results: records.map((r) => toResult(r, dataset.name)), datasetName: dataset.name, degraded: true };
+      }
       const records = await DatasetRecord.find({ ...baseFilter, recordId: { $in: semanticRecordIds } }).limit(SEMANTIC_LIMIT).lean();
       // Preserve Qdrant's own relevance order — Mongo's $in doesn't.
       const byId = new Map(records.map((r) => [r.recordId, r]));
@@ -165,10 +188,16 @@ export async function executeDatasetQuery(
       return { results: ordered.map((r) => toResult(r, dataset.name)), datasetName: dataset.name };
     }
 
-    // hybrid — intersect the structured filter with the semantic candidate set.
-    const structuredFilter = { ...baseFilter, ...planToMongoFilter(plan.filters, validFields), recordId: { $in: semanticRecordIds } };
+    // hybrid — intersect the structured filter with the semantic candidate
+    // set, UNLESS semantic search itself failed, in which case that
+    // intersection would just be `recordId: {$in: []}` (matches nothing) —
+    // fall back to the structured filter alone instead, same reasoning as
+    // the pure-semantic branch above.
+    const structuredFilter = semanticSearchFailed
+      ? { ...baseFilter, ...planToMongoFilter(plan.filters, validFields) }
+      : { ...baseFilter, ...planToMongoFilter(plan.filters, validFields), recordId: { $in: semanticRecordIds } };
     const records = await DatasetRecord.find(structuredFilter).limit(STRUCTURED_LIMIT).lean();
-    return { results: records.map((r) => toResult(r, dataset.name)), datasetName: dataset.name };
+    return { results: records.map((r) => toResult(r, dataset.name)), datasetName: dataset.name, degraded: semanticSearchFailed };
   }
 
   // exact | filter
