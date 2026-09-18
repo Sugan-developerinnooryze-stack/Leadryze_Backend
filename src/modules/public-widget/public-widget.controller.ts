@@ -79,6 +79,52 @@ export async function getConfig(req: Request, res: Response): Promise<void> {
   });
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** True only for "nothing answered at all" / upstream-server-error failures
+ * — a cold Render instance fails FAST this way (connection refused, no
+ * `response` object at all) rather than hanging until the 100s timeout, since
+ * there's nothing listening yet to even accept the connection. Deliberately
+ * excludes any real 4xx from the AI service itself (bad input, moderation
+ * rejection, etc.) — retrying those would be pointless and could mask a
+ * genuine client-side problem behind a slow, misleading multi-attempt delay. */
+function isRetryableInfraFailure(err: unknown): boolean {
+  const response = (err as { response?: { status?: number } })?.response;
+  return !response || (response.status !== undefined && response.status >= 500);
+}
+
+/** Confirmed, repeated real-world pattern (this exact failure diagnosed live
+ * multiple times, both text and voice go through the same AI service):
+ * Render's free/hobby tier goes to sleep after ~15 minutes idle, and the
+ * very next request fails fast with a connection-level error while Render
+ * cold-boots the instance — a second or third attempt 15-20s later
+ * typically succeeds once the boot finishes. A scheduled keep-alive ping
+ * (scheduler.service.ts) now also fights this at the source, but neither
+ * that nor this retry can offer a hard guarantee on shared/sleeping
+ * infrastructure — only a paid always-on tier does. This is strictly a
+ * second layer: absorb a cold start INSIDE the "thinking…" wait the widget
+ * already shows, so a visitor only ever sees the graceful "temporarily
+ * unavailable" message after every reasonable attempt has genuinely
+ * failed, not on the very first one. Shared by postChat/postVoiceChat —
+ * `requestFn` carries whatever differs (JSON body vs multipart form). */
+async function postToAiWithRetry<T>(requestFn: () => Promise<T>, logLabel: string): Promise<T> {
+  const delaysMs = [15000, 20000]; // total added worst-case wait: ~35s across 2 retries, beyond the first attempt
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
+    try {
+      return await requestFn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === delaysMs.length || !isRetryableInfraFailure(err)) throw err;
+      logger.warn(`${logLabel} hit an infra-level failure — retrying (likely AI service cold start)`, {
+        attempt: attempt + 1, error: (err as Error).message,
+      });
+      await sleep(delaysMs[attempt]);
+    }
+  }
+  throw lastErr; // unreachable — satisfies TS control-flow analysis
+}
+
 export async function postChat(req: Request, res: Response): Promise<void> {
   const widgetKey = req.query.widgetKey as string;
   const tenant = await resolveTenantByWidgetKey(widgetKey);
@@ -95,7 +141,7 @@ export async function postChat(req: Request, res: Response): Promise<void> {
     // (staff-authenticated) proxy. The public browser never sees this key
     // or talks to the AI service directly (see the plan's own "why the
     // browser must never call the AI service directly" section).
-    const response = await axios.post(
+    const response = await postToAiWithRetry(() => axios.post(
       `${AI_URL}/api/chat`,
       {
         tenantId: String(tenant._id),
@@ -112,7 +158,7 @@ export async function postChat(req: Request, res: Response): Promise<void> {
       // needing a primary+fallback retry) legitimately needs more room than a
       // single plain completion did when 70s was chosen.
       { headers: aiHeaders, timeout: 100000 },
-    );
+    ), 'Widget chat proxy');
     sendSuccess(res, response.data.data, 'AI response generated');
   } catch (err) {
     // Deliberately generic — this route is reachable from arbitrary public
@@ -161,9 +207,10 @@ export async function postVoiceChat(req: Request, res: Response): Promise<void> 
     if (voice.voiceName) form.append('voiceName', voice.voiceName);
     if (durationSeconds) form.append('durationSeconds', durationSeconds);
 
-    const response = await axios.post(`${AI_URL}/api/voice/chat`, form, {
-      headers: aiHeaders, timeout: 100000,
-    });
+    const response = await postToAiWithRetry(
+      () => axios.post(`${AI_URL}/api/voice/chat`, form, { headers: aiHeaders, timeout: 100000 }),
+      'Widget voice-chat proxy',
+    );
     sendSuccess(res, response.data.data, 'Voice response generated');
   } catch (err) {
     logger.error('Widget voice-chat proxy to AI service failed', { tenantId: String(tenant._id), error: (err as Error).message });
