@@ -1,5 +1,7 @@
 import cron from 'node-cron';
+import axios from 'axios';
 import { logger } from '../../utils/logger';
+import { config } from '../../config';
 import { runContractScheduler } from '../native-crm/contracts/contract.scheduler';
 import { pollPausedFlows, pollScheduledFlows } from '../native-crm/automation-flows/automation-flow.service';
 import { pollScheduledRules } from '../native-crm/automation-rules/automation-rule.service';
@@ -433,7 +435,26 @@ function initCronJobs(): void {
     await recoverStuckImports().catch((err) => logger.error('recoverStuckImports crashed', { error: (err as Error).message }));
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min)');
+  // AI service keep-alive — Render's free/hobby tier spins a service down
+  // after ~15 minutes with no incoming requests, and the next real request
+  // (a visitor's chat message) then pays a 30-60+ second cold-boot tax,
+  // which surfaced today as the widget's "temporarily unavailable" 502 —
+  // confirmed directly (the AI service was unreachable for 25s+ on the
+  // first two health-check attempts, only responding on a third, longer
+  // attempt). A no-op locally (AI_SERVICE_URL defaults to localhost, which
+  // is always "warm" — this cron only matters where the URL is a real
+  // Render deployment). 10-minute cadence stays comfortably ahead of the
+  // ~15-minute sleep threshold; best-effort only (a single missed ping
+  // doesn't matter, the next one 10 minutes later still keeps it warm) —
+  // this reduces cold starts to near-zero but does NOT eliminate them the
+  // way a paid always-on Render plan does, since a slow deploy/restart on
+  // Render's side can still coincide with a real visitor's request.
+  cron.schedule('*/10 * * * *', async () => {
+    await axios.get(`${config.app.aiServiceUrl}/health`, { timeout: 20000 })
+      .catch((err) => logger.warn('AI service keep-alive ping failed', { error: (err as Error).message }));
+  });
+
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min), AI service keep-alive (10min)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────
