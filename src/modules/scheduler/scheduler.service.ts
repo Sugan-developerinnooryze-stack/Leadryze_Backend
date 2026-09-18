@@ -13,6 +13,7 @@ import { writeLog } from '../logs/log.service';
 import { sendEmailNow, buildFollowupEmail } from '../messages/brevo.service';
 import { sendSmsNow, buildFollowupSms } from '../messages/twilio.service';
 import { cleanupOrphanedImageUploads } from '../native-crm/datasets/dataset-image.service';
+import { recoverStuckImports } from '../native-crm/datasets/dataset.service';
 import { retryFailedChatbotLeadEmails } from '../native-crm/lead-capture/chatbot-lead-email.service';
 
 // ─── BullMQ (Redis-dependent) — graceful stub when Redis unavailable ──────────
@@ -61,6 +62,19 @@ export function initQueues(): void {
 
   // Cron jobs always run regardless of Redis
   initCronJobs();
+
+  // dataset.service.ts's own recoverStuckImports() doc comment claims this
+  // runs "once on backend startup" — real bug found and fixed here: that
+  // call was never actually wired up anywhere in the codebase, so a Dataset
+  // import stuck at importing/indexing (e.g. the backend process itself
+  // died/restarted mid-pipeline) had no way to ever self-heal — it just sat
+  // there forever regardless of how long you waited, until someone noticed
+  // and manually re-ran the import. Firing it once here (in addition to the
+  // periodic cron entry below, which covers the case this startup-only call
+  // was never designed for — a version getting stuck while the process
+  // keeps running without a restart) finally makes both halves of the
+  // originally-intended design real.
+  recoverStuckImports().catch((err) => logger.error('recoverStuckImports (startup) crashed', { error: (err as Error).message }));
 }
 
 // ─── Auto CRM Sync — runs every 30 min for ALL tenants ───────────────────────
@@ -406,7 +420,20 @@ function initCronJobs(): void {
     await retryFailedChatbotLeadEmails().catch((err) => logger.error('retryFailedChatbotLeadEmails crashed', { error: (err as Error).message }));
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly)');
+  // Periodic sweep for Dataset imports stuck at importing/indexing (the real
+  // fix — the one-off startup call above only ever catches a version that
+  // was ALREADY stuck by the time the process booted; it can't help a
+  // version that gets stuck while this same process keeps running for
+  // hours/days without restarting, which is exactly the gap that let one
+  // sit at "Importing..." indefinitely with nothing ever noticing). 5-minute
+  // cadence matches dataset.service.ts's own STUCK_IMPORT_GRACE_MS, so a
+  // genuinely stuck version is picked up on close to the first tick after
+  // it crosses that threshold, not an arbitrary hour later.
+  cron.schedule('*/5 * * * *', async () => {
+    await recoverStuckImports().catch((err) => logger.error('recoverStuckImports crashed', { error: (err as Error).message }));
+  });
+
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────

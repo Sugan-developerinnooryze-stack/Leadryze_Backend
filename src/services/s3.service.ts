@@ -1,7 +1,28 @@
-import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, DeleteObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+
+// Real, confirmed bug this fixes: the AWS SDK v3's default NodeHttpHandler
+// has connectionTimeout/requestTimeout/socketTimeout all set to 0 ("no
+// timeout") unless explicitly configured. Supabase Storage's backing
+// Postgres is already known to stall under load (see toStorageError()'s own
+// comment on its "DatabaseTimeout" errors) — without a bound here, a single
+// stalled upload's `await upload.done()` hangs forever with no error, no
+// log line, nothing to catch. dataset-image.service.ts's processDatasetImages()
+// runs this sequentially per row as the FIRST step of the import pipeline,
+// so one hung image upload froze the entire dataset import at "importing"
+// permanently — the exact bug behind datasets stuck at "Importing..." with
+// zero further log activity. throwOnRequestTimeout is required alongside
+// requestTimeout: without it, a breached requestTimeout only logs a warning
+// and keeps waiting, it does not actually reject the call.
+const s3RequestHandler = new NodeHttpHandler({
+  connectionTimeout:    10_000,
+  requestTimeout:       30_000,
+  throwOnRequestTimeout: true,
+  socketTimeout:        30_000,
+});
 
 export const s3Client = new S3Client({
   endpoint:        config.s3.endpoint,
@@ -11,6 +32,7 @@ export const s3Client = new S3Client({
     secretAccessKey: config.s3.secret,
   },
   forcePathStyle: true, // required for Supabase S3
+  requestHandler: s3RequestHandler,
 });
 
 /**
@@ -99,6 +121,48 @@ export async function deleteFromS3(key: string): Promise<void> {
   } catch (err) {
     throw toStorageError(err, 'delete');
   }
+}
+
+/**
+ * Deletes every object under an S3 key prefix — e.g. all of a dataset's
+ * uploaded product images across every version at once, instead of the
+ * caller having to reconstruct each individual {recordId}/{kind}.webp key
+ * (fragile: depends on knowing the exact record count and which of the two
+ * variants actually made it to storage). Real numbers this needs to handle:
+ * a single import can be 500-800 products x 2 files (image + thumbnail)
+ * each = up to ~1,600 objects — well past S3's 1,000-key-per-request cap on
+ * BOTH list and delete, so both are paginated/chunked here rather than
+ * assuming a single call covers everything. Best-effort: logs and returns
+ * the count actually removed rather than throwing, since this runs as
+ * cleanup after the "real" delete (the DB records) has already succeeded —
+ * a storage hiccup here shouldn't make the whole delete action look failed
+ * to the caller when the data itself is already gone.
+ */
+export async function deleteByPrefix(prefix: string): Promise<number> {
+  let deleted = 0;
+  let continuationToken: string | undefined;
+  try {
+    do {
+      const listed = await s3Client.send(new ListObjectsV2Command({
+        Bucket: config.s3.bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      }));
+      const keys = (listed.Contents ?? []).map((obj) => obj.Key).filter((k): k is string => !!k);
+      for (let i = 0; i < keys.length; i += 1000) {
+        const chunk = keys.slice(i, i + 1000);
+        await s3Client.send(new DeleteObjectsCommand({
+          Bucket: config.s3.bucket,
+          Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true },
+        }));
+        deleted += chunk.length;
+      }
+      continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+    } while (continuationToken);
+  } catch (err) {
+    logger.error('S3-compatible storage bulk delete-by-prefix failed', { prefix, deletedSoFar: deleted, error: err instanceof Error ? err.message : err });
+  }
+  return deleted;
 }
 
 /**

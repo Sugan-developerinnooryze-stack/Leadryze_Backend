@@ -9,6 +9,7 @@ import { DatasetRecord } from './dataset-record.model';
 import { analyzeColumns } from './dataset-schema.service';
 import { buildRecordFields, buildSemanticText } from './dataset-value.service';
 import { processDatasetImages } from './dataset-image.service';
+import { deleteByPrefix } from '../../../services/s3.service';
 
 const MONGO_BATCH_SIZE = 200;
 const QDRANT_BATCH_SIZE = 50;
@@ -403,8 +404,30 @@ async function cleanupFailedVersion(tenantId: string, datasetId: string, version
   });
 }
 
-export async function listDatasets(tenantId: string) {
-  return Dataset.find({ tenantId }).sort({ updatedAt: -1 }).lean();
+/** Real, confirmed bug this fixes: the list response never carried
+ * `activeVersionDetail` — only getOne() (single-dataset fetch) attached it.
+ * The frontend's dataset card (WidgetSettingsPage.tsx) reads exactly that
+ * field to decide between "Importing…" and the real record count, so every
+ * dataset in this list was structurally stuck showing "Importing…" forever,
+ * regardless of whether its import had actually finished — a separate bug
+ * from (and compounding on top of) the S3 upload hang. Batched into one
+ * extra query (not N+1) since a tenant's dataset count is always small. */
+export async function listDatasets(tenantId: string): Promise<Array<Record<string, unknown>>> {
+  const datasets = await Dataset.find({ tenantId }).sort({ updatedAt: -1 }).lean();
+  const activeVersionNumbers = datasets.filter((d) => d.activeVersion != null).map((d) => d.activeVersion);
+  if (activeVersionNumbers.length === 0) return datasets.map((d) => ({ ...d, activeVersionDetail: null }));
+
+  const versions = await DatasetVersion.find({
+    tenantId,
+    datasetId: { $in: datasets.map((d) => d._id) },
+    version: { $in: activeVersionNumbers },
+  }).lean();
+  const versionByKey = new Map(versions.map((v) => [`${v.datasetId}:${v.version}`, v]));
+
+  return datasets.map((d) => ({
+    ...d,
+    activeVersionDetail: d.activeVersion != null ? (versionByKey.get(`${d._id}:${d.activeVersion}`) ?? null) : null,
+  }));
 }
 
 export async function getDatasetById(tenantId: string, datasetId: string) {
@@ -446,5 +469,20 @@ export async function deleteDataset(tenantId: string, datasetId: string): Promis
       `${config.app.aiServiceUrl}/api/knowledge/dataset-index/${datasetId}/${v.version}`,
       { params: { tenantId }, headers: { 'x-api-key': config.ai.internalApiKey }, timeout: 30000 },
     ).catch(() => {});
+  }
+  // Real gap this closes: the DB/Qdrant cleanup above never touched the
+  // actual product images uploaded to S3-compatible storage — every deleted
+  // dataset left its images behind as orphaned files (still billed/counted
+  // storage, nothing left pointing to them). The key convention
+  // (uploadProcessedImage() in dataset-image.service.ts) is
+  // Leadryze_Bucket/{tenantId}/datasets/{datasetId}/versions/{version}/records/{recordId}/{kind}.webp
+  // for every version, so one prefix covering "datasets/{datasetId}/" sweeps
+  // every version's images in one pass rather than needing a separate call
+  // per version. Runs after the DB delete has already succeeded — a storage
+  // hiccup here is logged (see deleteByPrefix()) but never turns an
+  // otherwise-successful delete into a failure the caller sees.
+  const deletedImageCount = await deleteByPrefix(`Leadryze_Bucket/${tenantId}/datasets/${datasetId}/`);
+  if (deletedImageCount > 0) {
+    logger.info('Deleted dataset: swept orphaned product images from storage', { tenantId, datasetId, deletedImageCount });
   }
 }
