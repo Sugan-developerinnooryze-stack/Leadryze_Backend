@@ -66,3 +66,11 @@ export async function removeWidgetLogo(req: AuthRequest, res: Response, next: Ne
     sendSuccess(res, null, 'Widget logo removed');
   } catch (err) { next(err); }
 }
+
+export async function getAiUsage(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const usage = await tenantService.getAiUsage(req.params.id);
+    if (!usage) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, usage);
+  } catch (err) { next(err); }
+}

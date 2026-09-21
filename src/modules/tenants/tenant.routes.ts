@@ -45,6 +45,7 @@ router.put('/:id', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, c
 router.post('/:id/widget/regenerate-key', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.regenerateWidgetKey);
 router.post('/:id/widget/logo', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, upload.single('file'), controller.uploadWidgetLogo);
 router.delete('/:id/widget/logo', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.removeWidgetLogo);
+router.get('/:id/ai-usage', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.getAiUsage);
 router.delete('/:id', authorize('SUPER_ADMIN'), controller.deleteTenant);
 
 export default router;

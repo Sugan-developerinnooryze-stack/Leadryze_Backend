@@ -14,7 +14,7 @@ const VIDEO_MAX = 10 * 1024 * 1024; // 10 MB
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const items = await listCustomFields(req.tenantId!, req.query.module as string | undefined);
+    const items = await listCustomFields(req.tenantId!, req.query.module as string | undefined, req.branchId);
     return sendSuccess(res, items);
   } catch (err: any) {
     return sendError(res, err.message);
@@ -33,7 +33,7 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const item = await createCustomField(req.tenantId!, req.body);
+    const item = await createCustomField(req.tenantId!, req.body, req.branchId);
     return sendCreated(res, item);
   } catch (err: any) {
     return sendError(res, err.message);

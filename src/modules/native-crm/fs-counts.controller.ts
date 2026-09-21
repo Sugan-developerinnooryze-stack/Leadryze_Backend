@@ -21,6 +21,7 @@ import { NativeAsset }     from './assets/asset.model';
 import { NativeVehicle }   from './vehicles/vehicle.model';
 import { Lead }            from './leads/lead.model';
 import { Deal }            from './deals/deal.model';
+import { User }            from '../auth/auth.model';
 import {
   resolveEffectiveScope, applyDataScopeToFilter, applyDataScopeToCreatedByFilter, applyDataScopeToTeamFilter,
 } from './shared/data-scope';
@@ -57,7 +58,7 @@ export async function fsCounts(req: AuthRequest, res: Response) {
       leads, deals,
       categories, services, teams, staffs, customers, sites, parts,
       workorders, quotations, contracts, invoices, receipts,
-      expenses, activities, products, assets, vehicles,
+      expenses, activities, products, assets, vehicles, supervisors,
     ] = await Promise.all([
       Lead.countDocuments(staffAnchored('leads', 'leadOwnerStaffId')),
       Deal.countDocuments(staffAnchored('deals', 'assignedStaffId')),
@@ -78,13 +79,19 @@ export async function fsCounts(req: AuthRequest, res: Response) {
       NativeProduct.countDocuments(createdByAnchored('products')),
       NativeAsset.countDocuments(createdByAnchored('assets')),
       NativeVehicle.countDocuments(createdByAnchored('vehicles')),
+      // Real, confirmed bug this fixes: this endpoint never returned a
+      // `supervisors` key at all, so the sidebar badge was permanently stuck
+      // at 0 regardless of how many were added. A "Supervisor" isn't its own
+      // model — it's exactly the same definition SupervisorsPage.tsx already
+      // uses client-side: any tenant User with role:'MANAGER'.
+      User.countDocuments({ tenantId: tid, role: 'MANAGER' }),
     ]);
 
     sendSuccess(res, {
       leads, deals,
       categories, services, teams, staffs, customers, sites, parts,
       workorders, quotations, contracts, invoices, receipts,
-      expenses, activities, products, assets, vehicles,
+      expenses, activities, products, assets, vehicles, supervisors,
     });
   } catch {
     sendError(res, 'Failed to fetch FS counts', 500);

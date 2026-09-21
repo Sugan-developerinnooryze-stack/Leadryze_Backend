@@ -174,8 +174,24 @@ export async function loginUser(
 ): Promise<LoginResult> {
   const query: Record<string, unknown> = { email: email.toLowerCase(), isActive: true };
   if (tenantId) query.tenantId = tenantId;
-  const user = await User.findOne(query).select('+password');
-  if (!user || !(await user.comparePassword(password))) {
+
+  // Real, confirmed bug this fixes: the same email can legitimately exist
+  // under multiple tenants (the unique index is {email,tenantId}, not a
+  // global one — e.g. someone invited into two separate client workspaces).
+  // The login form never asks which tenant, so this used to findOne() and
+  // silently compare the password against whichever account Mongo happened
+  // to return first — a perfectly correct password failed with a generic
+  // "Invalid email or password" whenever that happened to be the WRONG
+  // tenant's account. Confirmed directly against production: two MANAGER
+  // accounts for the same email under two different tenants. Trying the
+  // password against every matching account (there are only ever a
+  // handful) resolves to the right one without needing a tenant-picker UI.
+  const candidates = await User.find(query).select('+password');
+  let user: (typeof candidates)[number] | undefined;
+  for (const candidate of candidates) {
+    if (await candidate.comparePassword(password)) { user = candidate; break; }
+  }
+  if (!user) {
     logSecurityEvent('auth.login_failed', {
       ip:        ctx?.ip ?? 'unknown',
       userAgent: ctx?.userAgent ?? 'unknown',

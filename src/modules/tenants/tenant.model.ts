@@ -91,7 +91,7 @@ export interface ITenant extends Document {
   slug: string;
   clientId?: string;
   domain?: string;
-  plan: 'starter' | 'professional' | 'enterprise';
+  plan: 'starter' | 'growth' | 'professional' | 'enterprise';
   isActive: boolean;
   featureFlags: IFeatureFlags;
   settings: {
@@ -136,6 +136,12 @@ export interface ITenant extends Document {
      * monthlyTokenLimit. Never applies to push-to-talk voice (a different,
      * per-turn-charged capability) or the internal staff assistant. */
     monthlyVoiceMinutesLimit?: number;
+    /** Admin-facing-only usage heads-up, as a percent of monthlyTokenLimit
+     * (the effective one — custom override if set, else the plan default).
+     * Never changes visitor-facing behavior; that only ever switches at
+     * 100%/exceeded, unchanged. Defaults to 80/95 if unset. */
+    tokenWarningThresholdPercent?: number;
+    tokenCriticalThresholdPercent?: number;
     /** Which already-integrated LLM provider/model powers RAG/catalog/
      * booking tool-calling for the public widget specifically — undefined
      * means "use the global primary/fallback pair" (today's unchanged
@@ -305,7 +311,7 @@ const tenantSchema = new Schema<ITenant>(
     slug:     { type: String, required: true, unique: true, lowercase: true, trim: true },
     clientId: { type: String, unique: true, sparse: true, index: true },
     domain:   String,
-    plan: { type: String, enum: ['starter', 'professional', 'enterprise'], default: 'starter' },
+    plan: { type: String, enum: ['starter', 'growth', 'professional', 'enterprise'], default: 'starter' },
     isActive: { type: Boolean, default: true },
     featureFlags: {
       nav_dashboard:         { type: Boolean, default: true },
@@ -370,6 +376,11 @@ const tenantSchema = new Schema<ITenant>(
       agentName: String,
       monthlyTokenLimit: Number,
       monthlyVoiceMinutesLimit: Number,
+      // Admin-facing-only heads-up thresholds — never change visitor-facing
+      // behavior (that switch is still 100%/exceeded only, unchanged). Stored
+      // as a percent (not a fraction) to match the settings-UI input directly.
+      tokenWarningThresholdPercent:  { type: Number, default: 80 },
+      tokenCriticalThresholdPercent: { type: Number, default: 95 },
       toolModelPreset: { type: String, enum: ['groq', 'anthropic', 'openai', 'google'] },
       autoConvertLeadOnMeetingCompleted: { type: Boolean, default: false },
     },

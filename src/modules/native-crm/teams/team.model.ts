@@ -71,6 +71,11 @@ schema.pre('save', async function (next) {
 schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, managerUserId: 1 });
+// Exact-case race-condition backstop — team.service.ts's own
+// assertUniqueTeamName() is the primary, case-insensitive guard (with a
+// clean error message); this index only catches two near-simultaneous
+// requests slipping past that check with the identical exact-case name.
+schema.index({ tenantId: 1, name: 1 }, { unique: true });
 
 export const NativeTeam = mongoose.model<ITeamDoc>(
   'NativeTeam',

@@ -33,7 +33,19 @@ export async function getTeamById(id: string, tenantId: string) {
   return NativeTeam.findOne({ _id: id, tenantId: tid });
 }
 
+/** Case-insensitive duplicate check within the tenant — "Team A" and
+ * "team a" are the same name to a user picking from a dropdown, even though
+ * Mongo would happily store both as distinct strings. `excludeId` lets
+ * updateTeam() re-use this without flagging a team against its own name. */
+async function assertUniqueTeamName(tenantId: mongoose.Types.ObjectId, name: string, excludeId?: string): Promise<void> {
+  const filter: any = { tenantId, name: new RegExp(`^${name.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') };
+  if (excludeId) filter._id = { $ne: excludeId };
+  const existing = await NativeTeam.findOne(filter).select('_id').lean();
+  if (existing) throw new Error(`A team named "${name.trim()}" already exists`);
+}
+
 export async function createTeam(data: any) {
+  if (data.name) await assertUniqueTeamName(new mongoose.Types.ObjectId(data.tenantId), data.name);
   const doc = await NativeTeam.create(data);
   indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'teams', doc.toObject(), doc.name);
   return doc;
@@ -41,6 +53,7 @@ export async function createTeam(data: any) {
 
 export async function updateTeam(id: string, tenantId: string, data: any) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  if (data.name) await assertUniqueTeamName(tid, data.name, id);
   const updated = await NativeTeam.findOneAndUpdate(
     { _id: id, tenantId: tid },
     data,

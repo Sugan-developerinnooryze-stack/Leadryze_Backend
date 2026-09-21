@@ -9,6 +9,7 @@ export type CustomFieldType =
 
 export interface ICustomFieldDoc extends Document {
   tenantId:       mongoose.Types.ObjectId;
+  branchId?:      mongoose.Types.ObjectId | null;
   clientId?:      string;
   module:         string;
   fieldKey:       string;
@@ -27,6 +28,7 @@ export interface ICustomFieldDoc extends Document {
 const schema = new Schema<ICustomFieldDoc>(
   {
     tenantId:  { type: Schema.Types.ObjectId, ref: 'Tenant', required: true },
+    branchId:  { type: Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
     clientId:  { type: String, index: true },
     module:    { type: String, required: true, trim: true },
     fieldKey:  { type: String, required: true, trim: true },
@@ -54,8 +56,17 @@ schema.pre('save', async function (next) {
   next();
 });
 
-schema.index({ tenantId: 1, module: 1 });
-schema.index({ tenantId: 1, module: 1, fieldKey: 1 }, { unique: true });
+schema.index({ tenantId: 1, branchId: 1, module: 1 });
+// Real, confirmed bug this fixes: this model had no branchId at all, so
+// every custom field was tenant-wide regardless of which branch it was
+// created under — a field made while "CBE Branch" was selected showed up
+// under every other branch too. branchId now included in the unique key so
+// the same fieldKey can exist independently per branch, matching every
+// other branch-scoped native-crm model's own {tenantId,branchId,...}
+// convention. Pre-existing fields (no branchId in the stored document) still
+// match branchId:null queries — Mongo treats "missing" and "null" as
+// equivalent for this comparison — so no data migration is needed.
+schema.index({ tenantId: 1, branchId: 1, module: 1, fieldKey: 1 }, { unique: true });
 
 export const NativeCustomField = mongoose.model<ICustomFieldDoc>(
   'NativeCustomField',

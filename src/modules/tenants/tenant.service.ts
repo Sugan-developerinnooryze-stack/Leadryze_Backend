@@ -3,6 +3,66 @@ import { Tenant, ITenant } from './tenant.model';
 import { parsePagination, buildSkip } from '../../utils/pagination';
 import { uploadToS3, deleteFromS3, keyFromUrl } from '../../services/s3.service';
 import { DEFAULT_DATA_SCOPE_CONFIG } from '../native-crm/shared/data-scope';
+import { getTenantTokenUsageThisMonth, getTenantVoiceMinutesUsageThisMonth } from '../admin/ai-token-usage.model';
+
+// Mirrors admin.routes.ts's GET /admin/ai-usage and ai/src/services/
+// context.builder.ts's own default map for this same field — all three
+// kept in sync manually (no shared-constants module exists yet in this
+// codebase for cross-service config; matching the established pattern
+// rather than introducing one here).
+const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
+  starter: 300_000, growth: 1_000_000, professional: 1_500_000, enterprise: 8_000_000,
+};
+const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
+  starter: 100, growth: 250, professional: 500, enterprise: 3000,
+};
+
+export type AiUsageStatus = 'normal' | 'warning' | 'critical' | 'exceeded';
+
+/** Self-service version of admin.routes.ts's GET /admin/ai-usage, scoped to
+ * ONE tenant (a Tenant Admin's own) instead of the SUPER_ADMIN-only
+ * cross-tenant table — this is what the new AI Usage & Limits settings page
+ * reads. `status` is admin-facing only (drives the UI's badge color); it
+ * never changes visitor-facing widget behavior, which still only switches
+ * at 100%/exceeded via checkTenantTokenQuota() (ai/src/core/guardrails/
+ * rate-limiter.ts), unchanged by this endpoint. */
+export async function getAiUsage(tenantId: string) {
+  const tenant = await Tenant.findById(tenantId).select('plan aiConfig').lean();
+  if (!tenant) return null;
+
+  const planDefaultTokenLimit = DEFAULT_MONTHLY_TOKEN_LIMITS[tenant.plan] ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter;
+  const planDefaultVoiceMinutesLimit = DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS[tenant.plan] ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS.starter;
+  const monthlyTokenLimit = tenant.aiConfig?.monthlyTokenLimit ?? planDefaultTokenLimit;
+  const monthlyVoiceMinutesLimit = tenant.aiConfig?.monthlyVoiceMinutesLimit ?? planDefaultVoiceMinutesLimit;
+  const warningThresholdPercent = tenant.aiConfig?.tokenWarningThresholdPercent ?? 80;
+  const criticalThresholdPercent = tenant.aiConfig?.tokenCriticalThresholdPercent ?? 95;
+
+  const [tokensUsedThisMonth, voiceMinutesUsedThisMonth] = await Promise.all([
+    getTenantTokenUsageThisMonth(tenantId),
+    getTenantVoiceMinutesUsageThisMonth(tenantId),
+  ]);
+
+  const percentUsed = monthlyTokenLimit > 0 ? (tokensUsedThisMonth / monthlyTokenLimit) * 100 : 0;
+  const status: AiUsageStatus =
+    percentUsed >= 100 ? 'exceeded' :
+    percentUsed >= criticalThresholdPercent ? 'critical' :
+    percentUsed >= warningThresholdPercent ? 'warning' : 'normal';
+
+  return {
+    plan: tenant.plan,
+    planDefaultTokenLimit,
+    customTokenLimit: tenant.aiConfig?.monthlyTokenLimit ?? null,
+    monthlyTokenLimit, // the effective limit: custom override if set, else the plan default
+    tokensUsedThisMonth,
+    tokensRemaining: Math.max(0, monthlyTokenLimit - tokensUsedThisMonth),
+    percentUsed: Math.round(percentUsed * 10) / 10,
+    status,
+    warningThresholdPercent,
+    criticalThresholdPercent,
+    monthlyVoiceMinutesLimit,
+    voiceMinutesUsedThisMonth,
+  };
+}
 
 export async function createTenant(data: Partial<ITenant>): Promise<ITenant> {
   if (!data.slug && data.name) {
@@ -78,7 +138,7 @@ export async function updateTenant(
     }
   }
   if (aiConfig && typeof aiConfig === 'object') {
-    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'monthlyVoiceMinutesLimit', 'toolModelPreset', 'autoConvertLeadOnMeetingCompleted']) {
+    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'monthlyVoiceMinutesLimit', 'tokenWarningThresholdPercent', 'tokenCriticalThresholdPercent', 'toolModelPreset', 'autoConvertLeadOnMeetingCompleted']) {
       if (aiConfig[key] !== undefined) update[`aiConfig.${key}`] = aiConfig[key];
     }
   }

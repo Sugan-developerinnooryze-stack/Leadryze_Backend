@@ -530,6 +530,7 @@ router.get('/ai-usage', async (_req, res, next) => {
     // the two services don't share code, so this is kept in sync manually.
     const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
       starter: 300_000,
+      growth: 1_000_000,
       professional: 1_500_000,
       enterprise: 8_000_000,
     };
@@ -537,6 +538,7 @@ router.get('/ai-usage', async (_req, res, next) => {
     // same field — kept in sync manually, same as the token limits above.
     const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
       starter: 100,
+      growth: 250,
       professional: 500,
       enterprise: 3000,
     };

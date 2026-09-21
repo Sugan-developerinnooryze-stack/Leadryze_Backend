@@ -195,6 +195,12 @@ router.get('/dashboard-stats', async (req: AuthRequest, res: Response) => {
     today.setHours(0, 0, 0, 0);
 
     const leadFilter: Record<string, unknown> = { tenantId: tid };
+    // Real, confirmed bug this fixes: every other Lead-scoped endpoint
+    // (lead.service.ts's own list/stats) already applies req.branchId —
+    // this dashboard summary was the one place that never did, so switching
+    // branches left it silently showing tenant-wide numbers. Meeting has no
+    // branchId field at all yet (a separate, larger gap — not scoped here).
+    if (req.branchId) leadFilter.branchId = new mongoose.Types.ObjectId(req.branchId);
     applyDataScopeToFilter(leadFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
     const meetingFilter: Record<string, unknown> = { tenantId: tid };
     applyDataScopeToFilter(meetingFilter, resolveEffectiveScope(req, 'meetings'), 'assignedStaffId');
