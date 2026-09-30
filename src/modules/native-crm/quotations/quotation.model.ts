@@ -23,6 +23,10 @@ export interface IQuotationDoc extends Document {
   numId:                 number;
   quotationId:           string;
   customerId:            string;
+  contractId?:           string;
+  siteId?:               string;
+  staffId?:              string;
+  teamId?:               string;
   title:                 string;
   address?:              string;
   services:              IServiceLine[];
@@ -77,6 +81,10 @@ const schema = new Schema<IQuotationDoc>(
     numId:                 { type: Number },
     quotationId:           { type: String },
     customerId:            { type: String, required: true, trim: true },
+    contractId:            { type: String, trim: true },
+    siteId:                { type: String, trim: true },
+    staffId:               { type: String, trim: true },
+    teamId:                { type: String, trim: true },
     title:                 { type: String, required: true, trim: true },
     address:               { type: String, trim: true },
     services:              { type: [serviceLineSchema], default: [] },

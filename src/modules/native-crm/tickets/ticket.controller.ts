@@ -8,11 +8,12 @@ import { logAuditEvent } from '../../logs/audit-log.model';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, relatedModule, relatedId, slaStatus } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId, slaStatus, owner } = req.query as Record<string, string>;
+    const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
     const result = await svc.listTickets(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-      relatedModule, relatedId, slaStatus,
-    }, req.branchId, resolveEffectiveScope(req, 'tickets'));
+      relatedModule, relatedId, slaStatus, ownerTab,
+    }, req.branchId, resolveEffectiveScope(req, 'tickets'), req.user!.userId);
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch tickets', 500); }
 }
@@ -30,6 +31,7 @@ export async function create(req: AuthRequest, res: Response) {
     const record = await svc.createTicket(req.tenantId!, {
       ...req.body,
       branchId: req.body.branchId ?? req.branchId ?? null,
+      createdBy: req.user!.userId,
     });
     runAutomationsOnCreate(req.tenantId!, 'ticket', record as any).catch(() => {});
     sendCreated(res, record, 'Ticket created');
@@ -61,6 +63,6 @@ export async function remove(req: AuthRequest, res: Response) {
 }
 
 export async function stats(req: AuthRequest, res: Response) {
-  try { sendSuccess(res, await svc.getTicketStats(req.tenantId!, req.branchId, resolveEffectiveScope(req, 'tickets'))); }
+  try { sendSuccess(res, await svc.getTicketStats(req.tenantId!, req.branchId, resolveEffectiveScope(req, 'tickets'), req.query.range as string | undefined, req.query.customFrom as string | undefined, req.query.customTo as string | undefined)); }
   catch { sendError(res, 'Failed to fetch stats', 500); }
 }

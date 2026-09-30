@@ -4,6 +4,8 @@ import { customFields, serviceLine, partLine } from '../../../utils/common.schem
 export const createInvoiceSchema = z.object({
   customerId:            z.string().trim().min(1),
   workOrderId:           z.string().trim().optional(),
+  quotationId:           z.string().trim().optional(),
+  contractId:            z.string().trim().optional(),
   address:               z.string().trim().optional(),
   services:              z.array(serviceLine).optional(),
   parts:                 z.array(partLine).optional(),

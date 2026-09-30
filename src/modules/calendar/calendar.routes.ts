@@ -1,6 +1,6 @@
 import { Router, Response, NextFunction } from 'express';
 import mongoose from 'mongoose';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError, sendCreated } from '../../utils/response';
@@ -11,7 +11,7 @@ const router = Router();
 router.use(authenticate, requireTenant);
 
 /* ── GET /api/v1/calendar/events?start=&end= ─────────────────────────────── */
-router.get('/events', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/events', requirePermission('native_crm.calendar.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const start = req.query.start ? new Date(req.query.start as string) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const end   = req.query.end   ? new Date(req.query.end   as string) : new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
@@ -27,7 +27,7 @@ router.get('/events', async (req: AuthRequest, res: Response, next: NextFunction
 });
 
 /* ── POST /api/v1/calendar/events ────────────────────────────────────────── */
-router.post('/events', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/events', requirePermission('native_crm.calendar.create'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { title, startDate, endDate, allDay, description, color, location, createdBy, linkedRecord } = req.body as {
       title: string; startDate: string; endDate?: string; allDay?: boolean;
@@ -58,7 +58,7 @@ router.post('/events', async (req: AuthRequest, res: Response, next: NextFunctio
 });
 
 /* ── PUT /api/v1/calendar/events/:id ─────────────────────────────────────── */
-router.put('/events/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.put('/events/:id', requirePermission('native_crm.calendar.edit'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { title, startDate, endDate, allDay, description, color, location, linkedRecord } = req.body as {
       title?: string; startDate?: string; endDate?: string; allDay?: boolean;
@@ -88,7 +88,7 @@ router.put('/events/:id', async (req: AuthRequest, res: Response, next: NextFunc
 });
 
 /* ── DELETE /api/v1/calendar/events/:id ──────────────────────────────────── */
-router.delete('/events/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.delete('/events/:id', requirePermission('native_crm.calendar.delete'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const event = await CalendarEvent.findOneAndDelete({
       _id: req.params.id,

@@ -6,11 +6,11 @@ import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
-export async function listCompanies(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status } = opts;
+export async function listCompanies(tenantId: string, opts: ListOptions = {}, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
+  const { page = 1, limit = 20, search, status, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToCreatedByFilter(filter, scope);
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', ownerTab, userId);
   if (status) filter.companyStatus = status;
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
@@ -30,7 +30,7 @@ export async function getCompanyById(tenantId: string, id: string, scope?: DataS
   return Company.findOne(filter).lean();
 }
 
-export async function createCompany(tenantId: string, dto: CreateCompanyDTO) {
+export async function createCompany(tenantId: string, dto: CreateCompanyDTO & { createdBy?: string }) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Company.create({ tenantId: tid, ...dto });
   indexNativeSearchRecord(tenantId, 'native', 'companies', created.toObject(), created.name);

@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
 import {
@@ -18,7 +19,7 @@ import {
 } from './custom-module.service';
 
 const router = Router();
-router.use(authenticate, requireTenant);
+router.use(authenticate, requireTenant, requireModuleEnabled('config_customModules'));
 
 /* ── Module Definition CRUD ───────────────────────────────────────────────── */
 

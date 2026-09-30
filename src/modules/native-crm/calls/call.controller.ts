@@ -6,11 +6,12 @@ import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, relatedModule, relatedId, upcoming } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId, upcoming, owner } = req.query as Record<string, string>;
+    const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
     const result = await svc.listCalls(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-      relatedModule, relatedId, upcoming: upcoming === 'true',
-    }, resolveEffectiveScope(req, 'calls'));
+      relatedModule, relatedId, upcoming: upcoming === 'true', ownerTab,
+    }, resolveEffectiveScope(req, 'calls'), req.user!.userId);
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch calls', 500); }
 }
@@ -25,7 +26,7 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.createCall(req.tenantId!, req.body);
+    const record = await svc.createCall(req.tenantId!, { ...req.body, createdBy: req.user!.userId });
     sendCreated(res, record, 'Call logged');
   } catch { sendError(res, 'Failed to log call', 500); }
 }

@@ -26,10 +26,46 @@ export interface IFeatureFlags {
   nav_connectors:  boolean;
   nav_settings:    boolean;
   nav_crmData:     boolean;
+  nav_fieldService: boolean;
+  nav_configuration: boolean;
   // Customers page tabs
   customers_tabLeads:    boolean;
   customers_tabContacts: boolean;
   customers_tabDirect:   boolean;
+  // Native CRM sub-items (tenant-level — separate from per-role RBAC
+  // permissions, which already gate these independently)
+  native_contacts:  boolean;
+  native_companies: boolean;
+  native_deals:     boolean;
+  native_tasks:     boolean;
+  native_tickets:   boolean;
+  native_calls:     boolean;
+  native_meetings:  boolean;
+  // Field Service sub-items
+  fs_leads:      boolean;
+  fs_categories: boolean;
+  fs_services:   boolean;
+  fs_teams:      boolean;
+  fs_supervisors: boolean;
+  fs_staffs:     boolean;
+  fs_customers:  boolean;
+  fs_sites:      boolean;
+  fs_parts:      boolean;
+  fs_quotations: boolean;
+  fs_workorders: boolean;
+  fs_contracts:  boolean;
+  fs_invoices:   boolean;
+  fs_receipts:   boolean;
+  fs_expenses:   boolean;
+  fs_activities: boolean;
+  fs_products:   boolean;
+  fs_assets:     boolean;
+  fs_vehicles:   boolean;
+  // Configuration sub-items
+  config_hub:          boolean;
+  config_customFields: boolean;
+  config_customModules: boolean;
+  config_fsSettings:   boolean;
   // Connector visibility per type
   connector_zoho:        boolean;
   connector_hubspot:     boolean;
@@ -64,9 +100,41 @@ export const DEFAULT_FEATURE_FLAGS: IFeatureFlags = {
   nav_connectors:  true,
   nav_settings:    true,
   nav_crmData:     true,
+  nav_fieldService: true,
+  nav_configuration: true,
   customers_tabLeads:    true,
   customers_tabContacts: true,
   customers_tabDirect:   true,
+  native_contacts:  true,
+  native_companies: true,
+  native_deals:     true,
+  native_tasks:     true,
+  native_tickets:   true,
+  native_calls:     true,
+  native_meetings:  true,
+  fs_leads:      true,
+  fs_categories: true,
+  fs_services:   true,
+  fs_teams:      true,
+  fs_supervisors: true,
+  fs_staffs:     true,
+  fs_customers:  true,
+  fs_sites:      true,
+  fs_parts:      true,
+  fs_quotations: true,
+  fs_workorders: true,
+  fs_contracts:  true,
+  fs_invoices:   true,
+  fs_receipts:   true,
+  fs_expenses:   true,
+  fs_activities: true,
+  fs_products:   true,
+  fs_assets:     true,
+  fs_vehicles:   true,
+  config_hub:          true,
+  config_customFields: true,
+  config_customModules: true,
+  config_fsSettings:   true,
   connector_zoho:        true,
   connector_hubspot:     true,
   connector_salesforce:  true,
@@ -93,10 +161,34 @@ export interface ITenant extends Document {
   domain?: string;
   plan: 'starter' | 'growth' | 'professional' | 'enterprise';
   isActive: boolean;
+  // Undefined is treated as 'approved' everywhere this is read (matches
+  // every pre-existing tenant and every legacy .lean() read) — only the
+  // literal values 'pending'/'rejected' ever block login. See
+  // assertTenantLoginAllowed() in auth.service.ts.
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
+  // 'custom' (default) preserves each tenant's own independently-stored
+  // featureFlags exactly as today. 'default' means this tenant's EFFECTIVE
+  // flags are resolved from the Super-Admin-editable Platform Defaults
+  // singleton instead — see getEffectiveFeatureFlags() in tenant.service.ts.
+  accessConfigMode?: 'default' | 'custom';
   featureFlags: IFeatureFlags;
   settings: {
     allowedChannels: string[];
     maxUsers: number;
+    // Maintained seat-reservation counter, NOT a query-time count — enforced
+    // atomically via a single findOneAndUpdate ($expr compare + $inc) in
+    // tenant.service.ts's reserveUserSeat()/releaseUserSeat(), since this
+    // deployment is a standalone MongoDB instance (no replica set), so
+    // multi-document transactions aren't available to guard a separate
+    // count-then-create. Display code should read the live
+    // User.countDocuments() truth instead — this field exists only to make
+    // the reserve step atomic, not as a source of truth for the UI.
+    currentUserCount?: number;
+    // Atomic per-tenant sequence for User.loginId (${clientId}-U${seq}) —
+    // incremented via the exact same $inc-on-findOneAndUpdate pattern as
+    // currentUserCount above, for the same concurrency reason. See
+    // auth.model.ts's userSchema pre('save') hook.
+    userLoginSeq?: number;
     maxLeadsPerMonth: number;
     timezone: string;
     language: string;
@@ -305,15 +397,10 @@ export interface ITenant extends Document {
   dataScopeConfig?: Record<string, boolean>;
 }
 
-const tenantSchema = new Schema<ITenant>(
-  {
-    name:     { type: String, required: true, trim: true },
-    slug:     { type: String, required: true, unique: true, lowercase: true, trim: true },
-    clientId: { type: String, unique: true, sparse: true, index: true },
-    domain:   String,
-    plan: { type: String, enum: ['starter', 'growth', 'professional', 'enterprise'], default: 'starter' },
-    isActive: { type: Boolean, default: true },
-    featureFlags: {
+// Shared with the Platform Defaults singleton (admin/platform-defaults.model.ts)
+// so both schemas define these fields identically, in one place, instead of
+// two copies that could silently drift apart.
+export const featureFlagsSchemaFields = {
       nav_dashboard:         { type: Boolean, default: true },
       nav_aiChat:            { type: Boolean, default: true },
       nav_customers:         { type: Boolean, default: true },
@@ -325,9 +412,41 @@ const tenantSchema = new Schema<ITenant>(
       nav_connectors:        { type: Boolean, default: true },
       nav_settings:          { type: Boolean, default: true },
       nav_crmData:           { type: Boolean, default: true },
+      nav_fieldService:      { type: Boolean, default: true },
+      nav_configuration:     { type: Boolean, default: true },
       customers_tabLeads:    { type: Boolean, default: true },
       customers_tabContacts: { type: Boolean, default: true },
       customers_tabDirect:   { type: Boolean, default: true },
+      native_contacts:       { type: Boolean, default: true },
+      native_companies:      { type: Boolean, default: true },
+      native_deals:          { type: Boolean, default: true },
+      native_tasks:          { type: Boolean, default: true },
+      native_tickets:        { type: Boolean, default: true },
+      native_calls:          { type: Boolean, default: true },
+      native_meetings:       { type: Boolean, default: true },
+      fs_leads:              { type: Boolean, default: true },
+      fs_categories:         { type: Boolean, default: true },
+      fs_services:           { type: Boolean, default: true },
+      fs_teams:              { type: Boolean, default: true },
+      fs_supervisors:        { type: Boolean, default: true },
+      fs_staffs:             { type: Boolean, default: true },
+      fs_customers:          { type: Boolean, default: true },
+      fs_sites:              { type: Boolean, default: true },
+      fs_parts:              { type: Boolean, default: true },
+      fs_quotations:         { type: Boolean, default: true },
+      fs_workorders:         { type: Boolean, default: true },
+      fs_contracts:          { type: Boolean, default: true },
+      fs_invoices:           { type: Boolean, default: true },
+      fs_receipts:           { type: Boolean, default: true },
+      fs_expenses:           { type: Boolean, default: true },
+      fs_activities:         { type: Boolean, default: true },
+      fs_products:           { type: Boolean, default: true },
+      fs_assets:             { type: Boolean, default: true },
+      fs_vehicles:           { type: Boolean, default: true },
+      config_hub:            { type: Boolean, default: true },
+      config_customFields:   { type: Boolean, default: true },
+      config_customModules:  { type: Boolean, default: true },
+      config_fsSettings:     { type: Boolean, default: true },
       connector_zoho:        { type: Boolean, default: true },
       connector_hubspot:     { type: Boolean, default: true },
       connector_salesforce:  { type: Boolean, default: true },
@@ -345,10 +464,28 @@ const tenantSchema = new Schema<ITenant>(
       auto_booking:          { type: Boolean, default: false },
       auto_reminder:         { type: Boolean, default: false },
       auto_feedback:         { type: Boolean, default: false },
-    },
+} as const;
+
+const tenantSchema = new Schema<ITenant>(
+  {
+    name:     { type: String, required: true, trim: true },
+    slug:     { type: String, required: true, unique: true, lowercase: true, trim: true },
+    clientId: { type: String, unique: true, sparse: true, index: true },
+    domain:   String,
+    plan: { type: String, enum: ['starter', 'growth', 'professional', 'enterprise'], default: 'starter' },
+    isActive: { type: Boolean, default: true },
+    approvalStatus: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'approved' },
+    // Mongoose only applies this default on document creation through the
+    // model (and never on a .lean() read) — getEffectiveFeatureFlags()
+    // treats a missing/undefined value the same as 'default' regardless,
+    // so this schema default and that resolution logic stay in agreement.
+    accessConfigMode: { type: String, enum: ['default', 'custom'], default: 'default' },
+    featureFlags: featureFlagsSchemaFields,
     settings: {
       allowedChannels: { type: [String], default: ['web', 'whatsapp'] },
       maxUsers: { type: Number, default: 5 },
+      currentUserCount: { type: Number, default: 0 },
+      userLoginSeq: { type: Number, default: 0 },
       maxLeadsPerMonth: { type: Number, default: 500 },
       timezone: { type: String, default: 'Asia/Singapore' },
       language: { type: String, default: 'en' },

@@ -125,6 +125,50 @@ export function buildBookingConfirmationEmail(
   };
 }
 
+/** Shared by every credential-issuing action (direct tenant creation,
+ * signup approval, credential regeneration, and Super-Admin-added users)
+ * instead of separate inline templates — same visual style as the
+ * verify-email/reset-password emails in auth.service.ts. `toName` fills the
+ * greeting only. Login itself only needs Login ID + Password; accountEmail
+ * is shown purely so the recipient can confirm which account this
+ * credential belongs to, not because it's needed to log in. `loginId` is
+ * the tenant's Client ID itself for a Tenant Admin, or that tenant's
+ * Client ID with a per-user suffix (e.g. ABCD1234-U001) for anyone else —
+ * see the loginId doc-comment on auth.model.ts's userSchema. */
+export function buildTenantCredentialsEmail(opts: {
+  toName: string;
+  accountEmail: string;
+  loginId: string;
+  password: string;
+  frontendUrl: string;
+  forceChange?: boolean;
+}): EmailOptions {
+  const loginUrl = `${opts.frontendUrl}/login`;
+  return {
+    to: '',
+    subject: 'Your LeadRyze AI login credentials',
+    htmlContent: `
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px">
+        <h2 style="color:#1a1a2e">Welcome to LeadRyze AI, ${opts.toName}!</h2>
+        <p>Your account (${opts.accountEmail}) is ready. Log in with the Login ID and Password below.</p>
+        <div style="background:#f5f5f5;border-radius:8px;padding:16px;margin:16px 0">
+          <p style="margin:0"><strong>Login ID:</strong> <span style="font-family:monospace;font-weight:700">${opts.loginId}</span></p>
+          <p style="margin:8px 0 0"><strong>Password:</strong> <span style="font-family:monospace;font-weight:700">${opts.password}</span></p>
+        </div>
+        ${opts.forceChange !== false ? '<p>You\'ll be asked to set your own password the first time you log in.</p>' : ''}
+        <div style="margin:32px 0">
+          <a href="${loginUrl}" style="background:#2563eb;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">
+            Log In
+          </a>
+        </div>
+        <p style="color:#666;font-size:14px">Or copy this link:<br/><a href="${loginUrl}">${loginUrl}</a></p>
+        <hr style="border:none;border-top:1px solid #eee;margin:24px 0"/>
+        <p style="color:#999;font-size:12px">LeadRyze AI — AI-powered lead management</p>
+      </div>
+    `,
+  };
+}
+
 /** Real, side-effect-free reachability check — reads account info rather
  * than sending anything. Used by /admin/system/health so "Brevo" means
  * "actually reachable right now," not just "an API key is set". */

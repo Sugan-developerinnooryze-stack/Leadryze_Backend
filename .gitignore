@@ -28,3 +28,10 @@ tmp/
 # OS files
 .DS_Store
 Thumbs.db
+
+# One-off root-level backfill/scratch scripts (run once locally with
+# `node ...`/`ts-node ...` and thrown away) — not related to the app itself,
+# so they shouldn't be pushed. Scripts worth keeping belong in src/scripts/
+# instead (already tracked there — see backfill-client-ids.ts etc.).
+/backfill-*.js
+/scratch-*.js

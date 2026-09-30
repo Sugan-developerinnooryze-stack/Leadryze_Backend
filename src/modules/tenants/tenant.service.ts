@@ -1,9 +1,17 @@
 import crypto from 'crypto';
-import { Tenant, ITenant } from './tenant.model';
+import { Tenant, ITenant, IFeatureFlags, DEFAULT_FEATURE_FLAGS } from './tenant.model';
 import { parsePagination, buildSkip } from '../../utils/pagination';
 import { uploadToS3, deleteFromS3, keyFromUrl } from '../../services/s3.service';
 import { DEFAULT_DATA_SCOPE_CONFIG } from '../native-crm/shared/data-scope';
 import { getTenantTokenUsageThisMonth, getTenantVoiceMinutesUsageThisMonth } from '../admin/ai-token-usage.model';
+import { config } from '../../config';
+import { User } from '../auth/auth.model';
+import { Role } from '../rbac/role.model';
+import { ensureSystemPermissions } from '../rbac/rbac.seed';
+import { generatePassword } from '../native-crm/shared/app-credentials.service';
+import { sendEmailNow, buildTenantCredentialsEmail } from '../messages/brevo.service';
+import { logger } from '../../utils/logger';
+import { encrypt } from '../../utils/crypto';
 
 // Mirrors admin.routes.ts's GET /admin/ai-usage and ai/src/services/
 // context.builder.ts's own default map for this same field — all three
@@ -16,6 +24,49 @@ const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
 const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
   starter: 100, growth: 250, professional: 500, enterprise: 3000,
 };
+
+/** Shared, nullish-safe feature-flag read — matches the `!== false` (default
+ * true) convention already used throughout the frontend (Sidebar.tsx,
+ * CustomersPage.tsx) so a flag that's never been explicitly saved behaves
+ * identically everywhere it's read, backend or frontend. */
+export function isFeatureFlagEnabled(tenant: { featureFlags?: IFeatureFlags }, key: keyof IFeatureFlags): boolean {
+  return tenant.featureFlags?.[key] !== false;
+}
+
+/** Resolves which flags actually apply to this tenant right now: the
+ * Platform Defaults template when accessConfigMode is 'default' (a tenant
+ * that's deliberately inheriting the current template, not a frozen copy
+ * of it), or the tenant's own independently-stored featureFlags otherwise
+ * — 'custom', or unset, which is what every pre-existing tenant already is.
+ * Callers that only care about one key should still go through here (not
+ * read tenant.featureFlags directly) so 'default' mode is honored
+ * everywhere, not just in the Controls UI. */
+export async function getEffectiveFeatureFlags(tenant: { featureFlags?: IFeatureFlags; accessConfigMode?: 'default' | 'custom' }): Promise<IFeatureFlags> {
+  // Anything other than an explicit 'custom' opt-out reads live from
+  // Platform Defaults — including tenants created before accessConfigMode
+  // existed, whose stored value is undefined, not the literal string
+  // 'default'. A strict `=== 'default'` check here silently left those
+  // legacy tenants frozen on whatever featureFlags snapshot they happened
+  // to have, never picking up Super Admin changes to Platform Defaults.
+  if (tenant.accessConfigMode !== 'custom') {
+    const { getPlatformDefaults } = await import('../admin/platform-defaults.model');
+    return getPlatformDefaults();
+  }
+  return { ...DEFAULT_FEATURE_FLAGS, ...(tenant.featureFlags ?? {}) };
+}
+
+/** Batch version for a cron sweep that spans many tenants in one run
+ * (runDailyFollowupCheck/runMeetingReminders/runCallMeetingReminders) — one
+ * query for every distinct tenant touched this run instead of one query per
+ * customer/activity/record, then a plain in-memory lookup inside the loop. */
+export async function getFeatureFlagsForTenants(tenantIds: string[]): Promise<Map<string, IFeatureFlags | undefined>> {
+  const uniqueIds = [...new Set(tenantIds)];
+  if (uniqueIds.length === 0) return new Map();
+  const tenants = await Tenant.find({ _id: { $in: uniqueIds } }).select('featureFlags').lean();
+  const byId = new Map<string, IFeatureFlags | undefined>();
+  for (const t of tenants) byId.set(String(t._id), t.featureFlags);
+  return byId;
+}
 
 export type AiUsageStatus = 'normal' | 'warning' | 'critical' | 'exceeded';
 
@@ -71,6 +122,135 @@ export async function createTenant(data: Partial<ITenant>): Promise<ITenant> {
   return Tenant.create(data);
 }
 
+export interface ProvisionTenantInput {
+  name: string;
+  plan?: ITenant['plan'];
+  domain?: string;
+  contactEmail?: string;
+  contactPhone?: string;
+  adminFirstName: string;
+  adminLastName: string;
+  adminEmail: string;
+}
+
+export interface ProvisionTenantResult {
+  tenant: ITenant;
+  adminUser: Record<string, unknown>;
+  clientId: string;
+  loginId: string;
+  temporaryPassword: string;
+  emailSent: boolean;
+}
+
+/** Super Admin "Create Tenant" — creates a Tenant + its first TENANT_ADMIN
+ * User together, auto-approved (no signup-approval gate; the Super Admin
+ * creating it directly IS the approval). Mirrors registerUser()'s
+ * Tenant+User creation shape (auth.service.ts) so both provisioning paths
+ * produce an identically-usable tenant. The plaintext password is only
+ * ever returned here — never persisted, never returned by any other
+ * endpoint afterward. */
+export async function provisionTenant(input: ProvisionTenantInput): Promise<ProvisionTenantResult> {
+  const slug = input.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+    + '-' + crypto.randomBytes(3).toString('hex');
+
+  // Same generator/uniqueness-retry as self-signup (auth.service.ts:53-59)
+  let clientId: string;
+  let tries = 0;
+  do {
+    clientId = crypto.randomBytes(4).toString('hex').toUpperCase();
+    tries++;
+  } while (tries < 10 && await Tenant.exists({ clientId }));
+
+  const { getPlatformDefaults } = await import('../admin/platform-defaults.model');
+  const platformDefaults = await getPlatformDefaults();
+
+  const tenant = await Tenant.create({
+    clientId,
+    name: input.name,
+    slug,
+    plan: input.plan ?? 'starter',
+    domain: input.domain,
+    isActive: true,
+    approvalStatus: 'approved',
+    // New tenant inherits whatever the Super-Admin-editable template
+    // currently says, and stays on 'default' so future template edits keep
+    // applying — switching to 'custom' later freezes its flags as of that
+    // moment (see getEffectiveFeatureFlags()).
+    accessConfigMode: 'default',
+    featureFlags: platformDefaults,
+    settings: {
+      allowedChannels: ['web', 'whatsapp', 'email', 'sms'],
+      maxUsers: 5,
+      // The TENANT_ADMIN created right below already occupies one seat.
+      currentUserCount: 1,
+      maxLeadsPerMonth: 500,
+      timezone: 'Asia/Kuala_Lumpur',
+      language: 'en',
+      crmOption: 'no_crm',
+    },
+    branding: {
+      companyName: input.name,
+      ...(input.contactEmail ? { contactEmail: input.contactEmail } : {}),
+      ...(input.contactPhone ? { contactPhone: input.contactPhone } : {}),
+    },
+    aiConfig: {
+      agentName: 'LeadBot',
+      language: 'en',
+      fallbackToHuman: true,
+      systemPrompt: `You are LeadBot, an AI assistant for ${input.name}. Help capture leads and answer questions.`,
+    },
+  });
+
+  const temporaryPassword = generatePassword();
+
+  const user = await User.create({
+    email: input.adminEmail.toLowerCase(),
+    password: temporaryPassword, // hashed by the model's pre-save hook, never written raw
+    // Encrypted (reversible) copy so the Super Admin panel can show/copy
+    // the current password — only ever set for Super-Admin-issued
+    // credentials, cleared the moment the user changes it themselves.
+    passwordEnc: encrypt(temporaryPassword),
+    firstName: input.adminFirstName,
+    lastName: input.adminLastName,
+    role: 'TENANT_ADMIN',
+    tenantId: tenant._id,
+    clientId,
+    isActive: true,
+    emailVerified: true, // no verification step in this path — the Super Admin creating it is the vetting step
+    mustChangePassword: true,
+  });
+
+  // Fire-and-forget RBAC seeding — identical to registerUser()'s.
+  ensureSystemPermissions(tenant._id.toString()).then(async () => {
+    const adminRole = await Role.findOne({ tenantId: tenant._id, name: 'Admin' }, '_id').lean();
+    if (adminRole) {
+      await User.findByIdAndUpdate(user._id, { roleId: adminRole._id });
+    }
+  }).catch(() => {});
+
+  let emailSent = true;
+  try {
+    const email = buildTenantCredentialsEmail({
+      toName: input.adminFirstName,
+      accountEmail: user.email,
+      loginId: user.loginId ?? clientId,
+      password: temporaryPassword,
+      frontendUrl: config.app.frontendUrl,
+    });
+    await sendEmailNow({ ...email, to: user.email, toName: `${input.adminFirstName} ${input.adminLastName}` });
+  } catch (err) {
+    emailSent = false;
+    logger.error('Tenant credentials email failed to send', { tenantId: tenant._id.toString(), email: user.email, error: (err as Error).message });
+  }
+
+  const userObj = user.toObject() as unknown as Record<string, unknown>;
+  delete userObj.password;
+  delete userObj.refreshToken;
+  delete userObj.passwordEnc;
+
+  return { tenant, adminUser: userObj, clientId, loginId: user.loginId ?? clientId, temporaryPassword, emailSent };
+}
+
 export async function getTenants(query: Record<string, unknown>) {
   const { page, limit, sort, order } = parsePagination(query);
   const skip = buildSkip(page, limit);
@@ -114,11 +294,12 @@ export async function updateTenant(
   // handleContactInfoSave() sends only {contactEmail, contactPhone, address}
   // — a plain top-level replace would have wiped companyName/primaryColor/
   // logoUrl on every contact-info save.
-  const { widget, aiConfig, branding, dataScopeConfig, ...rest } = data as Partial<ITenant> & {
+  const { widget, aiConfig, branding, dataScopeConfig, settings, ...rest } = data as Partial<ITenant> & {
     widget?: Record<string, unknown>;
     aiConfig?: Record<string, unknown>;
     branding?: Record<string, unknown>;
     dataScopeConfig?: Record<string, unknown>;
+    settings?: Record<string, unknown>;
   };
   const update: Record<string, unknown> = { ...rest };
   if (widget && typeof widget === 'object') {
@@ -154,11 +335,73 @@ export async function updateTenant(
       if (dataScopeConfig[key] !== undefined) update[`dataScopeConfig.${key}`] = Boolean(dataScopeConfig[key]);
     }
   }
+  // Same "never wipe sibling keys" reasoning as widget/aiConfig/branding
+  // above — SettingsPage.tsx's saveTimezone() already sends a partial
+  // {settings:{timezone}} payload, which without this allow-list would
+  // `$set` the whole `settings` subdocument and silently erase
+  // allowedChannels/maxLeadsPerMonth/crmOption/etc. back to absent.
+  // `maxUsers`/`currentUserCount` are deliberately excluded — this route is
+  // reachable by TENANT_ADMIN (PUT /tenants/:id), and the seat limit must
+  // only be settable through the Super-Admin-only
+  // PUT /admin/tenants/:id/features, or a tenant could raise its own cap.
+  // `automationsPaused` is likewise excluded — it already has its own
+  // dedicated endpoint, per the schema comment on that field.
+  if (settings && typeof settings === 'object') {
+    for (const key of ['allowedChannels', 'maxLeadsPerMonth', 'timezone', 'language', 'crmOption']) {
+      if (settings[key] !== undefined) update[`settings.${key}`] = settings[key];
+    }
+  }
   return Tenant.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });
 }
 
 export async function deleteTenant(id: string): Promise<void> {
   await Tenant.findByIdAndUpdate(id, { isActive: false });
+}
+
+/** Atomically reserves one seat against a tenant's settings.maxUsers cap
+ * before a new active user (invite or reactivation) is created/applied.
+ * This is a single-document conditional update, not a count-then-create —
+ * this deployment's MongoDB connection is a standalone instance (no replica
+ * set), so multi-document transactions aren't available to guard a separate
+ * read+write against a race between two simultaneous requests. A
+ * findOneAndUpdate's filter+update pair is evaluated atomically by MongoDB
+ * itself, so two concurrent callers racing on the same Tenant document can
+ * never both win the last seat — the standard "reserve one of N slots"
+ * pattern. Returns true if a seat was reserved (caller may proceed), false
+ * if the tenant is already at its cap (caller must reject with 403) or the
+ * tenant doesn't exist. Missing/null maxUsers means unlimited. */
+export async function reserveUserSeat(tenantId: string): Promise<boolean> {
+  const reserved = await Tenant.findOneAndUpdate(
+    {
+      _id: tenantId,
+      $or: [
+        { 'settings.maxUsers': { $in: [null, undefined] } },
+        { $expr: { $lt: [{ $ifNull: ['$settings.currentUserCount', 0] }, '$settings.maxUsers'] } },
+      ],
+    },
+    { $inc: { 'settings.currentUserCount': 1 } },
+  );
+  return !!reserved;
+}
+
+/** Unconditional +1 — used when Super Admin adds a user directly (bypasses
+ * the block in reserveUserSeat, but the seat must still count toward future
+ * capacity so a later self-service invite doesn't silently slip past the
+ * real limit). Never rejects. */
+export async function forceAddUserSeat(tenantId: string): Promise<void> {
+  await Tenant.updateOne({ _id: tenantId }, { $inc: { 'settings.currentUserCount': 1 } });
+}
+
+/** Frees a seat on deactivation, or compensates a reserveUserSeat() call
+ * when the subsequent User.create()/save() fails for an unrelated reason —
+ * unconditional, since releasing a seat can never race unsafely (unlike
+ * reserving the last one). Floored at 0 so an already-drifted/undercounted
+ * tenant can't be pushed negative by a double-release. */
+export async function releaseUserSeat(tenantId: string): Promise<void> {
+  await Tenant.updateOne(
+    { _id: tenantId, 'settings.currentUserCount': { $gt: 0 } },
+    { $inc: { 'settings.currentUserCount': -1 } },
+  );
 }
 
 /** Server-generated only — never accepted as client input anywhere (see

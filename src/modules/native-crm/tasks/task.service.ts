@@ -6,6 +6,7 @@ import { sendOnCreateConfirmation } from '../../notifications/confirmation.servi
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
@@ -15,12 +16,12 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listTasks(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
+export async function listTasks(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToCreatedByFilter(filter, scope);
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', ownerTab, userId);
   if (status) filter.taskStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (upcoming) filter.dueDate = { $gte: new Date() };
@@ -42,7 +43,7 @@ export async function getTaskById(tenantId: string, id: string, scope?: DataScop
   return Task.findOne(filter).lean();
 }
 
-export async function createTask(tenantId: string, dto: CreateTaskDTO) {
+export async function createTask(tenantId: string, dto: CreateTaskDTO & { createdBy?: string }) {
   await assertValidStatus(tenantId, dto.taskStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Task.create({
@@ -73,16 +74,30 @@ export async function deleteTask(tenantId: string, id: string, scope?: DataScope
   return deleted;
 }
 
-export async function getTaskStats(tenantId: string, branchId?: string | null, scope?: DataScope) {
+export async function getTaskStats(tenantId: string, branchId?: string | null, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const now = new Date();
-  const filter: Record<string, unknown> = { tenantId: tid };
-  if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToCreatedByFilter(filter, scope);
-  const [total, byStatus, overdue] = await Promise.all([
-    Task.countDocuments(filter),
-    Task.aggregate([{ $match: filter }, { $group: { _id: '$taskStatus', count: { $sum: 1 } } }]),
-    Task.countDocuments({ ...filter, dueDate: { $lt: now }, taskStatus: { $nin: ['done', 'cancelled'] } }),
+  const todayEnd = new Date(now);
+  todayEnd.setHours(23, 59, 59, 999);
+
+  // overdue/dueToday are always real-time signals, independent of the
+  // Today/Week/Month range switcher — same rule the dashboard plan applies
+  // to Work Orders' overdue count. total/byStatus DO respect range.
+  const baseFilter: Record<string, unknown> = { tenantId: tid };
+  if (branchId) baseFilter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToCreatedByFilter(baseFilter, scope);
+
+  const rangedFilter = { ...baseFilter };
+  applyDateRangeToFilter(rangedFilter, 'createdAt', resolveDateRange(range, customFrom, customTo));
+
+  const [total, allTimeTotal, byStatus, overdue, dueToday] = await Promise.all([
+    Task.countDocuments(rangedFilter),
+    // Headline/Kanban-header total — all-time, same reasoning as
+    // Customers'/Leads'/Deals' allTimeTotal (baseFilter is already unranged).
+    Task.countDocuments(baseFilter),
+    Task.aggregate([{ $match: rangedFilter }, { $group: { _id: '$taskStatus', count: { $sum: 1 } } }]),
+    Task.countDocuments({ ...baseFilter, dueDate: { $lt: now }, taskStatus: { $nin: ['done', 'cancelled'] } }),
+    Task.countDocuments({ ...baseFilter, dueDate: { $gte: now, $lte: todayEnd }, taskStatus: { $nin: ['done', 'cancelled'] } }),
   ]);
-  return { total, overdue, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
+  return { total, allTimeTotal, overdue, dueToday, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
 }

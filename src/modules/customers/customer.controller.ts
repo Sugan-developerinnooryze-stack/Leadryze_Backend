@@ -122,7 +122,7 @@ export async function getCustomerStats(req: AuthRequest, res: Response, next: Ne
     const channels = req.query.channels
       ? String(req.query.channels).split(',').map((s) => s.trim()).filter(Boolean)
       : undefined;
-    const stats = await customerService.getCustomerStats(req.tenantId!, channels);
+    const stats = await customerService.getCustomerStats(req.tenantId!, channels, req.query.range as string | undefined, req.query.customFrom as string | undefined, req.query.customTo as string | undefined);
     sendSuccess(res, stats, 'Stats fetched');
   } catch (err) { next(err); }
 }

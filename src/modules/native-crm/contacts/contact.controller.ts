@@ -13,10 +13,11 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status } = req.query as Record<string, string>;
+    const { page, limit, search, status, owner } = req.query as Record<string, string>;
+    const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
     const result = await svc.listContacts(req.tenantId!, {
-      page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-    }, req.branchId, resolveEffectiveScope(req, 'contacts'));
+      page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status, ownerTab,
+    }, req.branchId, resolveEffectiveScope(req, 'contacts'), req.user!.userId);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(result.items, 'contacts', req.user!.role, viewRoles);
     sendSuccess(res, safeItems, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
@@ -34,7 +35,7 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.createContact(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null });
+    const record = await svc.createContact(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null, createdBy: req.user!.userId });
     sendCreated(res, record, 'Contact created');
   } catch { sendError(res, 'Failed to create contact', 500); }
 }

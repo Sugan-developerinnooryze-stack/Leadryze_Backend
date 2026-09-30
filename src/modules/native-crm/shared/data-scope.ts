@@ -56,6 +56,18 @@ export async function resolveDataScope(tenantId: string, user: JwtPayload): Prom
   };
 }
 
+/** The caller's own staffId, for modules scoped by real staff assignment
+ * (Meetings' assignedStaffId) rather than createdBy — used only for the
+ * "My X" view-tab filter, so callers only pay for this lookup when that
+ * tab is actually requested. Returns null if the user has no linked
+ * NativeStaff profile (e.g. a Tenant Admin who never sets one up). */
+export async function resolveOwnStaffId(tenantId: string, userId: string): Promise<string | null> {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const uid = new mongoose.Types.ObjectId(userId);
+  const ownStaff = await NativeStaff.findOne({ tenantId: tid, userId: uid }).select('staffId').lean();
+  return ownStaff?.staffId ?? null;
+}
+
 /** Per-module "is scoping actually enforced" defaults — read whenever a
  * tenant hasn't explicitly set Tenant.dataScopeConfig[key] yet, so behavior
  * is correct before any admin ever visits the settings page. Catalog/
@@ -102,11 +114,40 @@ export function resolveEffectiveScope(req: AuthRequest, moduleKey: string): Data
   return enabled ? scope : { kind: 'all', staffIds: [], teamIds: [], createdByUserIds: [] };
 }
 
+/** Guaranteed to never equal a real createdBy/staffId value — used to force
+ * "no rows match" without a separate $in: [] branch at every call site. */
+const NO_MATCH = '__no_match__';
+
 /** Small shared helpers every scoped module's filter-builder calls the same
  * way — mirrors how branchId scoping is already applied ad hoc per module,
  * just centralizing the "how do I turn a DataScope into a Mongo filter
- * fragment" logic in one place instead of copy-pasting the if/else 5 times. */
-export function applyDataScopeToFilter(filter: Record<string, unknown>, scope: DataScope | undefined, ownerField: string): void {
+ * fragment" logic in one place instead of copy-pasting the if/else 5 times.
+ *
+ * `ownerTab`/`ownStaffId` mirror applyDataScopeToCreatedByFilter's own
+ * ownerTab param — see that function's doc comment for the composition
+ * rules (same AND-with-scope reasoning, keyed on staffId instead of
+ * createdBy since Meetings has a real assignedStaffId field). */
+export function applyDataScopeToFilter(
+  filter: Record<string, unknown>,
+  scope: DataScope | undefined,
+  ownerField: string,
+  ownerTab?: 'my' | 'unassigned',
+  ownStaffId?: string | null,
+): void {
+  const scoped = !!scope && scope.kind !== 'all';
+
+  if (ownerTab === 'my') {
+    if (!ownStaffId) { filter[ownerField] = NO_MATCH; return; }
+    if (scoped && !scope!.staffIds.includes(ownStaffId)) { filter[ownerField] = NO_MATCH; return; }
+    filter[ownerField] = ownStaffId;
+    return;
+  }
+  if (ownerTab === 'unassigned') {
+    if (scoped) { filter[ownerField] = NO_MATCH; return; }
+    filter[ownerField] = { $in: [null, ''] };
+    return;
+  }
+
   if (!scope || scope.kind === 'all') return;
   filter[ownerField] = { $in: scope.staffIds };
 }
@@ -114,8 +155,37 @@ export function applyDataScopeToFilter(filter: Record<string, unknown>, scope: D
 /** Same idea, for modules with no real staff-assignment field — scopes on
  * who CREATED the record instead (Contacts, Companies, Tickets, Calls,
  * Sites, Quotations, Invoices, Receipts, Expenses, and the catalog/
- * reference modules once their own toggle is turned on). */
-export function applyDataScopeToCreatedByFilter(filter: Record<string, unknown>, scope: DataScope | undefined, field = 'createdBy'): void {
+ * reference modules once their own toggle is turned on).
+ *
+ * `ownerTab`/`userId` layer the "My X" / "Unassigned" view-tab filter on
+ * top of whatever row-level scope already applies — composed as a genuine
+ * AND, never a blind overwrite, so a scoped Manager/Agent can't use the
+ * Unassigned tab to see another team's unowned records, and "My" always
+ * resolves to exactly the caller (verified against the scope's own allowed
+ * set, in case a caller is ever in a scope that somehow excludes them). */
+export function applyDataScopeToCreatedByFilter(
+  filter: Record<string, unknown>,
+  scope: DataScope | undefined,
+  field = 'createdBy',
+  ownerTab?: 'my' | 'unassigned',
+  userId?: string,
+): void {
+  const scoped = !!scope && scope.kind !== 'all';
+
+  if (ownerTab === 'my' && userId) {
+    if (scoped && !scope!.createdByUserIds.includes(userId)) { filter[field] = NO_MATCH; return; }
+    filter[field] = userId;
+    return;
+  }
+  if (ownerTab === 'unassigned') {
+    // A scoped user's allowed createdBy set is always specific user ids,
+    // never "no owner" — so an unassigned record can never be in scope for
+    // them, same as any other tenant's record would be out of scope.
+    if (scoped) { filter[field] = NO_MATCH; return; }
+    filter[field] = { $in: [null, ''] };
+    return;
+  }
+
   if (!scope || scope.kind === 'all') return;
   filter[field] = { $in: scope.createdByUserIds };
 }

@@ -72,7 +72,7 @@ export async function remove(req: AuthRequest, res: Response) {
 }
 
 export async function stats(req: AuthRequest, res: Response) {
-  try { sendSuccess(res, await svc.getDealStats(req.tenantId!, resolveEffectiveScope(req, 'deals'))); }
+  try { sendSuccess(res, await svc.getDealStats(req.tenantId!, resolveEffectiveScope(req, 'deals'), req.query.range as string | undefined, req.query.customFrom as string | undefined, req.query.customTo as string | undefined)); }
   catch { sendError(res, 'Failed to fetch stats', 500); }
 }
 

@@ -6,6 +6,7 @@ import { sendOnCreateConfirmation } from '../../notifications/confirmation.servi
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { getOrCreateSlaPolicy, computeDueDates, deriveSlaStatus, slaStatusMongoFilter } from './ticket-sla-policy.service';
 import { SlaStatus } from './ticket.types';
@@ -17,12 +18,12 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
   }
 }
 
-export async function listTickets(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status, relatedModule, relatedId, slaStatus } = opts;
+export async function listTickets(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId, slaStatus, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToCreatedByFilter(filter, scope);
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', ownerTab, userId);
   if (status) filter.ticketStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (search) {
@@ -51,7 +52,7 @@ export async function getTicketById(tenantId: string, id: string, scope?: DataSc
   return item ? { ...item, slaStatus: deriveSlaStatus(item) } : item;
 }
 
-export async function createTicket(tenantId: string, dto: CreateTicketDTO) {
+export async function createTicket(tenantId: string, dto: CreateTicketDTO & { createdBy?: string }) {
   await assertValidStatus(tenantId, dto.ticketStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
 
@@ -98,11 +99,12 @@ export async function deleteTicket(tenantId: string, id: string, scope?: DataSco
   return deleted;
 }
 
-export async function getTicketStats(tenantId: string, branchId?: string | null, scope?: DataScope) {
+export async function getTicketStats(tenantId: string, branchId?: string | null, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
   applyDataScopeToCreatedByFilter(filter, scope);
+  applyDateRangeToFilter(filter, 'createdAt', resolveDateRange(range, customFrom, customTo));
   const [total, byStatus] = await Promise.all([
     Ticket.countDocuments(filter),
     Ticket.aggregate([{ $match: filter }, { $group: { _id: '$ticketStatus', count: { $sum: 1 } } }]),

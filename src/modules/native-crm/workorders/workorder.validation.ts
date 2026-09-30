@@ -4,6 +4,7 @@ import { customFields, serviceLine, partLine } from '../../../utils/common.schem
 export const createWorkorderSchema = z.object({
   customerId:    z.string().trim().min(1),
   title:         z.string().trim().min(1).max(300),
+  address:       z.string().trim().optional(),
   siteId:        z.string().trim().optional(),
   teamId:        z.string().trim().optional(),
   staffId:       z.string().trim().optional(),

@@ -9,16 +9,17 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { resolveTeamFromStaffId } from '../shared/team-resolution';
 import { NativeTimeline } from '../timeline/timeline.model';
 import { Tenant } from '../../tenants/tenant.model';
+import { isFeatureFlagEnabled } from '../../tenants/tenant.service';
 import { Lead } from '../leads/lead.model';
 import { convertLeadToCustomer } from '../leads/lead-conversion.service';
 import { NativeStaff } from '../staffs/staff.model';
 import { isSlotFree } from './availability.service';
 
-export async function listMeetings(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
+export async function listMeetings(tenantId: string, opts: ListOptions = {}, scope?: DataScope, ownStaffId?: string | null): Promise<PaginatedResult<unknown>> {
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId', ownerTab, ownStaffId);
   if (status) filter.meetingStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (upcoming) filter.startDate = { $gte: new Date() };
@@ -40,10 +41,27 @@ export async function getMeetingById(tenantId: string, id: string, scope?: DataS
   return Meeting.findOne(filter).lean();
 }
 
+/** `dto.source` (already a real, typed field — 'manual' | 'widget', set by
+ * internal.routes.ts's widget-booking handler, absent/'manual' for the
+ * normal staff-facing create path) is reused here rather than adding a new
+ * parameter: only a `source: 'widget'` booking is gated on Phase 2's
+ * auto_booking flag — "Booking confirmations & reminders" was decided to
+ * mean AI/widget bookings only, not every meeting. Gating
+ * sendOnCreateConfirmation() itself would have also silenced staff-created
+ * call/task/ticket confirmations, since it's one shared function across all
+ * four — so the check lives here instead, before that shared function is
+ * ever called for a widget booking. */
 export async function createMeeting(tenantId: string, dto: CreateMeetingDTO) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Meeting.create({ tenantId: tid, ...dto });
-  void sendOnCreateConfirmation(tenantId, 'meeting', created.toObject()); // fire-and-forget, never throws
+  if (dto.source === 'widget') {
+    const tenant = await Tenant.findById(tid).select('featureFlags').lean();
+    if (isFeatureFlagEnabled({ featureFlags: tenant?.featureFlags }, 'auto_booking')) {
+      void sendOnCreateConfirmation(tenantId, 'meeting', created.toObject()); // fire-and-forget, never throws
+    }
+  } else {
+    void sendOnCreateConfirmation(tenantId, 'meeting', created.toObject()); // fire-and-forget, never throws
+  }
   indexNativeSearchRecord(tenantId, 'native', 'meetings', created.toObject(), created.title);
   return created;
 }

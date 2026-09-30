@@ -32,4 +32,8 @@ export interface ListOptions {
   // ticket-sla-policy.service.ts's slaStatusMongoFilter(). Not supported by
   // any other module's list service.
   slaStatus?: string;
+  // "My X" / "Unassigned" view-tab filter (CrmLayout.tsx's viewTab) — see
+  // applyDataScopeToCreatedByFilter's ownerTab param. Composes with, never
+  // widens past, the row-level data scope already applied for Manager/Agent.
+  ownerTab?: 'my' | 'unassigned';
 }

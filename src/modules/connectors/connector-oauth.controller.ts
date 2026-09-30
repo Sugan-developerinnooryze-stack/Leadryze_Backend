@@ -5,7 +5,7 @@ import axios from 'axios';
 import { config } from '../../config';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
-import { createConnector } from './connector.service';
+import { createConnector, assertConnectorTypeAllowed } from './connector.service';
 import { OAuthStateNonce } from './oauth-state-nonce.model';
 import { logger } from '../../utils/logger';
 
@@ -75,6 +75,16 @@ export async function initiateOAuth(req: AuthRequest, res: Response): Promise<vo
   const type = req.params.type;
   if (!isOAuthType(type)) {
     sendError(res, 'OAuth connect is only available for zoho and hubspot — salesforce already uses its own Client Credentials flow', 400);
+    return;
+  }
+
+  // Defense in depth — createConnector() re-checks this too once the OAuth
+  // dance completes, but failing here means a disabled tenant is never even
+  // sent through the provider's own consent screen only to be rejected after.
+  try {
+    await assertConnectorTypeAllowed(req.tenantId!, type);
+  } catch (err) {
+    sendError(res, (err as Error).message, (err as { statusCode?: number }).statusCode ?? 403);
     return;
   }
 

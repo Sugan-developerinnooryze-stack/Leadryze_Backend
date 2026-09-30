@@ -1,7 +1,7 @@
 import { Router, Response, NextFunction } from 'express';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
-import { authenticate, authorize } from '../../middlewares/auth.middleware';
+import { authenticate, authorize, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { resolveBranch } from '../../middlewares/branch.middleware';
 import { uploadAudio } from '../../middlewares/upload.middleware';
@@ -83,7 +83,7 @@ router.post('/chat', async (req: AuthRequest, res: Response, next: NextFunction)
  *     tags: [AI]
  *     summary: Search knowledge base
  */
-router.post('/knowledge', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/knowledge', requirePermission('knowledge.create'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     // Was posting to `${AI_URL}/api/knowledge` — the AI service has no such
     // route (it's `/api/knowledge/ingest`), so this call 404'd every time.
@@ -100,7 +100,7 @@ router.post('/knowledge', async (req: AuthRequest, res: Response, next: NextFunc
   }
 });
 
-router.post('/knowledge/search', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/knowledge/search', requirePermission('knowledge.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     // Was a GET reading req.query, but the AI service's /knowledge/search is
     // a POST reading req.body — also pre-existing and also fixed here; the
@@ -124,7 +124,7 @@ router.post('/knowledge/search', async (req: AuthRequest, res: Response, next: N
  *     tags: [AI]
  *     summary: Crawl the tenant's own website and ingest its pages into the RAG knowledge base
  */
-router.post('/knowledge/crawl', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/knowledge/crawl', requirePermission('knowledge.create'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const response = await axios.post(
       `${AI_URL}/api/knowledge/crawl`,
@@ -137,7 +137,7 @@ router.post('/knowledge/crawl', async (req: AuthRequest, res: Response, next: Ne
   }
 });
 
-router.get('/knowledge/crawl-status', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/knowledge/crawl-status', requirePermission('knowledge.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const response = await axios.get(`${AI_URL}/api/knowledge/crawl-status`, {
       headers: aiHeaders,
@@ -149,7 +149,7 @@ router.get('/knowledge/crawl-status', async (req: AuthRequest, res: Response, ne
   }
 });
 
-router.delete('/knowledge/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.delete('/knowledge/:id', requirePermission('knowledge.delete'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     await axios.delete(`${AI_URL}/api/knowledge/${req.params.id}`, {
       headers: aiHeaders,

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import * as controller from './customer.controller';
 import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 
 const router = Router();
 
@@ -12,7 +13,10 @@ const router = Router();
  *   description: Lead and customer management
  */
 
-router.use(authenticate, requireTenant);
+// Same fix as connector.routes.ts — mounted directly in app.ts, so this had
+// permission checks but no tenant feature-flag enforcement. Same flag key
+// Sidebar.tsx's ENGAGE_NAV already gates the Customers nav item with.
+router.use(authenticate, requireTenant, requireModuleEnabled('nav_customers'));
 
 /**
  * @swagger

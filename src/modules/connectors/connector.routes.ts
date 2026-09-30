@@ -2,6 +2,7 @@ import { Router } from 'express';
 import * as controller from './connector.controller';
 import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 
 const router = Router();
 
@@ -12,7 +13,15 @@ const router = Router();
  *   description: External CRM and database connectors — Zoho, HubSpot, Salesforce, MySQL, PostgreSQL, MongoDB, REST API
  */
 
-router.use(authenticate, requireTenant);
+// Mounted directly in app.ts (not routed through native-crm.router.ts's
+// requireModuleEnabled wrapping like every fs_*/native_* module gets), so
+// this was previously the one module with permission checks but no tenant
+// feature-flag enforcement at all server-side — a Super-Admin-disabled
+// Connectors module still fully served data to any user who individually
+// held connector.view. Same flag key Sidebar.tsx already gates the nav
+// item with (PLATFORM_NAV's 'nav_connectors'), so this can't drift out of
+// sync with what the sidebar considers enabled.
+router.use(authenticate, requireTenant, requireModuleEnabled('nav_connectors'));
 
 /**
  * @swagger

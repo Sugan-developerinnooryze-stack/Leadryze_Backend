@@ -1,10 +1,12 @@
 import mongoose from 'mongoose';
 import { NativeQuotation } from './quotation.model';
+import { NativeContract } from '../contracts/contract.model';
 import { QuotationListOptions } from './quotation.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { advanceWorkflow } from '../workflow/workflow.engine';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -56,6 +58,15 @@ export async function createQuotation(data: any) {
     servicesAmount:        after,
     servicesAmountWithTax: after + (after * gst) / 100,
   });
+  // Mirrors the identical source-linking pattern already used by
+  // createWorkorder/createContract/createInvoice — marks the source
+  // Contract workflowState='complete' once a Quotation has been created
+  // from it, so the Contract row's "convert" button (once that also checks
+  // workflowState) stops offering to convert it again.
+  if (data.createdBy !== 'system' && data.contractId) {
+    const src = await NativeContract.findOne({ contractId: data.contractId }).select('_id').lean();
+    if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'quotation', mongoId: (created._id as any).toString() }).catch(() => {});
+  }
   indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'quotations', created.toObject(), created.title);
   return created;
 }

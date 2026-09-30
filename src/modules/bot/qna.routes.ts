@@ -1,6 +1,6 @@
 import { Router, Response, NextFunction } from 'express';
 import mongoose from 'mongoose';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
@@ -14,7 +14,7 @@ const router = Router();
 router.use(authenticate, requireTenant);
 
 // GET /api/v1/bot/qna — list all Q&A pairs for this tenant
-router.get('/qna', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/qna', requirePermission('bot.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const pairs = await QnAPair.find({ tenantId: req.tenantId }).sort({ createdAt: -1 });
     sendSuccess(res, pairs);
@@ -22,7 +22,7 @@ router.get('/qna', async (req: AuthRequest, res: Response, next: NextFunction) =
 });
 
 // POST /api/v1/bot/qna — create a new Q&A pair
-router.post('/qna', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/qna', requirePermission('bot.configure'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { question, answer, category } = req.body as { question: string; answer: string; category?: string };
     if (!question?.trim() || !answer?.trim()) {
@@ -35,7 +35,7 @@ router.post('/qna', async (req: AuthRequest, res: Response, next: NextFunction) 
 });
 
 // PUT /api/v1/bot/qna/:id — update
-router.put('/qna/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.put('/qna/:id', requirePermission('bot.configure'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { question, answer, category, isActive } = req.body as { question?: string; answer?: string; category?: string; isActive?: boolean };
     const pair = await QnAPair.findOneAndUpdate(
@@ -49,7 +49,7 @@ router.put('/qna/:id', async (req: AuthRequest, res: Response, next: NextFunctio
 });
 
 // DELETE /api/v1/bot/qna/:id
-router.delete('/qna/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.delete('/qna/:id', requirePermission('bot.configure'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const pair = await QnAPair.findOneAndDelete({ _id: req.params.id, tenantId: req.tenantId });
     if (!pair) { sendError(res, 'Not found', 404); return; }
@@ -58,7 +58,7 @@ router.delete('/qna/:id', async (req: AuthRequest, res: Response, next: NextFunc
 });
 
 // GET /api/v1/bot/chat-history — list chat sessions
-router.get('/chat-history', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/chat-history', requirePermission('bot.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page as string || '1', 10));
     const limit = Math.min(50, parseInt(req.query.limit as string || '20', 10));
@@ -78,7 +78,7 @@ router.get('/chat-history', async (req: AuthRequest, res: Response, next: NextFu
 // assistant message enriched with its AI trace (source/confidence/tokens/
 // cost/tool calls) via the same correlation logic the Super Admin
 // Conversation Inspector uses — see attachAiActionTrace.
-router.get('/chat-history/:sessionId', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/chat-history/:sessionId', requirePermission('bot.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const session = await ChatSession.findOne({ sessionId: req.params.sessionId, tenantId: req.tenantId }).lean();
     if (!session) { sendError(res, 'Not found', 404); return; }
@@ -88,7 +88,7 @@ router.get('/chat-history/:sessionId', async (req: AuthRequest, res: Response, n
 });
 
 /* ── GET /api/v1/bot/ai-actions — paginated AI action log ── */
-router.get('/ai-actions', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/ai-actions', requirePermission('bot.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const page     = Math.max(1, parseInt(req.query.page as string || '1', 10));
     const limit    = Math.min(100, parseInt(req.query.limit as string || '30', 10));
@@ -110,7 +110,7 @@ router.get('/ai-actions', async (req: AuthRequest, res: Response, next: NextFunc
 });
 
 /* ── GET /api/v1/bot/ai-actions/stats — overview counts ── */
-router.get('/ai-actions/stats', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/ai-actions/stats', requirePermission('bot.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
@@ -141,7 +141,7 @@ router.get('/ai-actions/stats', async (req: AuthRequest, res: Response, next: Ne
 });
 
 /* ── GET /api/v1/bot/leads — leads captured via chat ── */
-router.get('/leads', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/leads', requirePermission('bot.view'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page as string || '1', 10));
     const limit = Math.min(100, parseInt(req.query.limit as string || '20', 10));
@@ -164,7 +164,7 @@ router.get('/leads', async (req: AuthRequest, res: Response, next: NextFunction)
 });
 
 /* ── POST /api/v1/bot/crm-chat — local CRM + activities NLP search ─────────── */
-router.post('/crm-chat', async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/crm-chat', requirePermission('bot.use'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { message } = req.body as { message?: string };
     if (!message?.trim()) {

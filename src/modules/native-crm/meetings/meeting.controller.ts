@@ -3,15 +3,17 @@ import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated } from '../../../utils/response';
 import * as svc from './meeting.service';
 import { resolveSupervisorName } from '../shared/team-resolution';
-import { resolveEffectiveScope } from '../shared/data-scope';
+import { resolveEffectiveScope, resolveOwnStaffId } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, relatedModule, relatedId, upcoming } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId, upcoming, owner } = req.query as Record<string, string>;
+    const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
+    const ownStaffId = ownerTab === 'my' ? await resolveOwnStaffId(req.tenantId!, req.user!.userId) : null;
     const result = await svc.listMeetings(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-      relatedModule, relatedId, upcoming: upcoming === 'true',
-    }, resolveEffectiveScope(req, 'meetings'));
+      relatedModule, relatedId, upcoming: upcoming === 'true', ownerTab,
+    }, resolveEffectiveScope(req, 'meetings'), ownStaffId);
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch meetings', 500); }
 }

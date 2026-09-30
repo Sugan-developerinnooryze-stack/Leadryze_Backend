@@ -61,13 +61,21 @@ export async function createInvoice(data: any) {
     servicesAmountWithTax: after + (after * gst) / 100,
   });
   const mongoId = (doc._id as any).toString();
+  // Independent checks, not if/else-if — same fix and same reason as
+  // createWorkorder(): buildPrefill.ts now carries the full ancestor chain
+  // forward, so an Invoice created from a WorkOrder can legitimately also
+  // carry a quotationId and/or contractId at once, and each one present
+  // should be marked complete, not just whichever the old else-if chain
+  // reached first.
   if (data.workOrderId) {
     const src = await NativeWorkorder.findOne({ workOrderId: data.workOrderId }).select('_id').lean();
     if (src) advanceWorkflow({ type: 'workorder', mongoId: (src._id as any).toString() }, { type: 'invoice', mongoId }).catch(() => {});
-  } else if (data.quotationId) {
+  }
+  if (data.quotationId) {
     const src = await NativeQuotation.findOne({ quotationId: data.quotationId }).select('_id').lean();
     if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'invoice', mongoId }).catch(() => {});
-  } else if (data.contractId) {
+  }
+  if (data.contractId) {
     const src = await NativeContract.findOne({ contractId: data.contractId }).select('_id').lean();
     if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'invoice', mongoId }).catch(() => {});
   }

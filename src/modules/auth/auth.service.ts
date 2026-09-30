@@ -21,6 +21,63 @@ export interface LoginResult {
   refreshToken: string;
   user:         Omit<IUser, 'password' | 'refreshToken'>;
   permissions:  string[] | null; // null = full access (SUPER_ADMIN / TENANT_ADMIN without roleId)
+  mustChangePassword: boolean;
+}
+
+/** Undefined/'approved' both mean "allowed" — undefined covers every
+ * pre-existing tenant plus any .lean() read of a legacy document that
+ * predates this field (schema defaults don't hydrate on .lean()). Only the
+ * literal values 'pending'/'rejected' ever block login. Shared by both the
+ * email and Client-ID login branches so they can never enforce different
+ * rules. */
+function assertTenantLoginAllowed(tenant: { isActive?: boolean; approvalStatus?: string } | null): void {
+  if (tenant?.approvalStatus === 'pending') {
+    throw Object.assign(new Error('Your account is awaiting Super Admin approval.'), { statusCode: 403 });
+  }
+  if (tenant?.approvalStatus === 'rejected') {
+    throw Object.assign(new Error('Your account request was not approved. Contact support.'), { statusCode: 403 });
+  }
+  if (tenant && !tenant.isActive) {
+    throw Object.assign(new Error("Your organization's account has been deactivated. Contact support."), { statusCode: 403 });
+  }
+}
+
+/** Client-ID login has no second field to pick one specific person at a
+ * company — it tries the new password against every active user at that
+ * tenant (see loginUserByClientId). That's only safe if no two people at
+ * the same company can ever have matching passwords, so this is called
+ * before EVERY password is set, anywhere in the app (self-service change,
+ * forgot-password, and every Super-Admin-issued credential), and rejects
+ * the new password if it would collide with anyone else's. Compares via
+ * bcrypt against each candidate's hash — works regardless of whether that
+ * other person's password was self-chosen or admin-issued. */
+export async function isPasswordTakenAtTenant(
+  tenantId: string | mongoose.Types.ObjectId,
+  plaintextPassword: string,
+  excludeUserId?: string,
+): Promise<boolean> {
+  const others = await User.find({
+    tenantId,
+    isActive: true,
+    ...(excludeUserId ? { _id: { $ne: excludeUserId } } : {}),
+  }).select('+password');
+  for (const other of others) {
+    if (await other.comparePassword(plaintextPassword)) return true;
+  }
+  return false;
+}
+
+export async function assertPasswordUniqueAtTenant(
+  tenantId: string | mongoose.Types.ObjectId,
+  plaintextPassword: string,
+  excludeUserId?: string,
+): Promise<void> {
+  if (await isPasswordTakenAtTenant(tenantId, plaintextPassword, excludeUserId)) {
+    throw Object.assign(
+      new Error('This password is already in use by another account at your company. Choose a different one.'),
+      { statusCode: 409 },
+    );
+  }
 }
 
 export interface RegisterInput {
@@ -58,15 +115,25 @@ export async function registerUser(input: RegisterInput): Promise<{ message: str
     tries++;
   } while (tries < 10 && await Tenant.exists({ clientId }));
 
+  const { getPlatformDefaults } = await import('../admin/platform-defaults.model');
+  const platformDefaults = await getPlatformDefaults();
+
   const tenant = await Tenant.create({
     clientId,
     name: companyName,
     slug,
     plan: 'starter',
     isActive: true,
+    approvalStatus: 'pending',
+    // Same "inherit the current template, stay on default" behavior as
+    // provisionTenant() — see getEffectiveFeatureFlags() in tenant.service.ts.
+    accessConfigMode: 'default',
+    featureFlags: platformDefaults,
     settings: {
       allowedChannels: ['web', 'whatsapp', 'email', 'sms'],
       maxUsers: 5,
+      // The TENANT_ADMIN created right below already occupies one seat.
+      currentUserCount: 1,
       maxLeadsPerMonth: 500,
       timezone: 'Asia/Kuala_Lumpur',
       language: 'en',
@@ -117,7 +184,7 @@ export async function registerUser(input: RegisterInput): Promise<{ message: str
     htmlContent: `
       <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px">
         <h2 style="color:#1a1a2e">Welcome to LeadRyze AI, ${input.firstName}!</h2>
-        <p>Your account has been created. Please verify your email address to get started.</p>
+        <p>Your account has been created. Please verify your email address to complete your signup request.</p>
         <div style="margin:32px 0">
           <a href="${verifyUrl}" style="background:#2563eb;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">
             Verify Email Address
@@ -134,7 +201,12 @@ export async function registerUser(input: RegisterInput): Promise<{ message: str
   return { message: 'Registration successful. Please check your email to verify your account.' };
 }
 
-export async function verifyEmail(token: string, email: string): Promise<LoginResult> {
+export interface PendingApprovalResult {
+  status: 'pending_approval';
+  message: string;
+}
+
+export async function verifyEmail(token: string, email: string): Promise<LoginResult | PendingApprovalResult> {
   const user = await User.findOne({
     email: email.toLowerCase(),
     emailVerificationToken: sha256(token),
@@ -147,6 +219,18 @@ export async function verifyEmail(token: string, email: string): Promise<LoginRe
     emailVerified: true,
     $unset: { emailVerificationToken: 1, emailVerificationExpiry: 1 },
   });
+
+  // Approval-gated tenants (self-signup) don't get an auto-issued session
+  // just from verifying their email anymore — a Super Admin has to approve
+  // first. Every other tenant (approved, or undefined on a legacy .lean()
+  // read) keeps today's behavior of logging straight in.
+  const tenant = await Tenant.findById(user.tenantId).select('approvalStatus').lean();
+  if (tenant?.approvalStatus === 'pending') {
+    return {
+      status: 'pending_approval',
+      message: "Email verified. Your account is awaiting Super Admin approval — you'll receive an email with your login details once approved.",
+    };
+  }
 
   const payload: Omit<JwtPayload, 'iat' | 'exp'> = {
     userId: (user._id as mongoose.Types.ObjectId).toString(),
@@ -163,7 +247,12 @@ export async function verifyEmail(token: string, email: string): Promise<LoginRe
   delete userObj.refreshToken;
   delete userObj.emailVerificationToken;
 
-  return { ...tokens, user: userObj as unknown as Omit<IUser, 'password' | 'refreshToken'>, permissions: null };
+  return {
+    ...tokens,
+    user: userObj as unknown as Omit<IUser, 'password' | 'refreshToken'>,
+    permissions: null,
+    mustChangePassword: user.mustChangePassword ?? false,
+  };
 }
 
 export async function loginUser(
@@ -171,7 +260,15 @@ export async function loginUser(
   password: string,
   tenantId?: string,
   ctx?: { ip?: string; userAgent?: string },
+  clientId?: string,
 ): Promise<LoginResult> {
+  // New, additive login path — every existing call site omits this 5th
+  // arg, so it's always undefined for them and this guard never fires.
+  // Everything below is the pre-existing email branch, unmodified.
+  if (clientId) {
+    return loginUserByClientId(clientId, password, ctx);
+  }
+
   const query: Record<string, unknown> = { email: email.toLowerCase(), isActive: true };
   if (tenantId) query.tenantId = tenantId;
 
@@ -205,6 +302,137 @@ export async function loginUser(
     throw Object.assign(new Error('Please verify your email before logging in. Check your inbox.'), { statusCode: 403 });
   }
 
+  // Deactivated/pending/rejected tenants block login for everyone except
+  // Super Admin (who manages these flags itself — never lock out the
+  // account that can undo a mistaken deactivation).
+  if (user.role !== 'SUPER_ADMIN') {
+    const tenant = await Tenant.findById(user.tenantId).select('isActive approvalStatus').lean();
+    try {
+      assertTenantLoginAllowed(tenant);
+    } catch (err) {
+      logSecurityEvent('auth.login_failed', {
+        tenantId:  user.tenantId.toString(),
+        ip:        ctx?.ip ?? 'unknown',
+        userAgent: ctx?.userAgent ?? 'unknown',
+        detail:    { email, reason: tenantBlockReason(tenant) },
+      });
+      throw err;
+    }
+  }
+
+  return finalizeSuccessfulLogin(user, ctx);
+}
+
+/** Client-ID + password login — resolves `user` differently (Client ID
+ * identifies the tenant, then the account within it) but shares every
+ * other rule with the email branch above: the same `assertTenantLoginAllowed`
+ * gate, and the same `finalizeSuccessfulLogin` tail for token issuance,
+ * security-event logging, session creation, and permission resolution.
+ * Rate limiting is shared automatically — both paths go through the same
+ * POST /auth/login route and authRateLimit middleware.
+ *
+ * The plain, shared tenant Client ID resolves ONLY to a TENANT_ADMIN at
+ * that company — never to a sub-user, even if the submitted password
+ * happens to match one. Confirmed live (2026-09-22): a Super Admin testing
+ * this by hand hit exactly the ambiguous case — typing the shared Client ID
+ * with a Manager's password logged them in AS that Manager, not as the
+ * Tenant Admin they intended, because nothing about the submitted value
+ * says WHICH person. Every sub-user has their own distinct loginId
+ * (`${clientId}-U${seq}`) precisely so this can be unambiguous instead —
+ * see the direct-match branch below, which is what they're expected to use.
+ * assertPasswordUniqueAtTenant() still guards every password-setting call
+ * site as defense in depth (and disambiguates the rare multi-TENANT_ADMIN
+ * case below), but is no longer what makes this branch safe by itself. */
+async function loginUserByClientId(
+  clientId: string,
+  password: string,
+  ctx?: { ip?: string; userAgent?: string },
+): Promise<LoginResult> {
+  const normalized = clientId.trim().toUpperCase();
+
+  const tenant = await Tenant.findOne({ clientId: normalized }).select('_id isActive approvalStatus').lean();
+  if (tenant) {
+    const candidates = await User.find({ tenantId: tenant._id, isActive: true, role: 'TENANT_ADMIN' }).select('+password');
+    let user: (typeof candidates)[number] | undefined;
+    for (const candidate of candidates) {
+      if (await candidate.comparePassword(password)) { user = candidate; break; }
+    }
+    if (!user) {
+      logSecurityEvent('auth.login_failed', {
+        tenantId:  String(tenant._id),
+        ip:        ctx?.ip ?? 'unknown',
+        userAgent: ctx?.userAgent ?? 'unknown',
+        detail:    { clientId: normalized },
+      });
+      throw Object.assign(new Error('Invalid Client ID or password'), { statusCode: 401 });
+    }
+
+    if (!user.emailVerified && user.role !== 'SUPER_ADMIN') {
+      throw Object.assign(new Error('Please verify your email before logging in. Check your inbox.'), { statusCode: 403 });
+    }
+
+    if (user.role !== 'SUPER_ADMIN') {
+      try {
+        assertTenantLoginAllowed(tenant);
+      } catch (err) {
+        logSecurityEvent('auth.login_failed', {
+          tenantId:  String(tenant._id),
+          ip:        ctx?.ip ?? 'unknown',
+          userAgent: ctx?.userAgent ?? 'unknown',
+          detail:    { clientId: normalized, reason: tenantBlockReason(tenant) },
+        });
+        throw err;
+      }
+    }
+
+    return finalizeSuccessfulLogin(user, ctx);
+  }
+
+  // New path — only reached when `normalized` isn't any tenant's raw
+  // clientId at all (every real clientId is a fixed 8-char hex value, so it
+  // can never collide with a "${clientId}-U${seq}" loginId). A loginId
+  // match pins down exactly one person; only THAT account's password is
+  // ever checked — unlike the legacy branch above, a wrong password here
+  // must not fall through and get tried against anyone else at the tenant.
+  const direct = await User.findOne({ loginId: normalized, isActive: true }).select('+password');
+  if (direct && await direct.comparePassword(password)) {
+    if (!direct.emailVerified && direct.role !== 'SUPER_ADMIN') {
+      throw Object.assign(new Error('Please verify your email before logging in. Check your inbox.'), { statusCode: 403 });
+    }
+    if (direct.role !== 'SUPER_ADMIN') {
+      const directTenant = await Tenant.findById(direct.tenantId).select('isActive approvalStatus').lean();
+      try {
+        assertTenantLoginAllowed(directTenant);
+      } catch (err) {
+        logSecurityEvent('auth.login_failed', {
+          tenantId:  direct.tenantId.toString(),
+          ip:        ctx?.ip ?? 'unknown',
+          userAgent: ctx?.userAgent ?? 'unknown',
+          detail:    { loginId: normalized, reason: tenantBlockReason(directTenant) },
+        });
+        throw err;
+      }
+    }
+    return finalizeSuccessfulLogin(direct, ctx);
+  }
+
+  logSecurityEvent('auth.login_failed', {
+    ip: ctx?.ip ?? 'unknown', userAgent: ctx?.userAgent ?? 'unknown', detail: { clientId: normalized },
+  });
+  throw Object.assign(new Error('Invalid Client ID or password'), { statusCode: 401 });
+}
+
+function tenantBlockReason(tenant: { isActive?: boolean; approvalStatus?: string } | null): string {
+  if (tenant?.approvalStatus === 'pending')  return 'tenant_pending_approval';
+  if (tenant?.approvalStatus === 'rejected') return 'tenant_rejected';
+  return 'tenant_deactivated';
+}
+
+/** Shared tail for every successful login, regardless of how `user` was
+ * resolved (email+password candidate loop, or Client ID + password) — token
+ * issuance, security-event logging, session creation, and permission
+ * resolution must never diverge between the two login paths. */
+async function finalizeSuccessfulLogin(user: IUser, ctx?: { ip?: string; userAgent?: string }): Promise<LoginResult> {
   const userId        = (user._id as mongoose.Types.ObjectId).toString();
   const userTenantId  = user.tenantId.toString();
   const roleId        = user.roleId?.toString();
@@ -255,7 +483,12 @@ export async function loginUser(
     permissions = await getPermissionArray(userTenantId, roleId).catch(() => null);
   }
 
-  return { ...tokens, user: userObj as unknown as Omit<IUser, 'password' | 'refreshToken'>, permissions };
+  return {
+    ...tokens,
+    user: userObj as unknown as Omit<IUser, 'password' | 'refreshToken'>,
+    permissions,
+    mustChangePassword: user.mustChangePassword ?? false,
+  };
 }
 
 export async function forgotPassword(email: string): Promise<void> {
@@ -305,11 +538,21 @@ export async function changePassword(userId: string, currentPassword: string, ne
   const matches = await user.comparePassword(currentPassword);
   if (!matches) throw Object.assign(new Error('Current password is incorrect'), { statusCode: 401 });
 
+  await assertPasswordUniqueAtTenant(user.tenantId, newPassword, userId);
+
   user.password = newPassword;
   await user.save(); // triggers bcrypt hash via pre-save hook
 
-  // Invalidate existing refresh token — forces re-login on other devices
-  await User.findByIdAndUpdate(userId, { refreshToken: null });
+  // Invalidate existing refresh token — forces re-login on other devices.
+  // Also explicitly clears mustChangePassword: for every existing user this
+  // is already false (no-op write of the same value); for a Super-Admin-
+  // provisioned/approved tenant admin changing their forced temporary
+  // password, this is what lets RequireAuth stop redirecting them back to
+  // /change-password once the frontend re-fetches /auth/me.
+  // $unset passwordEnc — this is now a self-chosen password; any encrypted
+  // copy a Super Admin could previously read back is stale and must not
+  // keep being shown as if it still worked.
+  await User.findByIdAndUpdate(userId, { refreshToken: null, mustChangePassword: false, $unset: { passwordEnc: 1 } });
 }
 
 export async function resetPassword(token: string, email: string, newPassword: string): Promise<void> {
@@ -321,12 +564,20 @@ export async function resetPassword(token: string, email: string, newPassword: s
 
   if (!user) throw Object.assign(new Error('Invalid or expired reset link'), { statusCode: 400 });
 
+  await assertPasswordUniqueAtTenant(user.tenantId, newPassword, (user._id as mongoose.Types.ObjectId).toString());
+
   user.password = newPassword;
   await user.save(); // triggers bcrypt hash via pre-save hook
 
   await User.findByIdAndUpdate(user._id, {
-    $unset: { passwordResetToken: 1, passwordResetExpiry: 1 },
+    // Self-chosen — clear any Super-Admin-readable copy, it's now stale.
+    // mustChangePassword: false matches changePassword()'s own update
+    // above — without it, a brand-new user who uses Forgot Password
+    // instead of their first real login would still get redirected to
+    // change their password again right after they just changed it.
+    $unset: { passwordResetToken: 1, passwordResetExpiry: 1, passwordEnc: 1 },
     refreshToken: null,
+    mustChangePassword: false,
   });
 }
 

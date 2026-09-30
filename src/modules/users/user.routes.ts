@@ -4,13 +4,16 @@ import crypto from 'crypto';
 import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { AuthRequest } from '../../types';
-import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../utils/response';
+import { sendSuccess, sendError, sendCreated } from '../../utils/response';
 import { User } from '../auth/auth.model';
 import { Role } from '../rbac/role.model';
 import { invalidateRoleCache } from '../rbac/permission.service';
 import { sendEmailNow } from '../messages/brevo.service';
 import { config } from '../../config';
 import { logAuditEvent } from '../logs/audit-log.model';
+import { isPasswordTakenAtTenant } from '../auth/auth.service';
+import { Tenant } from '../tenants/tenant.model';
+import { reserveUserSeat, releaseUserSeat } from '../tenants/tenant.service';
 
 const router = Router();
 
@@ -36,7 +39,7 @@ router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, n
 
     if (req.query.role) filter.role = req.query.role;
 
-    const [users, total] = await Promise.all([
+    const [users, total, tenant, activeUsers] = await Promise.all([
       User.find(filter)
         .select('-password -refreshToken -emailVerificationToken -passwordResetToken')
         .populate('roleId', 'name description isSystem')
@@ -45,9 +48,18 @@ router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, n
         .limit(limit)
         .lean(),
       User.countDocuments(filter),
+      Tenant.findById(tenantId).select('settings.maxUsers').lean(),
+      // Live ground truth, unfiltered by search/role — the number the seat
+      // cap is actually compared against, which `total` above isn't
+      // guaranteed to equal once a search/role query param is applied.
+      User.countDocuments({ tenantId: new mongoose.Types.ObjectId(tenantId), role: { $ne: 'SUPER_ADMIN' }, isActive: true }),
     ]);
 
-    return sendPaginated(res, users, total, page, limit);
+    return sendSuccess(res, users, 'Success', 200, {
+      page, limit, total, totalPages: Math.ceil(total / limit),
+      maxUsers: tenant?.settings?.maxUsers ?? null,
+      activeUsers,
+    });
   } catch (err) {
     next(err);
   }
@@ -91,21 +103,57 @@ router.post('/', requirePermission('users.create'), async (req: AuthRequest, res
       }
     }
 
-    // Generate temp password if not provided
-    const tempPassword  = rawPassword || crypto.randomBytes(8).toString('hex');
+    // Generate temp password if not provided. Either way it must not
+    // collide with anyone else's password at this tenant — Client-ID
+    // login has no second field to tell two people at the same company
+    // apart, so it tries the password against every account there.
+    let tempPassword: string;
+    if (rawPassword) {
+      if (await isPasswordTakenAtTenant(tenantId, rawPassword)) {
+        return sendError(res, 'This password is already in use by another account at your company. Choose a different one.', 409);
+      }
+      tempPassword = rawPassword;
+    } else {
+      tempPassword = crypto.randomBytes(8).toString('hex');
+      let tries = 0;
+      while (tries < 10 && await isPasswordTakenAtTenant(tenantId, tempPassword)) {
+        tempPassword = crypto.randomBytes(8).toString('hex');
+        tries++;
+      }
+    }
     const isEmailVerified = true; // admin-created users skip email verification
 
-    const user = await User.create({
-      email:         email.toLowerCase().trim(),
-      password:      tempPassword,
-      firstName:     firstName.trim(),
-      lastName:      lastName.trim(),
-      role:          assignedRole,
-      roleId:        resolvedRoleId,
-      tenantId:      new mongoose.Types.ObjectId(tenantId),
-      isActive:      true,
-      emailVerified: isEmailVerified,
-    });
+    // Atomically reserve a seat before creating the user — see
+    // reserveUserSeat()'s own comment in tenant.service.ts for why this has
+    // to be a conditional single-document update rather than a
+    // count-then-create (this deployment has no replica set, so
+    // transactions aren't available to guard that race).
+    const seatReserved = await reserveUserSeat(tenantId);
+    if (!seatReserved) {
+      const tenant = await Tenant.findById(tenantId).select('settings.maxUsers').lean();
+      return sendError(res, `Your plan allows ${tenant?.settings?.maxUsers ?? 'a limited number of'} users. Contact your administrator to increase the limit.`, 403, { code: 'USER_LIMIT_REACHED' });
+    }
+
+    let user;
+    try {
+      user = await User.create({
+        email:         email.toLowerCase().trim(),
+        password:      tempPassword,
+        firstName:     firstName.trim(),
+        lastName:      lastName.trim(),
+        role:          assignedRole,
+        roleId:        resolvedRoleId,
+        tenantId:      new mongoose.Types.ObjectId(tenantId),
+        isActive:      true,
+        emailVerified: isEmailVerified,
+        mustChangePassword: true,
+      });
+    } catch (createErr) {
+      // Creation failed for an unrelated reason (validation, etc.) — don't
+      // leak the reservation.
+      await releaseUserSeat(tenantId);
+      throw createErr;
+    }
 
     // Send welcome email (fire-and-forget)
     const loginUrl = `${config.app.frontendUrl}/login`;
@@ -117,6 +165,7 @@ router.post('/', requirePermission('users.create'), async (req: AuthRequest, res
         <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px">
           <h2 style="color:#1a1a2e">Welcome to LeadRyze AI, ${firstName}!</h2>
           <p>Your account has been created by your team administrator.</p>
+          <p><strong>Login ID:</strong> ${user.loginId ?? '(contact your administrator)'}</p>
           <p><strong>Login Email:</strong> ${email.toLowerCase()}</p>
           ${!rawPassword ? `<p><strong>Temporary Password:</strong> ${tempPassword}</p><p style="color:#888;font-size:13px">Please change your password after logging in.</p>` : ''}
           <div style="margin:24px 0">
@@ -158,6 +207,19 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
     });
     if (!user) return sendError(res, 'User not found', 404);
 
+    // Reactivation is a fresh seat reservation — it must not be a backdoor
+    // around the cap. Deactivation always frees one. No-op transitions
+    // (already the requested state) touch neither.
+    const activating   = isActive === true  && !user.isActive;
+    const deactivating = isActive === false && user.isActive;
+    if (activating) {
+      const seatReserved = await reserveUserSeat(tenantId);
+      if (!seatReserved) {
+        const tenant = await Tenant.findById(tenantId).select('settings.maxUsers').lean();
+        return sendError(res, `Your plan allows ${tenant?.settings?.maxUsers ?? 'a limited number of'} users. Contact your administrator to increase the limit.`, 403, { code: 'USER_LIMIT_REACHED' });
+      }
+    }
+
     if (firstName?.trim()) user.firstName = firstName.trim();
     if (lastName?.trim())  user.lastName  = lastName.trim();
     if (typeof isActive === 'boolean') user.isActive = isActive;
@@ -181,7 +243,13 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
       if (oldRoleId) await invalidateRoleCache(tenantId, oldRoleId);
     }
 
-    await user.save();
+    try {
+      await user.save();
+    } catch (saveErr) {
+      if (activating) await releaseUserSeat(tenantId); // don't leak the reservation
+      throw saveErr;
+    }
+    if (deactivating) await releaseUserSeat(tenantId);
 
     if (roleChanged) {
       logAuditEvent('user.role_reassigned',
@@ -217,10 +285,12 @@ router.delete('/:id', requirePermission('users.delete'), async (req: AuthRequest
     });
     if (!user) return sendError(res, 'User not found', 404);
 
+    const wasActive = user.isActive;
     user.isActive = false;
     // Invalidate their session by clearing refresh token
     user.set('refreshToken', undefined);
     await user.save();
+    if (wasActive) await releaseUserSeat(tenantId); // frees the seat; no-op if already inactive
 
     return sendSuccess(res, null, 'User deactivated');
   } catch (err) {
@@ -244,6 +314,10 @@ router.post('/:id/reset-password', requirePermission('users.edit'), async (req: 
     }).select('+password');
 
     if (!user) return sendError(res, 'User not found', 404);
+
+    if (await isPasswordTakenAtTenant(tenantId, password, req.params.id)) {
+      return sendError(res, 'This password is already in use by another account at your company. Choose a different one.', 409);
+    }
 
     user.password = password;
     user.set('refreshToken', undefined); // invalidate existing sessions

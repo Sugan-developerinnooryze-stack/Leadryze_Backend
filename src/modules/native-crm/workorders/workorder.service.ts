@@ -10,6 +10,7 @@ import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -107,10 +108,20 @@ export async function createWorkorder(data: any) {
   }
   if (data.createdBy !== 'system') {
     const mongoId = (doc._id as any).toString();
+    // Independent checks, not if/else-if — since buildPrefill.ts now carries
+    // the FULL ancestor chain forward (e.g. a WorkOrder created from a
+    // Contract that itself came from a Quotation arrives with both
+    // contractId AND an inherited quotationId), every ancestor actually
+    // present should be marked complete, not just whichever one this used
+    // to check first. Confirmed real via live chain testing: with the old
+    // else-if, a Contract with an upstream Quotation reference never got
+    // marked complete when a WorkOrder was created from it, because the
+    // quotationId branch "won" and the contractId branch never ran.
     if (data.quotationId) {
       const src = await NativeQuotation.findOne({ quotationId: data.quotationId }).select('_id').lean();
       if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }).catch(() => {});
-    } else if (data.contractId) {
+    }
+    if (data.contractId) {
       const src = await NativeContract.findOne({ contractId: data.contractId }).select('_id').lean();
       if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }).catch(() => {});
     }
@@ -161,6 +172,51 @@ export async function deleteWorkorder(id: string, tenantId: string, scope?: Data
   const deleted = await NativeWorkorder.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'workorders', String(deleted._id));
   return deleted;
+}
+
+/** "Overdue" can't hardcode a status string — status is a free string
+ * validated against this tenant's own configurable pipeline stages (see
+ * assertValidStatus above), so a tenant that renames "Completed" must not
+ * silently break this count. Resolves the tenant's current completed/
+ * cancelled stage keys the same way updateWorkorder already does above. */
+export async function getWorkorderStats(tenantId: string, branchId?: string | null, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const now = new Date();
+
+  // Base filter (tenant/branch/data-scope only) — overdue is always a
+  // real-time signal, independent of the Today/Week/Month range switcher,
+  // same rule as Tasks' overdue field. total/byStatus DO respect range.
+  const baseFilter: Record<string, unknown> = { tenantId: tid };
+  if (branchId) baseFilter.branchId = new mongoose.Types.ObjectId(branchId);
+  applyDataScopeToFilter(baseFilter, scope, 'staffIds');
+
+  const rangedFilter = { ...baseFilter };
+  applyDateRangeToFilter(rangedFilter, 'createdAt', resolveDateRange(range, customFrom, customTo));
+
+  const [completedKey, cancelledKey] = await Promise.all([
+    getOutcomeStageKey(tenantId, 'workorder', 'completed', 'completed'),
+    getOutcomeStageKey(tenantId, 'workorder', 'cancelled', 'cancelled'),
+  ]);
+
+  const [total, allTimeTotal, byStatus, overdue] = await Promise.all([
+    NativeWorkorder.countDocuments(rangedFilter),
+    // Headline/Kanban-header total — all-time, same reasoning as
+    // Customers'/Leads'/Deals' allTimeTotal (baseFilter is already unranged).
+    NativeWorkorder.countDocuments(baseFilter),
+    NativeWorkorder.aggregate([{ $match: rangedFilter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    NativeWorkorder.countDocuments({
+      ...baseFilter,
+      scheduledDate: { $lt: now },
+      status: { $nin: [completedKey, cancelledKey] },
+    }),
+  ]);
+
+  return {
+    total,
+    allTimeTotal,
+    overdue,
+    byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])),
+  };
 }
 
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {

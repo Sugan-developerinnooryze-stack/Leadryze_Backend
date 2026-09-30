@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { getTenantLogs } from './log.service';
 import { sendSuccess, sendError } from '../../utils/response';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 
 const router = Router();
 
@@ -12,7 +12,7 @@ router.use(authenticate);
  * Returns paginated activity logs for the current tenant.
  * Query: service=ai|backend, level=info|warn|error, from, to, limit, offset
  */
-router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/', requirePermission('logs.view'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const tenantId = (req as Request & { user?: { tenantId?: string } }).user?.tenantId;
     if (!tenantId) { sendError(res, 'Unauthorized', 401); return; }

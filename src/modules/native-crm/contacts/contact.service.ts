@@ -6,12 +6,12 @@ import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
-export async function listContacts(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status } = opts;
+export async function listContacts(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
+  const { page = 1, limit = 20, search, status, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToCreatedByFilter(filter, scope);
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', ownerTab, userId);
   if (status) filter.status = status;
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
@@ -31,7 +31,7 @@ export async function getContactById(tenantId: string, id: string, scope?: DataS
   return Contact.findOne(filter).lean();
 }
 
-export async function createContact(tenantId: string, dto: CreateContactDTO) {
+export async function createContact(tenantId: string, dto: CreateContactDTO & { createdBy?: string }) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Contact.create({ tenantId: tid, ...dto });
   indexNativeSearchRecord(tenantId, 'native', 'contacts', created.toObject(), `${created.firstName} ${created.lastName}`.trim());

@@ -6,10 +6,11 @@ import { resolveEffectiveScope } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status } = req.query as Record<string, string>;
+    const { page, limit, search, status, owner } = req.query as Record<string, string>;
+    const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
     const result = await svc.listCompanies(req.tenantId!, {
-      page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-    }, resolveEffectiveScope(req, 'companies'));
+      page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status, ownerTab,
+    }, resolveEffectiveScope(req, 'companies'), req.user!.userId);
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch companies', 500); }
 }
@@ -24,7 +25,7 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.createCompany(req.tenantId!, req.body);
+    const record = await svc.createCompany(req.tenantId!, { ...req.body, createdBy: req.user!.userId });
     sendCreated(res, record, 'Company created');
   } catch { sendError(res, 'Failed to create company', 500); }
 }

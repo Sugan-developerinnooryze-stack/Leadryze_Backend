@@ -17,6 +17,7 @@ import { sendSmsNow, buildFollowupSms } from '../messages/twilio.service';
 import { cleanupOrphanedImageUploads } from '../native-crm/datasets/dataset-image.service';
 import { recoverStuckImports } from '../native-crm/datasets/dataset.service';
 import { retryFailedChatbotLeadEmails } from '../native-crm/lead-capture/chatbot-lead-email.service';
+import { getFeatureFlagsForTenants, isFeatureFlagEnabled } from '../tenants/tenant.service';
 
 // ─── BullMQ (Redis-dependent) — graceful stub when Redis unavailable ──────────
 let _bullmqAvailable = false;
@@ -175,6 +176,8 @@ async function runDailyFollowupCheck(): Promise<void> {
 
     logger.info(`Daily follow-up check: ${customers.length} customer(s) need follow-up`);
 
+    const flagsByTenant = await getFeatureFlagsForTenants(customers.map((c) => String(c.tenantId)));
+
     for (const customer of customers) {
       const lastContact: Date = customer.lastContactedAt ?? customer.updatedAt;
       const daysSince = Math.floor((Date.now() - lastContact.getTime()) / 86400000);
@@ -183,6 +186,11 @@ async function runDailyFollowupCheck(): Promise<void> {
       const customerName = [customer.firstName, customer.lastName].filter(Boolean).join(' ') || 'Customer';
       const tenantId = String(customer.tenantId);
       const customerId = String(customer._id);
+
+      if (!isFeatureFlagEnabled({ featureFlags: flagsByTenant.get(tenantId) }, 'auto_followup')) {
+        logger.info('Follow-up skipped — auto_followup disabled for tenant', { tenant: tenantId, customer: customerId });
+        continue;
+      }
 
       // Send follow-up email if customer has an email address
       if (customer.email) {
@@ -238,9 +246,17 @@ async function runMeetingReminders(): Promise<void> {
     if (activities.length === 0) return;
     logger.info(`Meeting reminder check: ${activities.length} activity(ies) in window`);
 
+    const flagsByTenant = await getFeatureFlagsForTenants(activities.map((a) => String(a.tenantId)));
+
     for (const activity of activities) {
       const lp = activity.linkedPerson;
       if (!lp) continue;
+
+      const tenantId = String(activity.tenantId);
+      if (!isFeatureFlagEnabled({ featureFlags: flagsByTenant.get(tenantId) }, 'auto_reminder')) {
+        logger.info('Meeting reminder skipped — auto_reminder disabled for tenant', { tenant: tenantId, activityId: String(activity._id) });
+        continue;
+      }
 
       const startFmt = activity.startDate
         ? new Date(activity.startDate).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })

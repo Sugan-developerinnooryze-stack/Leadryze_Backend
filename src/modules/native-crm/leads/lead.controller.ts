@@ -30,6 +30,7 @@ import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAuto
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { resolveTeamFromStaffId, resolveSupervisorName } from '../shared/team-resolution';
 import { resolveEffectiveScope } from '../shared/data-scope';
+import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -260,19 +261,57 @@ export async function remove(req: AuthRequest, res: Response) {
 export async function stats(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
+    const range = req.query.range as string | undefined;
+    const customFrom = req.query.customFrom as string | undefined;
+    const customTo = req.query.customTo as string | undefined;
     const matchFilter: Record<string, unknown> = { tenantId: tid };
     applyDataScopeToFilter(matchFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
-    const [pipeline, total, converted] = await Promise.all([
+    // Headline KPI total — all-time, before the range filter below narrows
+    // `matchFilter` in place (same reasoning as Customers' allTimeTotal).
+    const allTimeFilter = { ...matchFilter };
+    applyDateRangeToFilter(matchFilter, 'createdAt', resolveDateRange(range, customFrom, customTo));
+    // "Won" here means the lead has actually reached this tenant's Won
+    // pipeline stage (same outcome-tag lookup the conversion-eligibility
+    // check and the kanban board itself use — a renamed/reconfigured Won
+    // stage still resolves correctly), NOT isConverted, which instead marks
+    // a *later*, separate, manual step (a Won lead being turned into a
+    // Customer record). Counting isConverted here previously showed every
+    // already-converted lead regardless of its current stage, including
+    // leads that had since moved to Lost/On Hold/etc.
+    const wonKey = await getOutcomeStageKey(req.tenantId!, 'lead', 'won', 'won');
+
+    // Prior-period count, for a real (not faked) trend delta on the
+    // dashboard's Leads KPI tile — null range (no ?range= sent, e.g. the
+    // Leads page's own existing stats card) means no comparison is computed
+    // at all, keeping every pre-existing caller's response shape identical.
+    const priorRange = resolvePriorDateRange(range, customFrom, customTo);
+    const priorFilter: Record<string, unknown> = { tenantId: tid };
+    applyDataScopeToFilter(priorFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    if (priorRange) applyDateRangeToFilter(priorFilter, 'createdAt', priorRange);
+
+    // KPI sparkline — fixed 14-day window, independent of the range
+    // selector above (see date-range.ts's own comment on SPARKLINE_DAYS).
+    const sparklineFilter: Record<string, unknown> = { tenantId: tid, createdAt: { $gte: sparklineWindowStart() } };
+    applyDataScopeToFilter(sparklineFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+
+    const [pipeline, total, allTimeTotal, converted, priorTotal, dailyRaw] = await Promise.all([
       Lead.aggregate([
         { $match: matchFilter },
         { $group: { _id: '$status', count: { $sum: 1 }, revenue: { $sum: '$expectedRevenue' } } },
       ]),
       Lead.countDocuments(matchFilter),
-      Lead.countDocuments({ ...matchFilter, isConverted: true }),
+      Lead.countDocuments(allTimeFilter),
+      Lead.countDocuments({ ...matchFilter, status: wonKey }),
+      priorRange ? Lead.countDocuments(priorFilter) : Promise.resolve(null),
+      Lead.aggregate([
+        { $match: sparklineFilter },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+      ]),
     ]);
     const totalRevenue    = (pipeline as any[]).reduce((s: number, p: any) => s + (p.revenue ?? 0), 0);
     const conversionRate  = total > 0 ? Math.round((converted / total) * 100) : 0;
-    sendSuccess(res, { pipeline, total, converted, totalRevenue, conversionRate });
+    const daily = fillDailySeries(dailyRaw as any[], SPARKLINE_DAYS);
+    sendSuccess(res, { pipeline, total, allTimeTotal, converted, totalRevenue, conversionRate, priorTotal, daily });
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

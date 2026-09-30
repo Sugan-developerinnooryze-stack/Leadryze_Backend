@@ -189,7 +189,13 @@ const MANAGER_PERMISSIONS = [
   'analytics.view', 'analytics.export',
   'knowledge.*',
   'logs.view',
-  'bot.view', 'bot.use',
+  // bot.configure added alongside view/use when qna.routes.ts's Q&A CRUD
+  // first got a real requirePermission gate (previously wide open to any
+  // authenticated user) — Manager already configured the tenant's chatbot
+  // Q&A script day to day, so this is enforcement catching up to
+  // already-expressed intent, same posture as pipeline_config.*/doc_templates.*
+  // etc below, not a new grant.
+  'bot.view', 'bot.use', 'bot.configure',
   'connector.view', 'connector.sync',
   'native_crm.*',
   'fs.*',
@@ -220,7 +226,16 @@ const AGENT_PERMISSIONS = [
   'native_crm.contacts.view', 'native_crm.contacts.create', 'native_crm.contacts.edit',
   'native_crm.leads.view',    'native_crm.leads.create',
   'native_crm.tasks.view',    'native_crm.tasks.create',    'native_crm.tasks.edit',
-  'native_crm.meetings.view', 'native_crm.calendar.view',
+  'native_crm.meetings.view',
+  // calendar.view was previously the only calendar grant here, but
+  // calendar.routes.ts itself had ZERO permission checks until this same
+  // pass added them — meaning an Agent's real day-to-day behavior (booking/
+  // editing/cancelling their own calendar events via MyCalendarPage /
+  // BookingModal) was already full create/edit, not actually read-only.
+  // Matching that existing behavior, same "enforcement catching up to
+  // already-expressed intent" reasoning as native_crm.activities.* below —
+  // no delete, same tier as Companies/Deals/Tickets/Calls/Activities.
+  'native_crm.calendar.view', 'native_crm.calendar.create', 'native_crm.calendar.edit',
   // Added when native_crm.leads/meetings/fs.customers/fs.teams/fs.staffs
   // permission checks were first actually wired up on their routes — this
   // one, specifically, mirrors the legacy 'customers.view' grant just above
@@ -244,6 +259,13 @@ const AGENT_PERMISSIONS = [
   'native_crm.deals.view',     'native_crm.deals.create',     'native_crm.deals.edit',
   'native_crm.tickets.view',   'native_crm.tickets.create',   'native_crm.tickets.edit',
   'native_crm.calls.view',     'native_crm.calls.create',     'native_crm.calls.edit',
+  // Added when the top-level "Management" activities module
+  // (backend/src/modules/activities/activity.routes.ts — distinct from
+  // fs.activities.* above) first got a real requirePermission gate
+  // (previously wide open to any authenticated user, including /:id/notify's
+  // real email/SMS send) — same view/create/edit tier as Companies/Deals/
+  // Tickets/Calls above, no delete, matching that exact precedent.
+  'native_crm.activities.view', 'native_crm.activities.create', 'native_crm.activities.edit',
   // Added when Custom Module records first got a real requirePermission gate
   // (previously wide open to any authenticated user, same starting point as
   // Companies/Deals/Tickets/Calls above) — same view/create/edit tier, no

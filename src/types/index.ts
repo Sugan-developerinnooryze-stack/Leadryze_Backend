@@ -52,6 +52,14 @@ export interface AuthRequest extends Request {
    * even before a Tenant Admin ever visits the settings page. Read via
    * resolveEffectiveScope(req, moduleKey), never this map directly. */
   dataScopeConfig?: Record<string, boolean>;
+  /** This tenant's EFFECTIVE feature flags (already resolved through
+   * accessConfigMode — see getEffectiveFeatureFlags() in
+   * modules/tenants/tenant.service.ts), attached once by requireTenant so
+   * requireModuleEnabled() and friends never need a second DB round-trip
+   * for something requireTenant already had to fetch. Loosely typed here
+   * (not the full IFeatureFlags interface) so this foundational types file
+   * doesn't need to depend on a specific feature module. */
+  featureFlags?: Record<string, boolean>;
 }
 
 export interface ApiResponse<T = unknown> {
@@ -64,6 +72,12 @@ export interface ApiResponse<T = unknown> {
     limit?: number;
     total?: number;
     totalPages?: number;
+    // Additive, optional — only GET /api/v1/users sets these, to surface
+    // the tenant's seat cap alongside the existing paginated shape without
+    // a new endpoint or a second request. Every other sendPaginated() call
+    // site is unaffected.
+    maxUsers?: number | null;
+    activeUsers?: number;
   };
 }
 

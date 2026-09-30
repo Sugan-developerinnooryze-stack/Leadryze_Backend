@@ -8,11 +8,12 @@ import { logTimeline } from '../timeline/timeline.service';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, relatedModule, relatedId, upcoming } = req.query as Record<string, string>;
+    const { page, limit, search, status, relatedModule, relatedId, upcoming, owner } = req.query as Record<string, string>;
+    const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
     const result = await svc.listTasks(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status,
-      relatedModule, relatedId, upcoming: upcoming === 'true',
-    }, req.branchId, resolveEffectiveScope(req, 'tasks'));
+      relatedModule, relatedId, upcoming: upcoming === 'true', ownerTab,
+    }, req.branchId, resolveEffectiveScope(req, 'tasks'), req.user!.userId);
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch tasks', 500); }
 }
@@ -30,6 +31,7 @@ export async function create(req: AuthRequest, res: Response) {
     const record = await svc.createTask(req.tenantId!, {
       ...req.body,
       branchId: req.body.branchId ?? req.branchId ?? null,
+      createdBy: req.user!.userId,
     });
     logTimeline(req.tenantId!, 'task', String((record as any)._id), 'created', `Task "${(record as any).title}" created`, req.user?.userId,
       { taskStatus: (record as any).taskStatus, dueDate: (record as any).dueDate }).catch(() => {});
@@ -68,6 +70,6 @@ export async function remove(req: AuthRequest, res: Response) {
 }
 
 export async function stats(req: AuthRequest, res: Response) {
-  try { sendSuccess(res, await svc.getTaskStats(req.tenantId!, req.branchId, resolveEffectiveScope(req, 'tasks'))); }
+  try { sendSuccess(res, await svc.getTaskStats(req.tenantId!, req.branchId, resolveEffectiveScope(req, 'tasks'), req.query.range as string | undefined, req.query.customFrom as string | undefined, req.query.customTo as string | undefined)); }
   catch { sendError(res, 'Failed to fetch stats', 500); }
 }

@@ -27,12 +27,12 @@ export async function verifyEmail(req: AuthRequest, res: Response, next: NextFun
 
 export async function login(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
-    const { email, password, tenantId } = req.body;
-    if (!email || !password) { sendError(res, 'email and password are required', 400); return; }
+    const { email, clientId, password, tenantId } = req.body;
+    if (!password || (!email && !clientId)) { sendError(res, 'email (or clientId) and password are required', 400); return; }
     const result = await authService.loginUser(email, password, tenantId, {
       ip:        req.ip,
       userAgent: req.headers['user-agent'] as string,
-    });
+    }, clientId);
     sendSuccess(res, result, 'Login successful');
   } catch (err) { next(err); }
 }
@@ -111,5 +111,21 @@ export async function updateProfile(req: AuthRequest, res: Response, next: NextF
     );
     if (!user) { sendError(res, 'User not found', 404); return; }
     sendSuccess(res, user, 'Profile updated');
+  } catch (err) { next(err); }
+}
+
+// req.body has already been through sidebarLayoutSchema (see auth.validation.ts)
+// by the time it gets here — unknown item-key prefixes are already stripped,
+// order/pinned are already type-checked. Stored as-is beyond that. This is a
+// UI ordering preference only; see the doc-comment on IUser.sidebarLayout.
+export async function updateSidebarLayout(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.user?.userId,
+      { sidebarLayout: req.body },
+      { new: true }
+    );
+    if (!user) { sendError(res, 'User not found', 404); return; }
+    sendSuccess(res, user, 'Sidebar layout updated');
   } catch (err) { next(err); }
 }

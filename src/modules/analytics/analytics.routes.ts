@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import * as controller from './analytics.controller';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 
 const router = Router();
@@ -23,7 +23,7 @@ router.use(authenticate, requireTenant);
  *     responses:
  *       200: { description: Stats aggregation }
  */
-router.get('/dashboard', controller.getDashboard);
+router.get('/dashboard', requirePermission('analytics.view'), controller.getDashboard);
 
 /**
  * @swagger
@@ -42,6 +42,6 @@ router.get('/dashboard', controller.getDashboard);
  *         name: channel
  *         schema: { type: string }
  */
-router.get('/', controller.getAnalytics);
+router.get('/', requirePermission('analytics.view'), controller.getAnalytics);
 
 export default router;

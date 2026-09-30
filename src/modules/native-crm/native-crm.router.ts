@@ -1,8 +1,11 @@
 import { Router, Response } from 'express';
 import { authenticate } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 import { resolveBranch } from '../../middlewares/branch.middleware';
 import { resolveDataScopeMiddleware, applyDataScopeToFilter, applyDataScopeToCreatedByFilter, resolveEffectiveScope } from './shared/data-scope';
+import { resolveDateRange, applyDateRangeToFilter } from './shared/date-range';
+import { getOutcomeStageKey } from './pipeline-config/pipeline-config.service';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
 
@@ -85,53 +88,57 @@ router.use(nativeCrmLog);
 router.use('/native-logs', nativeLogRoutes);
 
 /* ── CRM sub-routers ──────────────────────────────────────────────────────── */
-router.use('/contacts',  contactRoutes);
-router.use('/companies', companyRoutes);
-router.use('/deals',     dealRoutes);
-router.use('/tasks',     taskRoutes);
+// Gated by tenant-level module flags (§3 of the Tenant Access Management
+// plan) — in addition to, not instead of, the per-role RBAC permission
+// checks each of these route files already does internally. SUPER_ADMIN
+// bypasses inside requireModuleEnabled itself.
+router.use('/contacts',  requireModuleEnabled('native_contacts'),  contactRoutes);
+router.use('/companies', requireModuleEnabled('native_companies'), companyRoutes);
+router.use('/deals',     requireModuleEnabled('native_deals'),     dealRoutes);
+router.use('/tasks',     requireModuleEnabled('native_tasks'),     taskRoutes);
 // Registered BEFORE '/tickets' — ticketRoutes has a GET/PUT '/:id' catch-all
 // that would otherwise swallow '/tickets/sla-policy' as if 'sla-policy' were
 // a ticket id (Express matches router.use() calls in registration order).
-router.use('/tickets/sla-policy', ticketSlaPolicyRoutes);
-router.use('/tickets',   ticketRoutes);
-router.use('/calls',     callRoutes);
-router.use('/meetings',  meetingRoutes);
+router.use('/tickets/sla-policy', requireModuleEnabled('native_tickets'), ticketSlaPolicyRoutes);
+router.use('/tickets',   requireModuleEnabled('native_tickets'),  ticketRoutes);
+router.use('/calls',     requireModuleEnabled('native_calls'),    callRoutes);
+router.use('/meetings',  requireModuleEnabled('native_meetings'), meetingRoutes);
 router.use('/datasets',  datasetRoutes);
 
 /* ── Field-service sub-routers ────────────────────────────────────────────── */
-router.use('/categories', categoryRoutes);
-router.use('/services',   serviceRoutes);
-router.use('/teams',      teamRoutes);
-router.use('/staffs',     staffRoutes);
-router.use('/customers',  customerRoutes);
-router.use('/sites',      siteRoutes);
-router.use('/parts',      partRoutes);
+router.use('/categories', requireModuleEnabled('fs_categories'), categoryRoutes);
+router.use('/services',   requireModuleEnabled('fs_services'),   serviceRoutes);
+router.use('/teams',      requireModuleEnabled('fs_teams'),      teamRoutes);
+router.use('/staffs',     requireModuleEnabled('fs_staffs'),     staffRoutes);
+router.use('/customers',  requireModuleEnabled('fs_customers'),  customerRoutes);
+router.use('/sites',      requireModuleEnabled('fs_sites'),      siteRoutes);
+router.use('/parts',      requireModuleEnabled('fs_parts'),      partRoutes);
 
 /* ── Phase 2 sub-routers ──────────────────────────────────────────────────── */
-router.use('/quotations', quotationRoutes);
-router.use('/workorders', workorderRoutes);
-router.use('/contracts',  contractRoutes);
-router.use('/invoices',   invoiceRoutes);
-router.use('/receipts',   receiptRoutes);
+router.use('/quotations', requireModuleEnabled('fs_quotations'), quotationRoutes);
+router.use('/workorders', requireModuleEnabled('fs_workorders'), workorderRoutes);
+router.use('/contracts',  requireModuleEnabled('fs_contracts'),  contractRoutes);
+router.use('/invoices',   requireModuleEnabled('fs_invoices'),   invoiceRoutes);
+router.use('/receipts',   requireModuleEnabled('fs_receipts'),   receiptRoutes);
 
 /* ── Phase 3 sub-routers ──────────────────────────────────────────────────── */
-router.use('/expenses',   expenseRoutes);
-router.use('/activities', activityRoutes);
+router.use('/expenses',   requireModuleEnabled('fs_expenses'),   expenseRoutes);
+router.use('/activities', requireModuleEnabled('fs_activities'), activityRoutes);
 router.use('/activity-feed', activityFeedRoutes);
 router.use('/pdf',        pdfRoutes);
 
 /* ── Phase 4 sub-routers ──────────────────────────────────────────────────── */
-router.use('/fs-settings',   fsSettingsRoutes);
-router.use('/products',      productRoutes);
+router.use('/fs-settings',   requireModuleEnabled('config_fsSettings'),    fsSettingsRoutes);
+router.use('/products',      requireModuleEnabled('fs_products'),          productRoutes);
 router.use('/catalog',       catalogRoutes);
-router.use('/assets',        assetRoutes);
-router.use('/vehicles',      vehicleRoutes);
+router.use('/assets',        requireModuleEnabled('fs_assets'),            assetRoutes);
+router.use('/vehicles',      requireModuleEnabled('fs_vehicles'),          vehicleRoutes);
 router.use('/timeline',      timelineRoutes);
-router.use('/custom-fields',       customFieldRoutes);
+router.use('/custom-fields',       requireModuleEnabled('config_customFields'), customFieldRoutes);
 router.use('/custom-templates',    customTemplateRoutes);
 router.use('/template-assets',     templateAssetRoutes);
 router.use('/template-analysis',   templateAnalysisRoutes);
-router.use('/leads',               leadRoutes);
+router.use('/leads',               requireModuleEnabled('fs_leads'), leadRoutes);
 router.use('/lead-capture',        leadCaptureRoutes);
 router.use('/record-lock',         recordLockRoutes);
 router.use('/branches',            branchRoutes);
@@ -193,23 +200,43 @@ router.get('/dashboard-stats', async (req: AuthRequest, res: Response) => {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
 
-    const leadFilter: Record<string, unknown> = { tenantId: tid };
+    // Base filters (no date range) — newToday/appointmentsToday are always
+    // real-time "today" signals, independent of the range switcher, same
+    // rule applied to Tasks'/Work Orders' overdue/dueToday fields.
+    const leadFilterBase: Record<string, unknown> = { tenantId: tid };
     // Real, confirmed bug this fixes: every other Lead-scoped endpoint
     // (lead.service.ts's own list/stats) already applies req.branchId —
     // this dashboard summary was the one place that never did, so switching
     // branches left it silently showing tenant-wide numbers. Meeting has no
     // branchId field at all yet (a separate, larger gap — not scoped here).
-    if (req.branchId) leadFilter.branchId = new mongoose.Types.ObjectId(req.branchId);
-    applyDataScopeToFilter(leadFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    if (req.branchId) leadFilterBase.branchId = new mongoose.Types.ObjectId(req.branchId);
+    applyDataScopeToFilter(leadFilterBase, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
     const meetingFilter: Record<string, unknown> = { tenantId: tid };
     applyDataScopeToFilter(meetingFilter, resolveEffectiveScope(req, 'meetings'), 'assignedStaffId');
 
-    const [totalLeads, newToday, converted, appointments, sourceAgg, statusAgg] = await Promise.all([
+    const leadFilter = { ...leadFilterBase };
+    applyDateRangeToFilter(leadFilter, 'createdAt', resolveDateRange(
+      req.query.range as string | undefined,
+      req.query.customFrom as string | undefined,
+      req.query.customTo as string | undefined,
+    ));
+
+    // "Won" here means the lead has actually reached this tenant's Won
+    // pipeline stage — same fix already applied to lead.controller.ts's own
+    // /leads/stats earlier this session, ported here since this endpoint had
+    // its own separate, still-buggy isConverted:true count feeding the
+    // exact same "Conversion" KPI the dashboard displays.
+    const wonKey = await getOutcomeStageKey(req.tenantId!, 'lead', 'won', 'won');
+
+    const [totalLeads, newToday, converted, appointments, appointmentsToday, sourceAgg, statusAgg] = await Promise.all([
       Lead.countDocuments(leadFilter),
-      Lead.countDocuments({ ...leadFilter, createdAt: { $gte: today } }),
-      Lead.countDocuments({ ...leadFilter, isConverted: true }),
+      Lead.countDocuments({ ...leadFilterBase, createdAt: { $gte: today } }),
+      Lead.countDocuments({ ...leadFilter, status: wonKey }),
       Meeting.countDocuments(meetingFilter),
+      Meeting.countDocuments({ ...meetingFilter, startDate: { $gte: today, $lte: todayEnd } }),
       Lead.aggregate([{ $match: leadFilter }, { $group: { _id: '$source', count: { $sum: 1 } } }]),
       Lead.aggregate([{ $match: leadFilter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
     ]);
@@ -221,7 +248,7 @@ router.get('/dashboard-stats', async (req: AuthRequest, res: Response) => {
 
     const conversionRate = totalLeads > 0 ? (converted / totalLeads) * 100 : 0;
 
-    sendSuccess(res, { totalLeads, newToday, appointments, conversionRate, bySource, byStatus });
+    sendSuccess(res, { totalLeads, newToday, appointments, appointmentsToday, conversionRate, bySource, byStatus });
   } catch {
     sendError(res, 'Failed to fetch dashboard stats', 500);
   }

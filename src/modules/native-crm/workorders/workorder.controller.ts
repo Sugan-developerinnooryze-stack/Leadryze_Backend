@@ -9,6 +9,7 @@ import {
   deleteWorkorder,
   checkStaffAvailability,
   findNearestStaff,
+  getWorkorderStats,
 } from './workorder.service';
 import { logTimeline } from '../timeline/timeline.service';
 import { logAuditEvent } from '../../logs/audit-log.model';
@@ -22,6 +23,15 @@ export async function list(req: AuthRequest, res: Response) {
   try {
     const { items, total, page } = await listWorkorders(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'workorders'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
+export async function stats(req: AuthRequest, res: Response) {
+  try {
+    const result = await getWorkorderStats(req.tenantId!, req.branchId, resolveEffectiveScope(req, 'workorders'), req.query.range as string | undefined, req.query.customFrom as string | undefined, req.query.customTo as string | undefined);
+    sendSuccess(res, result);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

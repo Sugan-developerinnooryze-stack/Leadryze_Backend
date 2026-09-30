@@ -58,6 +58,7 @@ export interface IContractDoc extends Document {
   customerId:            string;
   quotationId?:          string;
   title:                 string;
+  address?:              string;
   siteId?:               string;
   staffId?:              string;
   teamId?:               string;
@@ -187,6 +188,7 @@ const schema = new Schema<IContractDoc>(
     staffId:               { type: String, trim: true },
     teamId:                { type: String, trim: true },
     title:                 { type: String, required: true, trim: true },
+    address:               { type: String, trim: true },
     startDate:             { type: Date },
     endDate:               { type: Date },
     noEndDate:             { type: Boolean, default: false },

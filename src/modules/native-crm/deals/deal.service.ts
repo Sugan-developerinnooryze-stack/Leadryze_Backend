@@ -5,6 +5,7 @@ import { PaginatedResult, ListOptions } from '../native-crm.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { customFieldsSearchExpr } from '../shared/custom-field-query';
 import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
@@ -77,18 +78,47 @@ export async function deleteDeal(tenantId: string, id: string, scope?: DataScope
   return deleted;
 }
 
-export async function getDealStats(tenantId: string, scope?: DataScope) {
+export async function getDealStats(tenantId: string, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
-  const [total, byStage, totalValue] = await Promise.all([
+  // Headline KPI totals (Deals count + Revenue) — all-time, before the
+  // range filter below narrows `filter` in place (same reasoning as
+  // Customers'/Leads' allTimeTotal).
+  const allTimeFilter = { ...filter };
+  applyDateRangeToFilter(filter, 'createdAt', resolveDateRange(range, customFrom, customTo));
+
+  const priorRange = resolvePriorDateRange(range, customFrom, customTo);
+  const priorFilter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToFilter(priorFilter, scope, 'assignedStaffId');
+  if (priorRange) applyDateRangeToFilter(priorFilter, 'createdAt', priorRange);
+
+  // KPI sparkline — fixed 14-day window, independent of `range` (also
+  // backs the dashboard's Revenue tile, which reuses Deals' own data).
+  const sparklineFilter: Record<string, unknown> = { tenantId: tid, createdAt: { $gte: sparklineWindowStart() } };
+  applyDataScopeToFilter(sparklineFilter, scope, 'assignedStaffId');
+
+  const [total, allTimeTotal, byStage, totalValue, allTimeTotalValue, priorTotal, priorTotalValue, dailyRaw] = await Promise.all([
     Deal.countDocuments(filter),
+    Deal.countDocuments(allTimeFilter),
     Deal.aggregate([{ $match: filter }, { $group: { _id: '$stage', count: { $sum: 1 } } }]),
     Deal.aggregate([{ $match: filter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Deal.aggregate([{ $match: allTimeFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    priorRange ? Deal.countDocuments(priorFilter) : Promise.resolve(null),
+    priorRange ? Deal.aggregate([{ $match: priorFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]) : Promise.resolve(null),
+    Deal.aggregate([
+      { $match: sparklineFilter },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+    ]),
   ]);
   return {
     total,
+    allTimeTotal,
     byStatus: Object.fromEntries(byStage.map((r) => [r._id as string, r.count as number])),
     totalValue: totalValue[0]?.total ?? 0,
+    allTimeTotalValue: allTimeTotalValue[0]?.total ?? 0,
+    priorTotal,
+    priorTotalValue: priorTotalValue ? (priorTotalValue[0]?.total ?? 0) : null,
+    daily: fillDailySeries(dailyRaw as any[], SPARKLINE_DAYS),
   };
 }

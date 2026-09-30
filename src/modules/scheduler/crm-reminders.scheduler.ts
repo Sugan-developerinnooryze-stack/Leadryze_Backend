@@ -20,6 +20,8 @@ import { getOrCreateSettings } from '../native-crm/notification-settings/notific
 import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { EmailLogSourceModule } from '../notifications/email-log.model';
+import { Tenant } from '../tenants/tenant.model';
+import { isFeatureFlagEnabled } from '../tenants/tenant.service';
 
 type ReminderKind = Extract<EmailLogSourceModule, 'call' | 'meeting' | 'task'>;
 
@@ -60,6 +62,13 @@ interface ReminderTarget {
 
 async function sendReminder(target: ReminderTarget, windowMinutes: number): Promise<void> {
   const { tenantId, sourceModule, sourceId, relatedModule, relatedId, relatedLabel } = target;
+
+  const tenant = await Tenant.findById(tenantId).select('featureFlags').lean();
+  if (!isFeatureFlagEnabled({ featureFlags: tenant?.featureFlags }, 'auto_reminder')) {
+    logger.debug(`${sourceModule} reminder skipped — auto_reminder disabled for tenant`, { id: sourceId, tenantId });
+    return;
+  }
+
   const settings = await getOrCreateSettings(tenantId);
   const recipient = await resolveRecipient(tenantId, relatedModule, relatedId);
 

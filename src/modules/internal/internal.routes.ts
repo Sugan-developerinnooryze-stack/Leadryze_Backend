@@ -117,7 +117,7 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
     const tid = new mongoose.Types.ObjectId(tenantId);
 
     const [tenant, connectors, recentCustomers, templates, crmModules, customerCounts, qnaPairs, websiteProfile, hasWidgetDepartments] = await Promise.all([
-      Tenant.findById(tid).select('name slug plan settings branding aiConfig widget.greeting widget.voice.maxSessionMinutes widget.voice.allowTextDuringVoice widget.voice.voiceName widget.voice.sttLanguage widget.voice.voicePreset widget.booking.requireTeam widget.booking.requireService widget.booking.requireName widget.booking.contactRequirement widget.booking.staffLabel widget.booking.timezone'),
+      Tenant.findById(tid).select('name slug plan settings branding aiConfig featureFlags widget.greeting widget.voice.maxSessionMinutes widget.voice.allowTextDuringVoice widget.voice.voiceName widget.voice.sttLanguage widget.voice.voicePreset widget.booking.requireTeam widget.booking.requireService widget.booking.requireName widget.booking.contactRequirement widget.booking.staffLabel widget.booking.timezone'),
 
       Connector.find({ tenantId: tid, isActive: true })
         .select('type name isActive lastSyncAt syncStatus'),
@@ -203,6 +203,7 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
         settings: tenant.settings,
         branding: tenant.branding,
         aiConfig: tenant.aiConfig,
+        featureFlags: tenant.featureFlags,
       },
       // Only the fields the continuous-voice worker actually needs (the
       // greeting for its deterministic session.say() opener, and the

@@ -7,11 +7,11 @@ import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 
-export async function listCalls(tenantId: string, opts: ListOptions = {}, scope?: DataScope): Promise<PaginatedResult<unknown>> {
-  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming } = opts;
+export async function listCalls(tenantId: string, opts: ListOptions = {}, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
+  const { page = 1, limit = 20, search, status, relatedModule, relatedId, upcoming, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToCreatedByFilter(filter, scope);
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', ownerTab, userId);
   if (status) filter.callStatus = status;
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (upcoming) filter.date = { $gte: new Date() };
@@ -33,7 +33,7 @@ export async function getCallById(tenantId: string, id: string, scope?: DataScop
   return Call.findOne(filter).lean();
 }
 
-export async function createCall(tenantId: string, dto: CreateCallDTO) {
+export async function createCall(tenantId: string, dto: CreateCallDTO & { createdBy?: string }) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const created = await Call.create({ tenantId: tid, ...dto });
   void sendOnCreateConfirmation(tenantId, 'call', created.toObject()); // fire-and-forget, never throws

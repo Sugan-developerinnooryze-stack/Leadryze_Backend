@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { Activity, IActivity } from './activity.model';
+import { resolveDateRange, applyDateRangeToFilter } from '../native-crm/shared/date-range';
 
 export type ActivityType = IActivity['type'];
 export type ActivityStatus = IActivity['status'];
@@ -83,15 +84,17 @@ export async function deleteActivity(tenantId: string, id: string) {
   return result.deletedCount > 0;
 }
 
-export async function getActivityStats(tenantId: string) {
+export async function getActivityStats(tenantId: string, range?: string, customFrom?: string, customTo?: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const filter: Record<string, unknown> = { tenantId: tid };
+  applyDateRangeToFilter(filter, 'createdAt', resolveDateRange(range, customFrom, customTo));
   const [byType, byStatus] = await Promise.all([
     Activity.aggregate([
-      { $match: { tenantId: tid } },
+      { $match: filter },
       { $group: { _id: '$type', count: { $sum: 1 } } },
     ]),
     Activity.aggregate([
-      { $match: { tenantId: tid } },
+      { $match: filter },
       { $group: { _id: '$status', count: { $sum: 1 } } },
     ]),
   ]);

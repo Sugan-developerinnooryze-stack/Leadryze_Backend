@@ -92,6 +92,13 @@ export async function remove(req: AuthRequest, res: Response) {
 }
 
 export async function stats(req: AuthRequest, res: Response) {
-  try { sendSuccess(res, await getCustomerStats(req.tenantId!, resolveEffectiveScope(req, 'customers'))); }
+  try {
+    sendSuccess(res, await getCustomerStats(
+      req.tenantId!, resolveEffectiveScope(req, 'customers'),
+      req.query.range as string | undefined,
+      req.query.customFrom as string | undefined,
+      req.query.customTo as string | undefined,
+    ));
+  }
   catch (err: any) { sendError(res, err.message, 500); }
 }

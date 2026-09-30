@@ -5,6 +5,7 @@ import { ensureCredentials } from '../shared/app-credentials.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
 
 export async function listCustomers(tenantId: string, opts: CustomerListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -65,18 +66,47 @@ export async function deleteCustomer(id: string, tenantId: string, scope?: DataS
   return deleted;
 }
 
-/** New — mirrors Lead.stats()/Meeting.stats()' own already-scoped pattern
- * exactly (no Customer aggregate endpoint existed before this). Feeds the
- * Supervisor dashboard's 3rd stat tile — correctly scoped to a Manager's
- * own team(s) or an Agent's own records via the same applyDataScopeToFilter
- * every other Customer query already uses. */
-export async function getCustomerStats(tenantId: string, scope?: DataScope) {
+/** Mirrors Lead.stats()/Meeting.stats()' own already-scoped pattern exactly
+ * — correctly scoped to a Manager's own team(s) or an Agent's own records
+ * via the same applyDataScopeToFilter every other Customer query already
+ * uses. Extended to the same range/trend/sparkline shape as every other
+ * dashboard stats endpoint (see native-crm/shared/date-range.ts) — this is
+ * the tenant's real, operationally-used Customer entity (the one Work
+ * Orders/Invoices/Quotations/Contracts actually reference), unlike the
+ * separate legacy top-level `customers` module. */
+export async function getCustomerStats(tenantId: string, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const matchFilter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToFilter(matchFilter, scope, 'assignedStaffId');
-  const [total, byStatus] = await Promise.all([
-    NativeCustomer.countDocuments(matchFilter),
-    NativeCustomer.aggregate([{ $match: matchFilter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const baseFilter: Record<string, unknown> = { tenantId: tid };
+  applyDataScopeToFilter(baseFilter, scope, 'assignedStaffId');
+
+  const rangedFilter = { ...baseFilter };
+  applyDateRangeToFilter(rangedFilter, 'createdAt', resolveDateRange(range, customFrom, customTo));
+
+  const priorRange = resolvePriorDateRange(range, customFrom, customTo);
+  const priorFilter: Record<string, unknown> = { ...baseFilter };
+  if (priorRange) applyDateRangeToFilter(priorFilter, 'createdAt', priorRange);
+
+  const sparklineFilter: Record<string, unknown> = { ...baseFilter, createdAt: { $gte: sparklineWindowStart() } };
+
+  const [totalCustomers, newToday, byStatus, priorTotal, dailyRaw] = await Promise.all([
+    NativeCustomer.countDocuments(rangedFilter),
+    NativeCustomer.countDocuments({ ...baseFilter, createdAt: { $gte: today } }),
+    NativeCustomer.aggregate([{ $match: rangedFilter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    priorRange ? NativeCustomer.countDocuments(priorFilter) : Promise.resolve(null),
+    NativeCustomer.aggregate([
+      { $match: sparklineFilter },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+    ]),
   ]);
-  return { total, byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])) };
+
+  return {
+    totalCustomers,
+    newToday,
+    byStatus: Object.fromEntries(byStatus.map((r) => [r._id as string, r.count as number])),
+    priorTotal,
+    daily: fillDailySeries(dailyRaw as any[], SPARKLINE_DAYS),
+  };
 }

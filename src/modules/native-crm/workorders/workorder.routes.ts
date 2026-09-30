@@ -11,6 +11,7 @@ const router = Router();
 
 router.get('/staff-availability', requirePermission('fs.workorders.view'), ctrl.staffAvailability);
 router.get('/nearest-staff',     requirePermission('fs.workorders.view'), ctrl.nearestStaff);
+router.get('/stats',  requirePermission('fs.workorders.view'),   ctrl.stats);
 router.get('/',       requirePermission('fs.workorders.view'),   ctrl.list);
 router.post('/',      requirePermission('fs.workorders.create'), validate({ body: createWorkorderSchema }), ctrl.create);
 router.get('/:id',    requirePermission('fs.workorders.view'),   validate({ params: idParam }),              ctrl.getOne);

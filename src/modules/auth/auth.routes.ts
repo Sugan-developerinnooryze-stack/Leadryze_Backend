@@ -10,6 +10,7 @@ import {
   forgotPasswordSchema,
   resetPasswordSchema,
   verifyEmailSchema,
+  sidebarLayoutSchema,
 } from './auth.validation';
 
 const router = Router();
@@ -212,5 +213,30 @@ router.get('/me', authenticate, controller.me);
  */
 router.put('/profile', authenticate, controller.updateProfile);
 router.put('/change-password', authenticate, controller.changePassword);
+
+/**
+ * @swagger
+ * /auth/sidebar-layout:
+ *   put:
+ *     tags: [Auth]
+ *     summary: Save the current user's sidebar customization (drag order, pin/unpin, section visibility)
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               items:
+ *                 type: object
+ *                 description: Keyed by stable nav item id (e.g. "native:contacts"), values { order?, pinned? }
+ *               groups:
+ *                 type: object
+ *                 properties:
+ *                   crmData:       { type: boolean }
+ *                   customModules: { type: boolean }
+ *     responses:
+ *       200: { description: Updated user }
+ */
+router.put('/sidebar-layout', authenticate, validate(sidebarLayoutSchema), controller.updateSidebarLayout);
 
 export default router;

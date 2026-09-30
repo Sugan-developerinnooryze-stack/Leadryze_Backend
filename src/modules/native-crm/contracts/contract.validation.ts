@@ -33,6 +33,7 @@ export const createContractSchema = z.object({
   customerId:            z.string().trim().min(1),
   title:                 z.string().trim().min(1).max(300),
   quotationId:           z.string().trim().optional(),
+  address:               z.string().trim().optional(),
   startDate:             z.string().optional(),
   endDate:               z.string().optional(),
   noEndDate:             z.boolean().optional(),

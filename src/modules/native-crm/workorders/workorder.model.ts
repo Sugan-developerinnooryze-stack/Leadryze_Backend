@@ -36,6 +36,7 @@ export interface IWorkorderDoc extends Document {
   staffId?:       string;
   staffIds?:      string[];
   title:          string;
+  address?:       string;
   scheduledDate?: Date;
   completedDate?: Date;
   durationHours?: number;
@@ -100,6 +101,7 @@ const schema = new Schema<IWorkorderDoc>(
     staffId:      { type: String, trim: true },
     staffIds:     { type: [{ type: String, trim: true }], default: [] },
     title:        { type: String, required: true, trim: true },
+    address:      { type: String, trim: true },
     scheduledDate:{ type: Date },
     completedDate:{ type: Date },
     durationHours:{ type: Number, min: 0 },

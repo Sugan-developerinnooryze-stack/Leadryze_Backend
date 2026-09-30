@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
@@ -10,7 +10,7 @@ const router = Router();
 router.use(authenticate, requireTenant);
 
 // GET /api/v1/automation-runs?page=1&limit=20&status=
-router.get('/', async (req: AuthRequest, res, next) => {
+router.get('/', requirePermission('automation.view_executions'), async (req: AuthRequest, res, next) => {
   try {
     const tenantId = new mongoose.Types.ObjectId(req.user!.tenantId);
     const page     = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -49,7 +49,7 @@ router.get('/', async (req: AuthRequest, res, next) => {
 });
 
 // GET /api/v1/automation-runs/:id
-router.get('/:id', async (req: AuthRequest, res, next) => {
+router.get('/:id', requirePermission('automation.view_executions'), async (req: AuthRequest, res, next) => {
   try {
     const tenantId = new mongoose.Types.ObjectId(req.user!.tenantId);
     const run = await AutomationRun.findOne({ _id: req.params.id, tenantId }).lean();
@@ -59,7 +59,7 @@ router.get('/:id', async (req: AuthRequest, res, next) => {
 });
 
 // DELETE /api/v1/automation-runs/:id
-router.delete('/:id', async (req: AuthRequest, res, next) => {
+router.delete('/:id', requirePermission('automation.view_executions'), async (req: AuthRequest, res, next) => {
   try {
     const tenantId = new mongoose.Types.ObjectId(req.user!.tenantId);
     const result = await AutomationRun.deleteOne({ _id: req.params.id, tenantId });

@@ -9,6 +9,25 @@ import { encrypt, decrypt, isEncrypted } from '../../utils/crypto';
 import { Permission, PermissionScope } from '../rbac/permission.model';
 import { CRMRecord } from '../crm/crm-record.model';
 import { invalidateRoleCache } from '../rbac/permission.service';
+import { Tenant } from '../tenants/tenant.model';
+import { isFeatureFlagEnabled } from '../tenants/tenant.service';
+
+// Phase 2: connector_<type> availability, gated at connector-creation time
+// only — see createConnector()'s own check below for the "new connections
+// only, existing sync unaffected" scope boundary.
+const CONNECTOR_TYPE_FLAG: Record<string, string> = {
+  zoho: 'connector_zoho', hubspot: 'connector_hubspot', salesforce: 'connector_salesforce',
+  rest: 'connector_rest', mysql: 'connector_mysql', postgresql: 'connector_postgresql', mongodb: 'connector_mongodb',
+};
+
+export async function assertConnectorTypeAllowed(tenantId: string, type: string): Promise<void> {
+  const flagKey = CONNECTOR_TYPE_FLAG[type];
+  if (!flagKey) return; // unknown/future type — nothing to gate against
+  const tenant = await Tenant.findById(tenantId).select('featureFlags').lean();
+  if (tenant && !isFeatureFlagEnabled(tenant, flagKey as keyof import('../tenants/tenant.model').IFeatureFlags)) {
+    throw Object.assign(new Error(`${type} is disabled for this tenant`), { statusCode: 403 });
+  }
+}
 
 const SENSITIVE_FIELDS = ['password', 'uri', 'apiKey', 'accessToken', 'refreshToken', 'webhookSecret'] as const;
 
@@ -39,6 +58,8 @@ export async function createConnector(
   tenantId: string,
   data: Partial<IConnector>
 ): Promise<IConnector> {
+  if (data.type) await assertConnectorTypeAllowed(tenantId, data.type);
+
   // NOTE: old connector deactivation happens AFTER OAuth succeeds (see below).
   // Deactivating first caused a race condition where auth failures left the
   // tenant with zero active connectors of that type.

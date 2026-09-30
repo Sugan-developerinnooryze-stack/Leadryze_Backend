@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
-import { authenticate } from '../../middlewares/auth.middleware';
+import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 import { AuthRequest } from '../../types';
 import {
   createActivity, listActivities, getActivity,
@@ -11,18 +12,22 @@ import { sendSmsNow } from '../messages/twilio.service';
 import { Tenant } from '../tenants/tenant.model';
 
 const router = Router();
-router.use(authenticate, requireTenant);
+// Same fix as connector.routes.ts/customer.routes.ts — mounted directly in
+// app.ts with no tenant feature-flag enforcement. This is the top-level
+// "Management" module under the Automation/My CRM sidebar section, gated
+// there by the single 'nav_myCrm' flag (Sidebar.tsx's AUTOMATION_ITEMS).
+router.use(authenticate, requireTenant, requireModuleEnabled('nav_myCrm'));
 
-router.get('/stats', async (req: AuthRequest, res: Response) => {
+router.get('/stats', requirePermission('native_crm.activities.view'), async (req: AuthRequest, res: Response) => {
   try {
-    const stats = await getActivityStats(req.tenantId!);
+    const stats = await getActivityStats(req.tenantId!, req.query.range as string | undefined, req.query.customFrom as string | undefined, req.query.customTo as string | undefined);
     res.json({ success: true, data: stats });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to fetch stats' });
   }
 });
 
-router.get('/', async (req: AuthRequest, res: Response) => {
+router.get('/', requirePermission('native_crm.activities.view'), async (req: AuthRequest, res: Response) => {
   try {
     const page  = Math.max(1, parseInt(String(req.query.page  || '1')));
     const limit = Math.min(100, parseInt(String(req.query.limit || '20')));
@@ -37,7 +42,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', async (req: AuthRequest, res: Response) => {
+router.post('/', requirePermission('native_crm.activities.create'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.body.title) return res.status(400).json({ success: false, message: 'title is required' });
     if (!req.body.type)  return res.status(400).json({ success: false, message: 'type is required' });
@@ -48,7 +53,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.get('/:id', async (req: AuthRequest, res: Response) => {
+router.get('/:id', requirePermission('native_crm.activities.view'), async (req: AuthRequest, res: Response) => {
   try {
     const activity = await getActivity(req.tenantId!, req.params.id);
     if (!activity) return res.status(404).json({ success: false, message: 'Not found' });
@@ -58,7 +63,7 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.put('/:id', async (req: AuthRequest, res: Response) => {
+router.put('/:id', requirePermission('native_crm.activities.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const activity = await updateActivity(req.tenantId!, req.params.id, req.body);
     if (!activity) return res.status(404).json({ success: false, message: 'Not found' });
@@ -68,7 +73,7 @@ router.put('/:id', async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.delete('/:id', async (req: AuthRequest, res: Response) => {
+router.delete('/:id', requirePermission('native_crm.activities.delete'), async (req: AuthRequest, res: Response) => {
   try {
     const ok = await deleteActivity(req.tenantId!, req.params.id);
     if (!ok) return res.status(404).json({ success: false, message: 'Not found' });
@@ -79,7 +84,7 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
 });
 
 /* ── POST /api/v1/activities/:id/notify — send email/SMS for an activity ── */
-router.post('/:id/notify', async (req: AuthRequest, res: Response) => {
+router.post('/:id/notify', requirePermission('native_crm.activities.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const activity = await getActivity(req.tenantId!, req.params.id);
     if (!activity) { res.status(404).json({ success: false, message: 'Activity not found' }); return; }

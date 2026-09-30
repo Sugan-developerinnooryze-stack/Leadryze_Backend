@@ -2,6 +2,8 @@ import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../../types';
 import * as tenantService from './tenant.service';
 import { sendSuccess, sendCreated, sendError, sendPaginated } from '../../utils/response';
+import { Tenant } from './tenant.model';
+import { logAuditEvent } from '../logs/audit-log.model';
 
 export async function createTenant(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -27,8 +29,30 @@ export async function getTenant(req: AuthRequest, res: Response, next: NextFunct
 
 export async function updateTenant(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
+    // Snapshot only the top-level keys the caller is touching, so the audit
+    // entry below can show old vs. new without a second full-document read.
+    const changedKeys = Object.keys(req.body ?? {});
+    const before = changedKeys.length
+      ? await Tenant.findById(req.params.id).select(changedKeys.join(' ')).lean()
+      : null;
+
     const tenant = await tenantService.updateTenant(req.params.id, req.body);
     if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+
+    if (before) {
+      const oldValues: Record<string, unknown> = {};
+      const newValues: Record<string, unknown> = {};
+      for (const key of changedKeys) {
+        oldValues[key] = (before as unknown as Record<string, unknown>)[key];
+        newValues[key] = (tenant as unknown as Record<string, unknown>)[key];
+      }
+      logAuditEvent(
+        'tenant.updated',
+        { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+        { tenantId: req.params.id, target: 'Tenant', targetId: req.params.id, detail: { tenantName: tenant.name, changedFields: changedKeys, oldValues, newValues } },
+      );
+    }
+
     sendSuccess(res, tenant, 'Tenant updated');
   } catch (err) { next(err); }
 }

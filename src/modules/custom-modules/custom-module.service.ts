@@ -101,13 +101,24 @@ export async function buildSearchIndexData(
 async function assertValidPipelineField(
   tenantId: string, moduleSlug: string, data: Record<string, unknown>,
 ): Promise<void> {
-  const def = await CustomModuleDef.findOne({ tenantId, slug: moduleSlug }).select('pipelineFieldKey').lean();
+  const def = await CustomModuleDef.findOne({ tenantId, slug: moduleSlug }).select('pipelineFieldKey fields').lean();
   const fieldKey = def?.pipelineFieldKey;
   if (!fieldKey || data[fieldKey] === undefined) return;
   const value = String(data[fieldKey]);
-  if (!(await isValidStageKey(tenantId, `custom:${moduleSlug}`, value))) {
-    throw new Error(`"${value}" is not a valid stage for this module's pipeline`);
-  }
+  if (await isValidStageKey(tenantId, `custom:${moduleSlug}`, value)) return;
+
+  // No tenant-configured Pipeline Settings stages exist yet for this custom
+  // module (PipelineConfig upserts to an empty stage list on first read for
+  // 'custom:<slug>' modules — see getOrCreateStages' comment) — fall back to
+  // accepting the pipeline field's own dropdown options, the same
+  // "usable until customized" default the frontend Kanban board already
+  // offers (CustomModulePage.tsx's pipelineFallbackStages). Without this, a
+  // drag-drop status change the board legitimately offered would be
+  // silently rejected here as an invalid stage.
+  const field = def?.fields.find((f) => f.key === fieldKey);
+  if (field?.options?.includes(value)) return;
+
+  throw new Error(`"${value}" is not a valid stage for this module's pipeline`);
 }
 
 /** Fire-and-forget hook-in point, same shape as every built-in module's

@@ -15,10 +15,26 @@ import { config } from '../../config';
 import mongoose from 'mongoose';
 import { UserSession } from '../auth/user-session.model';
 import { AuditLog, logAuditEvent } from '../logs/audit-log.model';
-import { checkBrevoHealth } from '../messages/brevo.service';
+import { checkBrevoHealth, sendEmailNow, buildTenantCredentialsEmail } from '../messages/brevo.service';
 import { checkTwilioHealth } from '../messages/twilio.service';
 import { ChatSession } from '../bot/chat-session.model';
 import { attachAiActionTrace } from '../bot/chat-trace.util';
+import { sendCreated } from '../../utils/response';
+import { provisionTenant, getEffectiveFeatureFlags, forceAddUserSeat } from '../tenants/tenant.service';
+import { getPlatformDefaults, setPlatformDefaults } from './platform-defaults.model';
+import { generatePassword } from '../native-crm/shared/app-credentials.service';
+import { logger } from '../../utils/logger';
+import { Role } from '../rbac/role.model';
+import { encrypt, decrypt } from '../../utils/crypto';
+import { assertPasswordUniqueAtTenant, isPasswordTakenAtTenant } from '../auth/auth.service';
+
+/** Best-effort decrypt for display — a user whose password was self-changed
+ * has no passwordEnc (cleared on change), and any old/corrupt value should
+ * never crash a list page, just render as "not available". */
+function tryDecryptPassword(enc?: string | null): string | null {
+  if (!enc) return null;
+  try { return decrypt(enc); } catch { return null; }
+}
 
 const router = Router();
 
@@ -92,7 +108,9 @@ router.get('/clients', async (_req, res, next) => {
           isActive: true,
           settings: {
             allowedChannels: ['web', 'whatsapp', 'email', 'sms'],
-            maxUsers: 5, maxLeadsPerMonth: 500,
+            // `admin` (the TENANT_ADMIN this tenant doc is being recreated
+            // for) already exists — one seat already in use.
+            maxUsers: 5, currentUserCount: 1, maxLeadsPerMonth: 500,
             timezone: 'Asia/Kuala_Lumpur', language: 'en', crmOption: 'no_crm',
           },
           branding: { companyName },
@@ -114,7 +132,7 @@ router.get('/clients', async (_req, res, next) => {
             Message.countDocuments({ tenantId: tid }),
             Campaign.countDocuments({ tenantId: tid }),
             User.findOne({ tenantId: tid, role: 'TENANT_ADMIN' })
-              .select('firstName lastName email createdAt'),
+              .select('firstName lastName email emailVerified createdAt'),
           ]);
         return {
           ...t.toObject(),
@@ -136,9 +154,123 @@ router.get('/clients', async (_req, res, next) => {
 router.get('/users', async (_req, res, next) => {
   try {
     const users = await User.find({ role: { $ne: 'SUPER_ADMIN' } })
+      .select('+passwordEnc')
       .sort({ createdAt: -1 })
-      .populate('tenantId', 'name slug plan isActive');
-    sendSuccess(res, users, 'Users fetched');
+      .populate('tenantId', 'name slug plan isActive clientId');
+    // Only present when a Super Admin issued/regenerated this credential —
+    // never for a self-chosen password (passwordEnc is cleared on change).
+    const withPasswords = users.map((u) => {
+      const obj = u.toObject() as unknown as Record<string, unknown>;
+      const password = tryDecryptPassword(u.passwordEnc);
+      delete obj.passwordEnc;
+      return { ...obj, password };
+    });
+    sendSuccess(res, withPasswords, 'Users fetched');
+  } catch (err) { next(err); }
+});
+
+// Reused by createUserForTenant() below — TENANT_ADMIN maps to the
+// tenant's seeded "Admin" system role; matches the map already used by
+// user.routes.ts's own POST / (a Tenant Admin inviting their own team).
+const ROLE_TO_SYSTEM_ROLE_NAME: Record<string, string> = {
+  TENANT_ADMIN: 'Admin', MANAGER: 'Manager', AGENT: 'Agent', USER: 'Agent',
+};
+
+// POST /admin/users — Super Admin adds a user directly to an EXISTING
+// tenant. Deliberately does not offer SUPER_ADMIN as a role here — creating
+// another Super Admin is a materially higher-stakes action than adding a
+// tenant's team member and isn't exposed through this generic form.
+router.post('/users', async (req: AuthRequest, res, next) => {
+  try {
+    const { tenantId, firstName, lastName, email, role, password: suppliedPassword } = req.body as {
+      tenantId?: string; firstName?: string; lastName?: string; email?: string; role?: string; password?: string;
+    };
+
+    if (!tenantId || !mongoose.isValidObjectId(tenantId)) { sendError(res, 'A valid tenantId is required', 400); return; }
+    if (!firstName?.trim()) { sendError(res, 'First name is required', 400); return; }
+    if (!lastName?.trim())  { sendError(res, 'Last name is required', 400); return; }
+    if (!email?.trim())     { sendError(res, 'Email is required', 400); return; }
+    const allowedRoles = ['TENANT_ADMIN', 'MANAGER', 'AGENT', 'USER'];
+    if (!role || !allowedRoles.includes(role)) { sendError(res, `Role must be one of: ${allowedRoles.join(', ')}`, 400); return; }
+
+    const tenant = await Tenant.findById(tenantId).select('name clientId').lean();
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const exists = await User.findOne({ email: normalizedEmail, tenantId });
+    if (exists) { sendError(res, 'A user with this email already exists in this tenant', 409); return; }
+
+    let password = suppliedPassword;
+    if (password) {
+      if (password.length < 8) { sendError(res, 'Password must be at least 8 characters', 400); return; }
+      await assertPasswordUniqueAtTenant(tenantId, password);
+    } else {
+      // Auto-generated — retry on the astronomically rare chance it
+      // collides with an existing password at this tenant.
+      let tries = 0;
+      do {
+        password = generatePassword();
+        tries++;
+      } while (tries < 10 && await isPasswordTakenAtTenant(tenantId, password));
+    }
+
+    const user = await User.create({
+      email: normalizedEmail,
+      password, // hashed by the model's pre-save hook — never written raw
+      passwordEnc: encrypt(password),
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      role,
+      tenantId: new mongoose.Types.ObjectId(tenantId),
+      // Only TENANT_ADMIN carries the tenant's clientId — matches
+      // registerUser()/provisionTenant()'s convention. Login itself no
+      // longer depends on this field (it resolves via {tenantId,email}),
+      // this is purely for display/consistency with those other paths.
+      ...(role === 'TENANT_ADMIN' ? { clientId: tenant.clientId } : {}),
+      isActive: true,
+      emailVerified: true, // admin-created — skips the verification step
+      mustChangePassword: true,
+    });
+
+    // Super Admin bypasses the tenant's own seat cap (no block here), but
+    // the new user still occupies a real seat — count it so a later
+    // self-service invite from the tenant's own Users page can't silently
+    // slip past the real limit.
+    await forceAddUserSeat(tenantId);
+
+    // Fire-and-forget role assignment — tenant's system roles already exist
+    // (seeded at tenant-creation time), just look one up by name.
+    const systemRoleName = ROLE_TO_SYSTEM_ROLE_NAME[role];
+    Role.findOne({ tenantId, name: systemRoleName }, '_id').lean()
+      .then((roleDoc) => { if (roleDoc) return User.findByIdAndUpdate(user._id, { roleId: roleDoc._id }); })
+      .catch(() => {});
+
+    let emailSent = true;
+    try {
+      const emailBody = buildTenantCredentialsEmail({
+        toName: firstName.trim(),
+        accountEmail: normalizedEmail,
+        loginId: user.loginId ?? tenant.clientId ?? '(missing Login ID)',
+        password,
+        frontendUrl: config.app.frontendUrl,
+      });
+      await sendEmailNow({ ...emailBody, to: normalizedEmail, toName: `${firstName.trim()} ${lastName.trim()}` });
+    } catch (err) {
+      emailSent = false;
+      logger.error('New-user credentials email failed', { tenantId, email: normalizedEmail, error: (err as Error).message });
+    }
+
+    logAuditEvent('user.created_by_admin',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      { tenantId, target: 'User', targetId: user._id.toString(), detail: { tenantName: tenant.name, userEmail: normalizedEmail, role, emailSent } },
+    );
+
+    const userObj = user.toObject() as unknown as Record<string, unknown>;
+    delete userObj.password;
+    delete userObj.refreshToken;
+    delete userObj.passwordEnc;
+
+    sendCreated(res, { user: userObj, loginId: user.loginId ?? tenant.clientId, temporaryPassword: password, emailSent }, 'User created — credentials emailed');
   } catch (err) { next(err); }
 });
 
@@ -159,23 +291,81 @@ router.post('/users/:id/verify-email', async (req: AuthRequest, res, next) => {
   } catch (err) { next(err); }
 });
 
-// POST /admin/users/:id/reset-password — set a new password for any user
+// POST /admin/users/:id/reset-password — set a new password for any user.
+// Two modes, distinguished only by the new `sendEmail` flag so the existing
+// typed-password caller (UsersPage.tsx) is byte-for-byte unaffected:
+//   - existing: { password } — sets exactly that password, no email, no
+//     forced change, response carries no password (unchanged behavior).
+//   - new, "Regenerate Tenant Admin Password": { sendEmail: true }, no
+//     password supplied — server generates one via generatePassword(),
+//     forces a change on next login, emails the credentials (Client ID +
+//     password), and always returns the plaintext password in the response
+//     as the guaranteed fallback if the email fails to send.
 router.post('/users/:id/reset-password', async (req: AuthRequest, res, next) => {
   try {
-    const { password } = req.body as { password: string };
-    if (!password || password.length < 8) {
+    const { password: suppliedPassword, sendEmail } = req.body as { password?: string; sendEmail?: boolean };
+    if (suppliedPassword && suppliedPassword.length < 8) {
       sendError(res, 'Password must be at least 8 characters', 400); return;
     }
+    if (!suppliedPassword && !sendEmail) {
+      sendError(res, 'Password must be at least 8 characters', 400); return;
+    }
+
     const user = await User.findById(req.params.id).select('+password');
     if (!user) { sendError(res, 'User not found', 404); return; }
+
+    let password = suppliedPassword;
+    if (password) {
+      try {
+        await assertPasswordUniqueAtTenant(user.tenantId, password, req.params.id);
+      } catch (err) { next(err); return; }
+    } else {
+      // Auto-generated — retry on the astronomically rare chance it
+      // collides with an existing password at this tenant.
+      let tries = 0;
+      do {
+        password = generatePassword();
+        tries++;
+      } while (tries < 10 && await isPasswordTakenAtTenant(user.tenantId, password, req.params.id));
+    }
+
     user.password = password;
     await user.save(); // triggers bcrypt pre-save hook
-    await User.findByIdAndUpdate(req.params.id, { $unset: { refreshToken: 1 } });
+    // Either branch here is a Super-Admin-issued credential (typed or
+    // generated), so both keep passwordEnc in sync — matches every other
+    // admin-issued-password call site.
+    await User.findByIdAndUpdate(req.params.id, {
+      $unset: { refreshToken: 1 },
+      passwordEnc: encrypt(password),
+      ...(sendEmail ? { mustChangePassword: true } : {}),
+    });
+
+    let emailSent: boolean | undefined;
+    if (sendEmail) {
+      emailSent = true;
+      try {
+        // Falls back to the tenant's clientId if this user predates the
+        // per-user loginId migration and hasn't been backfilled yet.
+        const userTenant = await Tenant.findById(user.tenantId).select('clientId').lean();
+        const emailBody = buildTenantCredentialsEmail({
+          toName: user.firstName,
+          accountEmail: user.email,
+          loginId: user.loginId ?? userTenant?.clientId ?? '(missing Login ID)',
+          password,
+          frontendUrl: config.app.frontendUrl,
+        });
+        await sendEmailNow({ ...emailBody, to: user.email, toName: `${user.firstName} ${user.lastName}`, subject: 'Your LeadRyze AI password has been reset' });
+      } catch (err) {
+        emailSent = false;
+        logger.error('Password-reset credential email failed', { userId: req.params.id, error: (err as Error).message });
+      }
+    }
+
     logAuditEvent('user.password_reset_by_admin',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      { target: 'User', targetId: req.params.id, detail: { userEmail: user.email } },
+      { target: 'User', targetId: req.params.id, detail: { userEmail: user.email, ...(sendEmail ? { emailSent } : {}) } },
     );
-    sendSuccess(res, null, 'Password reset successfully');
+    sendSuccess(res, sendEmail ? { password, emailSent, loginId: user.loginId } : null, 'Password reset successfully');
   } catch (err) { next(err); }
 });
 
@@ -186,8 +376,8 @@ router.get('/tenants/:id', async (req: AuthRequest, res, next) => {
     if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
 
     const tid = tenant._id;
-    const [users, recentCustomers, recentMessages, connectors, campaigns] = await Promise.all([
-      User.find({ tenantId: tid }).select('firstName lastName email role emailVerified createdAt'),
+    const [usersRaw, recentCustomers, recentMessages, connectors, campaigns] = await Promise.all([
+      User.find({ tenantId: tid }).select('firstName lastName email role emailVerified createdAt passwordEnc loginId'),
       Customer.find({ tenantId: tid }).sort({ createdAt: -1 }).limit(5).select('name email phone channel createdAt'),
       Message.find({ tenantId: tid }).sort({ createdAt: -1 }).limit(10)
         .select('content channel direction aiGenerated status createdAt')
@@ -196,7 +386,117 @@ router.get('/tenants/:id', async (req: AuthRequest, res, next) => {
       Campaign.find({ tenantId: tid }).sort({ createdAt: -1 }).limit(5).select('name type status stats createdAt'),
     ]);
 
+    // Only present when a Super Admin issued/regenerated this credential —
+    // never for a self-chosen password (passwordEnc is cleared on change).
+    const users = usersRaw.map((u) => {
+      const obj = u.toObject() as unknown as Record<string, unknown>;
+      const password = tryDecryptPassword(u.passwordEnc);
+      delete obj.passwordEnc;
+      return { ...obj, password };
+    });
+
     sendSuccess(res, { tenant, users, recentCustomers, recentMessages, connectors, campaigns }, 'Tenant detail fetched');
+  } catch (err) { next(err); }
+});
+
+// POST /admin/tenants — Super Admin direct tenant creation (Flow A):
+// generates Client ID + password immediately, no approval step needed.
+router.post('/tenants', async (req: AuthRequest, res, next) => {
+  try {
+    const { name, plan, domain, contactEmail, contactPhone, adminFirstName, adminLastName, adminEmail } = req.body ?? {};
+    if (!name?.trim()) { sendError(res, 'Business name is required', 400); return; }
+    if (!adminFirstName?.trim() || !adminLastName?.trim()) { sendError(res, 'Tenant admin first and last name are required', 400); return; }
+    if (!adminEmail?.trim()) { sendError(res, 'Tenant admin email is required', 400); return; }
+
+    const existing = await User.findOne({ email: adminEmail.toLowerCase().trim() });
+    if (existing) { sendError(res, 'A user with this email already exists', 409); return; }
+
+    const result = await provisionTenant({
+      name: name.trim(), plan, domain, contactEmail, contactPhone,
+      adminFirstName: adminFirstName.trim(), adminLastName: adminLastName.trim(), adminEmail: adminEmail.trim(),
+    });
+
+    logAuditEvent('tenant.provisioned',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      { tenantId: result.tenant._id.toString(), target: 'Tenant', targetId: result.tenant._id.toString(),
+        detail: { tenantName: result.tenant.name, clientId: result.clientId, adminEmail: result.adminUser.email, emailSent: result.emailSent } },
+    );
+    sendCreated(res, result, 'Tenant created — credentials emailed to the tenant admin');
+  } catch (err) { next(err); }
+});
+
+// POST /admin/tenants/:id/approve — Flow B: strictly a one-time
+// pending/rejected -> approved transition. Never regenerates credentials
+// for an already-approved tenant — that's what Regenerate Password is for.
+router.post('/tenants/:id/approve', async (req: AuthRequest, res, next) => {
+  try {
+    const tenant = await Tenant.findById(req.params.id);
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    if (tenant.approvalStatus === 'approved' || tenant.approvalStatus === undefined) {
+      sendError(res, 'This tenant is already approved — use Regenerate Tenant Admin Password to issue a new password', 409);
+      return;
+    }
+
+    const adminUser = await User.findOne({ tenantId: tenant._id, role: 'TENANT_ADMIN' }).select('+password');
+    if (!adminUser) { sendError(res, 'No tenant admin user found for this tenant', 404); return; }
+    if (!adminUser.emailVerified) {
+      sendError(res, "Cannot approve — the tenant admin's email is not verified yet", 400);
+      return;
+    }
+
+    // Auto-generated — retry on the astronomically rare chance it
+    // collides with an existing password at this tenant (e.g. a Manager
+    // added via Add User before this approval happened).
+    let temporaryPassword = generatePassword();
+    let tries = 0;
+    while (tries < 10 && await isPasswordTakenAtTenant(tenant._id, temporaryPassword, adminUser._id.toString())) {
+      temporaryPassword = generatePassword();
+      tries++;
+    }
+    adminUser.password = temporaryPassword; // hashed by the model's pre-save hook
+    await adminUser.save();
+    await User.findByIdAndUpdate(adminUser._id, { mustChangePassword: true, passwordEnc: encrypt(temporaryPassword) });
+
+    tenant.approvalStatus = 'approved';
+    await tenant.save();
+
+    let emailSent = true;
+    try {
+      const emailBody = buildTenantCredentialsEmail({
+        toName: adminUser.firstName,
+        accountEmail: adminUser.email,
+        loginId: adminUser.loginId ?? tenant.clientId ?? '(missing Login ID)',
+        password: temporaryPassword,
+        frontendUrl: config.app.frontendUrl,
+      });
+      await sendEmailNow({ ...emailBody, to: adminUser.email, toName: `${adminUser.firstName} ${adminUser.lastName}` });
+    } catch (err) {
+      emailSent = false;
+      logger.error('Tenant approval credentials email failed', { tenantId: tenant._id.toString(), email: adminUser.email, error: (err as Error).message });
+    }
+
+    logAuditEvent('tenant.approved',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      { tenantId: tenant._id.toString(), target: 'Tenant', targetId: tenant._id.toString(),
+        detail: { tenantName: tenant.name, clientId: tenant.clientId, adminEmail: adminUser.email, emailSent } },
+    );
+    sendSuccess(res, { loginId: adminUser.loginId ?? tenant.clientId, email: adminUser.email, temporaryPassword, emailSent }, 'Tenant approved — credentials emailed to the tenant admin');
+  } catch (err) { next(err); }
+});
+
+// POST /admin/tenants/:id/reject — Flow B: marks a pending signup as
+// rejected. No credentials are ever generated for a rejected tenant.
+router.post('/tenants/:id/reject', async (req: AuthRequest, res, next) => {
+  try {
+    const tenant = await Tenant.findById(req.params.id);
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    tenant.approvalStatus = 'rejected';
+    await tenant.save();
+    logAuditEvent('tenant.rejected',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      { tenantId: tenant._id.toString(), target: 'Tenant', targetId: tenant._id.toString(), detail: { tenantName: tenant.name } },
+    );
+    sendSuccess(res, { approvalStatus: 'rejected' }, 'Tenant signup rejected');
   } catch (err) { next(err); }
 });
 
@@ -217,12 +517,14 @@ router.patch('/clients/:id/toggle', async (req: AuthRequest, res, next) => {
   try {
     const tenant = await Tenant.findById(req.params.id);
     if (!tenant) { sendError(res, 'Client not found', 404); return; }
+    const previousIsActive = tenant.isActive;
+    const { reason } = (req.body ?? {}) as { reason?: string };
     tenant.isActive = !tenant.isActive;
     await tenant.save();
     logAuditEvent(
       tenant.isActive ? 'client.activated' : 'client.deactivated',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      { tenantId: tenant._id.toString(), target: 'Tenant', targetId: tenant._id.toString(), detail: { tenantName: tenant.name } },
+      { tenantId: tenant._id.toString(), target: 'Tenant', targetId: tenant._id.toString(), detail: { tenantName: tenant.name, previousIsActive, newIsActive: tenant.isActive, ...(reason ? { reason } : {}) } },
     );
     sendSuccess(res, { isActive: tenant.isActive }, `Client ${tenant.isActive ? 'activated' : 'deactivated'}`);
   } catch (err) { next(err); }
@@ -907,33 +1209,118 @@ router.get('/audit-logs', async (req: AuthRequest, res, next) => {
 // GET /admin/tenants/:id/features — get feature flags for a tenant
 router.get('/tenants/:id/features', async (req: AuthRequest, res, next) => {
   try {
-    const tenant = await Tenant.findById(req.params.id).select('featureFlags name');
+    const tenant = await Tenant.findById(req.params.id).select('featureFlags accessConfigMode name settings.maxUsers');
     if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
     const { DEFAULT_FEATURE_FLAGS } = await import('../tenants/tenant.model');
     // Convert Mongoose subdocument → plain object so all saved fields (including false values) are present
     const rawFlags = tenant.featureFlags as unknown as { toObject?: () => Record<string, unknown> } | undefined;
     const saved = rawFlags?.toObject ? rawFlags.toObject() : (tenant.featureFlags ?? {});
     const flags = { ...DEFAULT_FEATURE_FLAGS, ...saved };
-    sendSuccess(res, { flags, tenantName: tenant.name });
+    // Mirrors getEffectiveFeatureFlags()'s own precedence: anything other
+    // than an explicit 'custom' opt-out is treated as 'default' (including
+    // tenants that predate this field), so this displayed mode always
+    // matches what effectiveFlags below actually resolves to.
+    const accessConfigMode = tenant.accessConfigMode === 'custom' ? 'custom' : 'default';
+    // effectiveFlags is what's ACTUALLY applied right now — identical to
+    // `flags` in 'custom' mode, or the Platform Defaults template in
+    // 'default' mode. `flags` itself is always the tenant's own raw stored
+    // values, untouched by mode, so switching back to Customize later
+    // restores exactly what was there before, not the template.
+    const effectiveFlags = await getEffectiveFeatureFlags(tenant);
+    // Live ground truth for display — deliberately NOT the maintained
+    // currentUserCount reservation counter (that's an enforcement-only
+    // field; see reserveUserSeat() in tenant.service.ts).
+    const activeUsers = await User.countDocuments({ tenantId: tenant._id, role: { $ne: 'SUPER_ADMIN' }, isActive: true });
+    sendSuccess(res, { flags, effectiveFlags, accessConfigMode, tenantName: tenant.name, maxUsers: tenant.settings?.maxUsers ?? null, activeUsers });
   } catch (err) { next(err); }
 });
 
-// PUT /admin/tenants/:id/features — update feature flags for a tenant
+// PUT /admin/tenants/:id/features — update feature flags (and/or access
+// mode, and/or the user-seat limit) for a tenant. accessConfigMode and
+// maxUsers are both optional so the existing {flags}-only callers keep
+// working unchanged.
 router.put('/tenants/:id/features', async (req: AuthRequest, res, next) => {
   try {
-    const { flags } = req.body as { flags: Record<string, boolean> };
+    const { flags, accessConfigMode, maxUsers } = req.body as {
+      flags: Record<string, boolean>; accessConfigMode?: 'default' | 'custom'; maxUsers?: number | null;
+    };
+    if (accessConfigMode && !['default', 'custom'].includes(accessConfigMode)) {
+      sendError(res, "accessConfigMode must be 'default' or 'custom'", 400); return;
+    }
+    if (maxUsers !== undefined && maxUsers !== null && (!Number.isInteger(maxUsers) || maxUsers < 1)) {
+      sendError(res, 'maxUsers must be a positive whole number, or null for unlimited', 400); return;
+    }
+    const before = await Tenant.findById(req.params.id).select('featureFlags accessConfigMode settings.maxUsers');
+    if (!before) { sendError(res, 'Tenant not found', 404); return; }
+    const previousFlags = before.featureFlags;
+    const previousMode = before.accessConfigMode === 'custom' ? 'custom' : 'default';
+    const previousMaxUsers = before.settings?.maxUsers ?? null;
     const tenant = await Tenant.findByIdAndUpdate(
       req.params.id,
-      { $set: { featureFlags: flags } },
+      {
+        $set: {
+          featureFlags: flags,
+          ...(accessConfigMode ? { accessConfigMode } : {}),
+          // Changing the ceiling never touches currentUserCount or any User
+          // document — raising it takes effect on the very next invite,
+          // lowering it below current usage only blocks new invites, never
+          // deactivates or deletes anyone.
+          ...(maxUsers !== undefined ? { 'settings.maxUsers': maxUsers } : {}),
+        },
+      },
       { new: true, runValidators: false }
-    ).select('featureFlags name');
+    ).select('featureFlags accessConfigMode name settings.maxUsers');
     if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    // Per-flag-key diff — {previousFlags, flags} already had the full before/
+    // after objects; `changes` adds an explicit "what actually changed" list
+    // so a reviewer doesn't have to manually compare the two.
+    const previousFlagsObj = (previousFlags as unknown as { toObject?: () => Record<string, unknown> })?.toObject?.()
+      ?? (previousFlags as unknown as Record<string, unknown> | undefined) ?? {};
+    const changes: { key: string; from: unknown; to: unknown }[] = Object.keys(flags)
+      .filter((key) => previousFlagsObj[key] !== flags[key])
+      .map((key) => ({ key, from: previousFlagsObj[key] ?? null, to: flags[key] }));
+    if (accessConfigMode && accessConfigMode !== previousMode) {
+      changes.push({ key: 'accessConfigMode', from: previousMode, to: accessConfigMode });
+    }
+    if (maxUsers !== undefined && maxUsers !== previousMaxUsers) {
+      changes.push({ key: 'maxUsers', from: previousMaxUsers, to: maxUsers });
+    }
     logAuditEvent(
       'feature_flags.updated',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      { tenantId: req.params.id, target: 'Tenant', targetId: req.params.id, detail: { tenantName: tenant.name, flags } },
+      { tenantId: req.params.id, target: 'Tenant', targetId: req.params.id, detail: { tenantName: tenant.name, previousFlags, flags, changes, result: 'success' } },
     );
-    sendSuccess(res, { flags: tenant.featureFlags, tenantName: tenant.name }, 'Feature flags updated');
+    const activeUsers = await User.countDocuments({ tenantId: tenant._id, role: { $ne: 'SUPER_ADMIN' }, isActive: true });
+    sendSuccess(res, { flags: tenant.featureFlags, accessConfigMode: tenant.accessConfigMode === 'custom' ? 'custom' : 'default', tenantName: tenant.name, maxUsers: tenant.settings?.maxUsers ?? null, activeUsers }, 'Feature flags updated');
+  } catch (err) { next(err); }
+});
+
+// GET /admin/platform-defaults — the global template new tenants inherit
+router.get('/platform-defaults', async (_req, res, next) => {
+  try {
+    const flags = await getPlatformDefaults();
+    sendSuccess(res, { flags });
+  } catch (err) { next(err); }
+});
+
+// PUT /admin/platform-defaults — edit the global template. Only affects
+// tenants on accessConfigMode:'default' (immediately) and future tenants
+// created from this point on — existing 'custom' tenants are untouched.
+router.put('/platform-defaults', async (req: AuthRequest, res, next) => {
+  try {
+    const { flags } = req.body as { flags: Record<string, boolean> };
+    const previousFlags = await getPlatformDefaults();
+    const updatedFlags = await setPlatformDefaults(flags);
+    const previousFlagsObj = previousFlags as unknown as Record<string, unknown>;
+    const changes = Object.keys(flags)
+      .filter((key) => previousFlagsObj[key] !== flags[key])
+      .map((key) => ({ key, from: previousFlagsObj[key] ?? null, to: flags[key] }));
+    logAuditEvent(
+      'platform_defaults.updated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      { target: 'PlatformDefaults', targetId: 'platform-defaults', detail: { previousFlags, flags: updatedFlags, changes, result: 'success' } },
+    );
+    sendSuccess(res, { flags: updatedFlags }, 'Platform defaults updated');
   } catch (err) { next(err); }
 });
 
