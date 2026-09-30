@@ -102,7 +102,7 @@ const morganFormat = ':method :url :status :res[content-length]b - :response-tim
 app.use(morgan(morganFormat, { stream: { write: (msg) => logger.http(msg.trim()) } }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(mongoSanitize()); // strips MongoDB operators ($, .) from user input
+app.use(mongoSanitize({ allowDots: true })); // allowDots: true preserves Meta WhatsApp/Instagram webhook query params (hub.mode, hub.verify_token)
 app.use(hpp());           // removes duplicate query params (HTTP Parameter Pollution)
 app.use(globalRateLimit);
 app.use(auditLog);
