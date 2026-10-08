@@ -51,7 +51,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateStaff(req.params.id, req.tenantId!, req.body);
+    const item = await updateStaff(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'staffs'));
     if (!item) return sendError(res, 'Staff not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {

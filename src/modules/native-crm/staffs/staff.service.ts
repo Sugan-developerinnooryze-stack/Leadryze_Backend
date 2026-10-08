@@ -59,10 +59,16 @@ export async function createStaff(data: any) {
   return doc;
 }
 
-export async function updateStaff(id: string, tenantId: string, data: any) {
+export async function updateStaff(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  // Same row-level enforcement listStaffs already applies to the list view —
+  // without it, a scoped Manager could edit (or reassign onto their own
+  // team) a Staff record outside their scope just by knowing its id, even
+  // though they'd never see it in their own scoped list in the first place.
+  const filter: any = { _id: id, tenantId: tid };
+  applyDataScopeToFilter(filter, scope, 'staffId');
   const updated = await NativeStaff.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    filter,
     data,
     { new: true, runValidators: true }
   );

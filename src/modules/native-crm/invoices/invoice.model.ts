@@ -36,6 +36,9 @@ export interface IInvoiceDoc extends Document {
   servicesAmountWithTax: number;
   dueDate?:              Date;
   paid:                  boolean;
+  // How much of servicesAmountWithTax has been collected via Receipts —
+  // see receipt.service.ts's createReceipt, the only writer of this field.
+  paidAmount:            number;
   status:                string;
   notes?:                string;
   termsAndConditions?:   string;
@@ -93,6 +96,7 @@ const schema = new Schema<IInvoiceDoc>(
     servicesAmountWithTax: { type: Number, default: 0 },
     dueDate:               { type: Date },
     paid:                  { type: Boolean, default: false },
+    paidAmount:            { type: Number, default: 0 },
     // Stage validity is enforced at the service layer against the tenant's
     // own configured pipeline (native-crm/pipeline-config), not a fixed enum.
     status: {

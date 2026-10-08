@@ -1,6 +1,13 @@
 import mongoose from 'mongoose';
 import { Template, ITemplate } from './template.model';
 import { parsePagination, buildSkip } from '../../utils/pagination';
+import { Customer } from '../customers/customer.model';
+import { Campaign } from '../campaigns/campaign.model';
+import { AutomationRule } from '../native-crm/automation-rules/automation-rule.model';
+import { AutomationFlow } from '../native-crm/automation-flows/automation-flow.model';
+import { sendEmailNow } from '../messages/brevo.service';
+import { sendSmsNow } from '../messages/twilio.service';
+import { sendWhatsAppNow } from '../messages/whatsapp.service';
 
 function extractVariables(body: string): string[] {
   const matches = body.match(/\{\{([\w.]+)\}\}/g) || [];
@@ -106,4 +113,119 @@ export async function seedDefaultTemplates(tenantId: string): Promise<{ created:
     created++;
   }
   return { created, skipped };
+}
+
+// Mirrors deleteTemplate's shape exactly — the other half of the lifecycle
+// that was previously missing (deactivate existed, reactivate didn't).
+export async function activateTemplate(tenantId: string, id: string): Promise<ITemplate | null> {
+  return Template.findOneAndUpdate({ _id: id, tenantId }, { isActive: true }, { new: true });
+}
+
+// Intentionally resolves via getTemplateById (no isActive filter) — a
+// deactivated template can still be duplicated, same as it can still be
+// resolved for sending. The duplicate is a genuinely independent document:
+// no templateId anywhere points at its _id, so its usage is naturally 0.
+export async function duplicateTemplate(tenantId: string, id: string): Promise<ITemplate | null> {
+  const original = await getTemplateById(tenantId, id);
+  if (!original) return null;
+  return Template.create({
+    tenantId: new mongoose.Types.ObjectId(tenantId),
+    name: `${original.name} (Copy)`,
+    type: original.type,
+    category: original.category,
+    subject: original.subject,
+    body: original.body,
+    variables: original.variables,
+    language: original.language,
+    isActive: true,
+    aiGenerated: false,
+  });
+}
+
+function sampleVariablesForCustomer(customer: { name?: string; firstName?: string; lastName?: string; email?: string; phone?: string; company?: string } | null): Record<string, string> {
+  if (!customer) {
+    return { name: 'Sample Customer', firstName: 'Sample', lastName: 'Customer', email: 'sample@example.com', phone: '+10000000000', company: 'Sample Co' };
+  }
+  return {
+    name: customer.name ?? '',
+    firstName: customer.firstName ?? customer.name ?? '',
+    lastName: customer.lastName ?? '',
+    email: customer.email ?? '',
+    phone: customer.phone ?? '',
+    company: customer.company ?? '',
+  };
+}
+
+// Render-only — no provider call, no DB write. Reuses the existing pure
+// renderTemplate() so preview and real sends are guaranteed to render
+// identically.
+export async function previewTemplate(
+  tenantId: string,
+  id: string,
+  sampleVariables?: Record<string, string>
+): Promise<{ subject?: string; body: string } | null> {
+  const template = await getTemplateById(tenantId, id);
+  if (!template) return null;
+  const variables = sampleVariables ?? sampleVariablesForCustomer(await Customer.findOne({ tenantId }).lean());
+  return {
+    subject: template.subject ? renderTemplate(template.subject, variables) : undefined,
+    body: renderTemplate(template.body, variables),
+  };
+}
+
+export class TemplateActionError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// One-off test send — touches no stats, creates no CampaignRecipient-style
+// row. Only sendEmailNow can throw (Brevo API failures); sendWhatsAppNow/
+// sendSmsNow never throw, they resolve to null on failure or missing config
+// — same contract already established in campaign-dispatch.service.ts.
+export async function testSendTemplate(tenantId: string, id: string, to: string): Promise<{ sent: boolean; reason?: string }> {
+  const template = await getTemplateById(tenantId, id);
+  if (!template) throw new TemplateActionError('Template not found', 404);
+
+  const variables = sampleVariablesForCustomer(await Customer.findOne({ tenantId }).lean());
+  const body = renderTemplate(template.body, variables);
+
+  if (template.type === 'email') {
+    const subject = template.subject ? renderTemplate(template.subject, variables) : 'Test message';
+    try {
+      const messageId = await sendEmailNow({ to, subject, htmlContent: body });
+      return messageId ? { sent: true } : { sent: false, reason: 'Email is not configured for this tenant.' };
+    } catch (err) {
+      return { sent: false, reason: (err as Error).message };
+    }
+  }
+  if (template.type === 'whatsapp') {
+    const messageId = await sendWhatsAppNow(to, body);
+    return messageId ? { sent: true } : { sent: false, reason: 'WhatsApp is not connected for this tenant — configure it in Connectors before sending a test.' };
+  }
+  const sid = await sendSmsNow({ to, body });
+  return sid ? { sent: true } : { sent: false, reason: 'SMS is not configured for this tenant — configure your SMS provider before sending a test.' };
+}
+
+export interface TemplateUsage {
+  campaigns: number;
+  automationRules: number;
+  automationFlows: number;
+  total: number;
+}
+
+// Live aggregate, not a denormalized counter — never goes stale. The three
+// consumer collections use genuinely different id representations
+// (Campaign.templateId is an ObjectId ref; AutomationRule.templateId and
+// AutomationFlow's per-node templateId are both plain strings), confirmed
+// by direct schema reads, so this cannot be one shared helper query.
+export async function getTemplateUsage(tenantId: string, id: string): Promise<TemplateUsage> {
+  const [campaigns, automationRules, automationFlows] = await Promise.all([
+    Campaign.countDocuments({ tenantId, templateId: new mongoose.Types.ObjectId(id) }),
+    AutomationRule.countDocuments({ tenantId, templateId: id }),
+    AutomationFlow.countDocuments({ tenantId, 'nodes.templateId': id }),
+  ]);
+  return { campaigns, automationRules, automationFlows, total: campaigns + automationRules + automationFlows };
 }

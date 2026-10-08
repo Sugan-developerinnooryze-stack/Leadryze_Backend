@@ -21,7 +21,7 @@ export const taskSchema = new Schema(
     // Order/Contract) so this task shows up in that record's Activity feed —
     // relatedId is the target's Mongo _id (not its human-facing *Id string),
     // matching the same convention already used by lead-conversion/Timeline.
-    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract'] },
+    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract', 'lead'] },
     relatedId:     { type: String, trim: true },
     relatedLabel:  { type: String, trim: true },
     // Guard so the "upcoming task" reminder cron never emails/texts twice for

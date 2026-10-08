@@ -4,7 +4,7 @@ export interface ITemplate extends Document {
   tenantId: mongoose.Types.ObjectId;
   name: string;
   type: 'email' | 'whatsapp' | 'sms';
-  category: 'followup' | 'booking' | 'reminder' | 'marketing' | 'onboarding' | 'feedback';
+  category: 'followup' | 'booking' | 'reminder' | 'marketing' | 'onboarding' | 'feedback' | 'appointment' | 'meeting' | 'task' | 'custom';
   subject?: string;
   body: string;
   variables: string[];

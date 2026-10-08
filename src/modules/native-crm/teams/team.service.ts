@@ -51,8 +51,16 @@ export async function createTeam(data: any) {
   return doc;
 }
 
-export async function updateTeam(id: string, tenantId: string, data: any) {
+export async function updateTeam(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  // Same row-level enforcement listTeams already applies to the list view —
+  // without this, a scoped Manager who knows/guesses another team's id could
+  // reassign its managerUserId onto themselves (or unassign it) via a direct
+  // API call, even though that team never appears in their own scoped list.
+  // A scoped caller may only touch a team already inside their own scope —
+  // claiming a brand-new unassigned team stays an Admin-driven action here,
+  // same as create() already is.
+  if (scope && scope.kind !== 'all' && !scope.teamIds.includes(id)) return null;
   if (data.name) await assertUniqueTeamName(tid, data.name, id);
   const updated = await NativeTeam.findOneAndUpdate(
     { _id: id, tenantId: tid },

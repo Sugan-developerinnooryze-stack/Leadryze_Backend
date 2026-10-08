@@ -7,7 +7,11 @@ import { generateVisits, computeBalance, serviceRangeSummary } from './schedule.
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
+import { NativeTeam } from '../teams/team.model';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
+import { applyDynamicFilters } from '../shared/dynamic-filter';
+import { getContractFilterCatalog } from './contract.filter-catalog';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -20,6 +24,8 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
 function hasScheduleRules(services: any[]): boolean {
   return Array.isArray(services) && services.some((s) => s?.scheduleRule?.frequency);
 }
+
+const CONTRACT_DATE_FIELDS = new Set(['startDate', 'endDate', 'overlap', 'createdAt']);
 
 export async function listContracts(tenantId: string, opts: ContractListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -34,6 +40,36 @@ export async function listContracts(tenantId: string, opts: ContractListOptions,
     { title:      new RegExp(opts.search, 'i') },
     { customerId: new RegExp(opts.search, 'i') },
   ];
+  if (opts.teamId) {
+    const team = await NativeTeam.findOne({ _id: opts.teamId, tenantId: tid }).select('teamId').lean();
+    filter.teamId = team?.teamId ?? '__no_match__';
+  }
+  if (opts.staffId) {
+    const staffOr = [{ staffId: opts.staffId }, { staffIds: opts.staffId }];
+    if (filter.$or) {
+      filter.$and = [{ $or: filter.$or }, { $or: staffOr }];
+      delete filter.$or;
+    } else {
+      filter.$or = staffOr;
+    }
+  }
+  const dateField = opts.dateField && CONTRACT_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
+  const resolvedRange = resolveDateRange(opts.range, opts.dateFrom, opts.dateTo);
+  if (dateField === 'overlap') {
+    // A contract's active span (startDate..endDate) overlapping the
+    // requested window at all — not a single-field range match — so a
+    // contract running Sep-Dec still shows while viewing October.
+    if (resolvedRange) {
+      filter.startDate = { $lte: resolvedRange.end };
+      filter.endDate   = { $gte: resolvedRange.start };
+    }
+  } else {
+    applyDateRangeToFilter(filter, dateField, resolvedRange);
+  }
+  if (opts.filters) {
+    const catalog = await getContractFilterCatalog(tenantId, branchId);
+    applyDynamicFilters(filter, opts.filters, catalog);
+  }
 
   const [docs, total] = await Promise.all([
     NativeContract.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
@@ -69,7 +105,9 @@ export async function createContract(data: any) {
   const prtTotal = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
   const discount = Number(data.discount ?? 0);
   const gst      = Number(data.gstPercentage ?? 0);
-  const after    = svcTotal + prtTotal - discount;
+  // discount is a percentage (0-100), not a flat amount — matches quotation.service.ts.
+  const subtotal = svcTotal + prtTotal;
+  const after    = subtotal - (subtotal * discount) / 100;
 
   // Master engine: expand per-service schedule rules into the visit schedule
   let visits = data.visits;
@@ -110,7 +148,9 @@ export async function updateContract(id: string, tenantId: string, data: any, sc
     const gst       = Number(data.gstPercentage ?? existing?.gstPercentage ?? 0);
     const svcTotal  = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
     const prtTotal  = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-    const after     = svcTotal + prtTotal - discount;
+    // discount is a percentage (0-100), not a flat amount — matches createContract above.
+    const subtotal  = svcTotal + prtTotal;
+    const after     = subtotal - (subtotal * discount) / 100;
     data.partsAmount           = prtTotal;
     data.servicesAmount        = after;
     data.servicesAmountWithTax = after + (after * gst) / 100;

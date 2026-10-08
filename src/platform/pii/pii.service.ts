@@ -1,6 +1,16 @@
+import { createHash } from 'crypto';
 import { encrypt, decrypt, isEncrypted } from '../../utils/crypto';
 import { PII_FIELDS, ADMIN_ROLES } from './constants';
 import { maskField } from './masking.service';
+
+/** One-way, non-reversible — lets a search query check "is there a row
+ * whose real email equals X" via an exact hash match, without ever storing
+ * (or letting this field leak back into) the plaintext email itself.
+ * Exported so a search query (lead.service.ts/contact.service.ts) can hash
+ * the user's typed search term the same way to compare against it. */
+export function hashEmail(email: string): string {
+  return createHash('sha256').update(email.trim().toLowerCase()).digest('hex');
+}
 
 /**
  * Encrypts all PII fields on an object in-place before saving to MongoDB.
@@ -9,6 +19,17 @@ import { maskField } from './masking.service';
 export function encryptPIIFields(obj: Record<string, any>, module: string): void {
   const def = PII_FIELDS[module];
   if (!def) return;
+
+  // LR-LEAD-005: capture these BEFORE the encryption loop below overwrites
+  // obj.phone/obj.email in place — deriving the blind-index fields
+  // afterward was reading ciphertext, not the real value. If the field is
+  // already ciphertext (unchanged since a prior save), skip deriving —
+  // recomputing from ciphertext digits would corrupt the index a prior,
+  // correct save already produced.
+  const phoneValRaw = obj['phone'] ?? obj['mobile'];
+  const emailValRaw = obj['email'];
+  const phoneIsPlain = typeof phoneValRaw === 'string' && phoneValRaw.trim() !== '' && !isEncrypted(phoneValRaw);
+  const emailIsPlain = typeof emailValRaw === 'string' && emailValRaw.trim() !== '' && !isEncrypted(emailValRaw);
 
   const allFields = [...def.level2, ...def.level3];
   for (const field of allFields) {
@@ -22,17 +43,22 @@ export function encryptPIIFields(obj: Record<string, any>, module: string): void
     }
   }
 
-  // Derive phoneSearch (first 6 digits) and emailDomain for search compatibility
-  const phoneVal = obj['phone'] ?? obj['mobile'];
-  if (phoneVal && typeof phoneVal === 'string') {
-    const digits = phoneVal.replace(/\D/g, '');
+  // Derive phoneSearch (full digits — a prefix-anchored search regex needs
+  // the complete number, not a truncated slice, to match a fully-typed
+  // search term) and emailDomain for search compatibility.
+  if (phoneIsPlain) {
+    const digits = phoneValRaw.replace(/\D/g, '');
     if (digits.length >= 6) {
-      obj['phoneSearch'] = digits.slice(0, 6);
+      obj['phoneSearch'] = digits;
     }
   }
-  const emailVal = obj['email'];
-  if (emailVal && typeof emailVal === 'string' && emailVal.includes('@')) {
-    obj['emailDomain'] = emailVal.split('@')[1]?.toLowerCase() ?? '';
+  if (emailIsPlain && emailValRaw.includes('@')) {
+    obj['emailDomain'] = emailValRaw.split('@')[1]?.toLowerCase() ?? '';
+    // LR-LEAD-005: exact-match blind index — restores "search by email" for
+    // a correctly-encrypted row (a plain regex against the ciphertext
+    // column can never match a typed-out email) without storing it back in
+    // reversible form.
+    obj['emailSearch'] = hashEmail(emailValRaw);
   }
 }
 

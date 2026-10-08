@@ -48,3 +48,23 @@ export const widgetHistoryQuerySchema = z.object({
   limit:     z.coerce.number().int().min(1).max(200).optional(),
   before:    z.string().trim().datetime({ offset: true }).optional(),
 });
+
+// POST /public/widget/handoff/request — visitor clicks "Connect with an
+// expert." pageUrl travels in the body here (unlike history's query string)
+// since this is a POST, matching widgetChatBodySchema's own pageUrl shape.
+export const widgetHandoffRequestBodySchema = z.object({
+  sessionId:    z.string().trim().min(1).max(200),
+  visitorId:    z.string().trim().min(1).max(200).optional(),
+  visitorName:  z.string().trim().min(1).max(200).optional(),
+  visitorEmail: z.string().trim().email().max(200).optional(),
+  visitorPhone: z.string().trim().min(1).max(50).optional(),
+  pageUrl:      z.string().trim().max(2000).optional(),
+});
+
+// GET /public/widget/handoff/history?widgetKey=...&sessionId=...&visitorId=...
+// visitorId required, same ownership-factor reasoning as widgetHistoryQuerySchema.
+export const widgetHandoffHistoryQuerySchema = z.object({
+  widgetKey: widgetKeySchema,
+  sessionId: z.string().trim().min(1).max(200),
+  visitorId: z.string().trim().min(1).max(200),
+});

@@ -8,6 +8,7 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { customFieldsSearchExpr } from '../shared/custom-field-query';
 import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
 import { IFlowCondition } from '../automation-rules/automation-rule.model';
+import { hashEmail } from '../../../platform/pii/pii.service';
 
 function leadDisplayName(l: any): string {
   return [l.firstName, l.lastName].filter(Boolean).join(' ') || l.company || l.leadId;
@@ -24,7 +25,7 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', opts.owner === 'unassigned' ? 'unassigned' : undefined, undefined, 'createdBy');
 
   if (opts.status)     filter.status   = opts.status;
   if (opts.source)     filter.source   = opts.source;
@@ -35,12 +36,29 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
     filter.isConverted = opts.isConverted === 'true';
 
   if (opts.search) {
-    const re = new RegExp(opts.search, 'i');
-    filter.$or = [
+    // LR-LEAD-006: unescaped regex metacharacters (e.g. "+" in a phone
+    // number) crashed this with "Invalid regular expression: Nothing to
+    // repeat" — same escape already used by Contacts'/Deals' own search.
+    const re = new RegExp(opts.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    // LR-LEAD-005: email/phone are encrypted at rest, so a regex against
+    // those columns directly can only ever match the rare row that's still
+    // plaintext by accident — match the blind-index fields instead
+    // (phoneSearch/emailSearch, derived in lead.model.ts's own pre-save
+    // hook and pii.service.ts) so every correctly-encrypted lead is
+    // findable by the same search a user would actually type.
+    const orClauses: Record<string, unknown>[] = [
       { firstName: re }, { lastName: re },
-      { company: re }, { email: re }, { phone: re }, { leadId: re },
+      { company: re }, { leadId: re },
       customFieldsSearchExpr(opts.search),
     ];
+    const searchDigits = opts.search.replace(/\D/g, '');
+    if (searchDigits.length >= 4) {
+      orClauses.push({ phoneSearch: new RegExp('^' + searchDigits) });
+    }
+    if (opts.search.includes('@')) {
+      orClauses.push({ emailSearch: hashEmail(opts.search) });
+    }
+    filter.$or = orClauses;
   }
 
   if (opts.customFieldFilters) {
@@ -70,6 +88,10 @@ export async function listLeads(tenantId: string, opts: LeadListOptions, branchI
   const [items, total] = await Promise.all([
     Lead.find(filter)
       .sort(resolveLeadSort(opts))
+      // LR-LEAD-007: default binary string sort put every capital letter
+      // before every lowercase one ("Zed" before "adam") — a case-
+      // insensitive collation sorts the way a person actually expects.
+      .collation({ locale: 'en', strength: 2 })
       .skip((page - 1) * limit)
       .limit(limit)
       .lean(),
@@ -88,7 +110,7 @@ export async function listLeadsForExport(tenantId: string, opts: LeadListOptions
 export async function getLeadById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { $or: [{ _id: mongoose.isValidObjectId(id) ? id : null }, { leadId: id }], tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
   return Lead.findOne(filter);
 }
 
@@ -103,13 +125,16 @@ export async function updateLead(id: string, tenantId: string, data: any, scope?
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
-  const updated = await Lead.findOneAndUpdate(
-    filter,
-    { ...data, lastActivityAt: new Date() },
-    { new: true, runValidators: true }
-  );
-  if (updated) indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
+  // LR-LEAD-005: findOneAndUpdate() bypasses the pre('save') hooks that
+  // encrypt email/phone/etc and derive the blind-index search fields —
+  // load-then-save so an edited lead is encrypted exactly like a newly
+  // created one, instead of being written back as plaintext.
+  const updated = await Lead.findOne(filter);
+  if (!updated) return null;
+  updated.set({ ...data, lastActivityAt: new Date() });
+  await updated.save();
+  indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
   return updated;
 }
 
@@ -117,7 +142,7 @@ export async function updateLeadStage(id: string, tenantId: string, status: stri
   await assertValidStatus(tenantId, status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
   const updated = await Lead.findOneAndUpdate(
     filter,
     { status, lastActivityAt: new Date() },
@@ -130,7 +155,7 @@ export async function updateLeadStage(id: string, tenantId: string, status: stri
 export async function deleteLead(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
   const deleted = await Lead.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'leads', String(deleted._id));
   return deleted;
@@ -139,6 +164,6 @@ export async function deleteLead(id: string, tenantId: string, scope?: DataScope
 export async function getLeadRaw(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId');
+  applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
   return Lead.findOne(filter);
 }

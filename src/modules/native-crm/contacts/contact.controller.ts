@@ -5,6 +5,8 @@ import * as svc from './contact.service';
 import { getSettings } from '../fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../../platform/pii/pii.service';
 import { resolveEffectiveScope } from '../shared/data-scope';
+import { findDuplicateContact } from '../shared/duplicate-check';
+import { Contact } from './contact.model';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
@@ -13,10 +15,12 @@ async function getPIIViewRoles(tenantId: string, branchId?: string | null): Prom
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, owner } = req.query as Record<string, string>;
+    const { page, limit, search, status, owner, sortBy, sortDir, companyId } = req.query as Record<string, string>;
     const ownerTab = owner === 'my' || owner === 'unassigned' ? owner : undefined;
     const result = await svc.listContacts(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status, ownerTab,
+      sortBy, sortDir: sortDir as 'asc' | 'desc' | undefined,
+      ...(companyId ? { companyId } : {}),
     }, req.branchId, resolveEffectiveScope(req, 'contacts'), req.user!.userId);
     const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
     const safeItems = transformPIIResponse(result.items, 'contacts', req.user!.role, viewRoles);
@@ -35,8 +39,11 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
+    // LR-CONTACT-003: flag (never block, per LR-IMP-001) an exact
+    // email/phone match against an existing contact.
+    const duplicate = await findDuplicateContact(Contact, req.tenantId!, req.body);
     const record = await svc.createContact(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null, createdBy: req.user!.userId });
-    sendCreated(res, record, 'Contact created');
+    sendCreated(res, { ...record.toObject(), duplicateWarning: duplicate }, 'Contact created');
   } catch { sendError(res, 'Failed to create contact', 500); }
 }
 
@@ -45,7 +52,14 @@ export async function update(req: AuthRequest, res: Response) {
     const record = await svc.updateContact(req.tenantId!, req.params.id, req.body, resolveEffectiveScope(req, 'contacts'));
     if (!record) return void sendError(res, 'Contact not found', 404);
     sendSuccess(res, record, 'Contact updated');
-  } catch { sendError(res, 'Failed to update contact', 500); }
+  } catch (err: any) {
+    // LR-NEG-001: see lead.controller.ts's identical comment.
+    if (err?.name === 'VersionError') {
+      sendError(res, 'This contact was changed by someone else — please reload and try again.', 409);
+      return;
+    }
+    sendError(res, 'Failed to update contact', 500);
+  }
 }
 
 export async function remove(req: AuthRequest, res: Response) {

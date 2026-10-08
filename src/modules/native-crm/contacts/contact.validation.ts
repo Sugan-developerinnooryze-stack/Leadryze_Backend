@@ -10,6 +10,7 @@ export const createContactSchema = z.object({
   email:          z.string().trim().email(),
   phone:          z.string().trim().optional(),
   company:        z.string().trim().optional(),
+  companyId:      z.string().trim().optional(),
   jobTitle:       z.string().trim().optional(),
   contactOwner:   z.string().trim().optional(),
   lifecycleStage,

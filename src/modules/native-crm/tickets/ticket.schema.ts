@@ -20,7 +20,7 @@ export const ticketSchema = new Schema(
     // Order/Contract) so this ticket shows up in that record's Activity feed —
     // relatedId is the target's Mongo _id (not its human-facing *Id string),
     // matching the same convention already used by lead-conversion/Timeline.
-    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract'] },
+    relatedModule: { type: String, enum: ['contact', 'company', 'deal', 'customer', 'quotation', 'workorder', 'contract', 'lead'] },
     relatedId:     { type: String, trim: true },
     relatedLabel:  { type: String, trim: true },
 

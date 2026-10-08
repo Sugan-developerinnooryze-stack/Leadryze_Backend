@@ -5,7 +5,9 @@ export const createCompanySchema = z.object({
   name:          z.string().trim().min(1).max(200),
   domain:        z.string().trim().optional(),
   industry:      z.string().trim().optional(),
-  employeeCount: z.number().int().min(0).optional(),
+  // LR-COMPANY-001: the form submits this as a string, not a number —
+  // coerce rather than reject.
+  employeeCount: z.coerce.number().int().min(0).optional(),
   phone:         z.string().trim().optional(),
   website:       z.string().trim().optional(),
   city:          z.string().trim().optional(),

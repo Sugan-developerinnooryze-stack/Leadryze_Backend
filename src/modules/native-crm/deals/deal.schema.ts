@@ -27,13 +27,14 @@ export const dealSchema = new Schema(
     createdBy:     { type: String },
     leadId:        { type: String },
     contactId:     { type: String },
+    companyId:     { type: String },
     importBatchId: { type: String, index: true },
     isLocked:   { type: Boolean, default: false, index: true },
     lockedAt:   { type: Date },
     lockedBy:   { type: String },
     lockReason: { type: String },
   },
-  { timestamps: true }
+  { timestamps: true, optimisticConcurrency: true }
 );
 
 dealSchema.pre('save', async function (next) {

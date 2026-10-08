@@ -14,11 +14,21 @@ import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 import { resolveEffectiveScope } from '../shared/data-scope';
+import { getQuotationFilterCatalog } from './quotation.filter-catalog';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
     const { items, total, page } = await listQuotations(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'quotations'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
+export async function filterFields(req: AuthRequest, res: Response) {
+  try {
+    const catalog = await getQuotationFilterCatalog(req.tenantId!, req.branchId);
+    sendSuccess(res, catalog);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

@@ -9,6 +9,7 @@ export type EmailLogSourceModule =
   // Automation-rule sources (Phase 3) — the same 8 tenant-configurable
   // pipeline modules as native-crm/pipeline-config.
   | 'lead' | 'deal' | 'quotation' | 'workorder' | 'contract' | 'invoice'
+  | 'campaign'
   // Tenant-built Custom Modules (Phase 6) — arbitrary slug, so validated at
   // the application layer rather than a fixed Mongoose enum (see schema
   // below), same tradeoff as PipelineModule.

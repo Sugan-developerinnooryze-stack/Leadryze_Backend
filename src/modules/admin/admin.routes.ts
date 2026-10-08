@@ -1,5 +1,6 @@
 import { Router, Response, NextFunction } from 'express';
 import axios from 'axios';
+import { z } from 'zod';
 import { getAllTenantsLogs } from '../logs/log.service';
 import { authenticate } from '../../middlewares/auth.middleware';
 import { AuthRequest } from '../../types';
@@ -17,24 +18,16 @@ import { UserSession } from '../auth/user-session.model';
 import { AuditLog, logAuditEvent } from '../logs/audit-log.model';
 import { checkBrevoHealth, sendEmailNow, buildTenantCredentialsEmail } from '../messages/brevo.service';
 import { checkTwilioHealth } from '../messages/twilio.service';
+import { isWhatsAppConfigured } from '../messages/whatsapp.service';
 import { ChatSession } from '../bot/chat-session.model';
 import { attachAiActionTrace } from '../bot/chat-trace.util';
 import { sendCreated } from '../../utils/response';
-import { provisionTenant, getEffectiveFeatureFlags, forceAddUserSeat } from '../tenants/tenant.service';
-import { getPlatformDefaults, setPlatformDefaults } from './platform-defaults.model';
+import { provisionTenant, getEffectiveFeatureFlags, forceAddUserSeat, updateTenantAiLimits, getAiUsage, getOrInitCreditsResetDate } from '../tenants/tenant.service';
+import { getPlatformDefaults, setPlatformDefaults, getAiPlanDefaults, setAiPlanDefaults, getPlanLimits, DEFAULT_AI_PLAN_DEFAULTS } from './platform-defaults.model';
 import { generatePassword } from '../native-crm/shared/app-credentials.service';
 import { logger } from '../../utils/logger';
 import { Role } from '../rbac/role.model';
-import { encrypt, decrypt } from '../../utils/crypto';
 import { assertPasswordUniqueAtTenant, isPasswordTakenAtTenant } from '../auth/auth.service';
-
-/** Best-effort decrypt for display — a user whose password was self-changed
- * has no passwordEnc (cleared on change), and any old/corrupt value should
- * never crash a list page, just render as "not available". */
-function tryDecryptPassword(enc?: string | null): string | null {
-  if (!enc) return null;
-  try { return decrypt(enc); } catch { return null; }
-}
 
 const router = Router();
 
@@ -68,13 +61,24 @@ router.get('/stats', async (_req, res, next) => {
     ]);
     const totalClients = uniqueClientIds.size;
 
+    // Scoped to the same non-demo tenant set totalClients/uniqueClientIds
+    // already uses above — these used to be unscoped .countDocuments() calls,
+    // which silently pulled in both the leadryze-demo tenant's own data (the
+    // "ALL CLIENTS" list below deliberately hides that tenant, so its records
+    // were invisibly inflating every total) AND any records still pointing at
+    // a tenantId that no longer exists in the tenants collection at all (a
+    // hard-deleted tenant whose Customer/Campaign docs were never cleaned
+    // up). Scoping to nonDemoTenantIds excludes both categories at once, so
+    // every number here now actually equals the sum of what's enumerable in
+    // the client cards below — which is the entire point of an "at a glance"
+    // platform total.
     const [totalCustomers, activeConnectors, totalUsers, totalMessages, totalCampaigns] =
       await Promise.all([
-        Customer.countDocuments(),
-        Connector.countDocuments({ isActive: true }),
-        User.countDocuments({ role: { $ne: 'SUPER_ADMIN' } }),
-        Message.countDocuments(),
-        Campaign.countDocuments(),
+        Customer.countDocuments({ tenantId: { $in: nonDemoTenantIds } }),
+        Connector.countDocuments({ tenantId: { $in: nonDemoTenantIds }, isActive: true }),
+        User.countDocuments({ tenantId: { $in: nonDemoTenantIds }, role: { $ne: 'SUPER_ADMIN' } }),
+        Message.countDocuments({ tenantId: { $in: nonDemoTenantIds } }),
+        Campaign.countDocuments({ tenantId: { $in: nonDemoTenantIds } }),
       ]);
     sendSuccess(res, { totalClients, totalCustomers, activeConnectors, totalUsers, totalMessages, totalCampaigns }, 'Stats fetched');
   } catch (err) { next(err); }
@@ -153,19 +157,18 @@ router.get('/clients', async (_req, res, next) => {
 // GET /admin/users — all non-super-admin users
 router.get('/users', async (_req, res, next) => {
   try {
-    const users = await User.find({ role: { $ne: 'SUPER_ADMIN' } })
-      .select('+passwordEnc')
+    // LR-ADMIN-003: the Tenants list/stats deliberately hide the internal
+    // leadryze-demo tenant (see the comment above) — this endpoint never
+    // applied the same exclusion, so its users showed up here attributed
+    // to a tenant that doesn't appear anywhere in the Tenants list at all.
+    const demoTenant = await Tenant.findOne({ slug: 'leadryze-demo' }).select('_id').lean();
+    const users = await User.find({
+      role: { $ne: 'SUPER_ADMIN' },
+      ...(demoTenant ? { tenantId: { $ne: demoTenant._id } } : {}),
+    })
       .sort({ createdAt: -1 })
       .populate('tenantId', 'name slug plan isActive clientId');
-    // Only present when a Super Admin issued/regenerated this credential —
-    // never for a self-chosen password (passwordEnc is cleared on change).
-    const withPasswords = users.map((u) => {
-      const obj = u.toObject() as unknown as Record<string, unknown>;
-      const password = tryDecryptPassword(u.passwordEnc);
-      delete obj.passwordEnc;
-      return { ...obj, password };
-    });
-    sendSuccess(res, withPasswords, 'Users fetched');
+    sendSuccess(res, users, 'Users fetched');
   } catch (err) { next(err); }
 });
 
@@ -190,6 +193,9 @@ router.post('/users', async (req: AuthRequest, res, next) => {
     if (!firstName?.trim()) { sendError(res, 'First name is required', 400); return; }
     if (!lastName?.trim())  { sendError(res, 'Last name is required', 400); return; }
     if (!email?.trim())     { sendError(res, 'Email is required', 400); return; }
+    // LR-USER-001: this route never checked email format at all — any
+    // non-empty string ("not-an-email") was accepted and saved.
+    if (!z.string().email().safeParse(email.trim()).success) { sendError(res, 'A valid email address is required', 400); return; }
     const allowedRoles = ['TENANT_ADMIN', 'MANAGER', 'AGENT', 'USER'];
     if (!role || !allowedRoles.includes(role)) { sendError(res, `Role must be one of: ${allowedRoles.join(', ')}`, 400); return; }
 
@@ -217,7 +223,6 @@ router.post('/users', async (req: AuthRequest, res, next) => {
     const user = await User.create({
       email: normalizedEmail,
       password, // hashed by the model's pre-save hook — never written raw
-      passwordEnc: encrypt(password),
       firstName: firstName.trim(),
       lastName: lastName.trim(),
       role,
@@ -331,12 +336,8 @@ router.post('/users/:id/reset-password', async (req: AuthRequest, res, next) => 
 
     user.password = password;
     await user.save(); // triggers bcrypt pre-save hook
-    // Either branch here is a Super-Admin-issued credential (typed or
-    // generated), so both keep passwordEnc in sync — matches every other
-    // admin-issued-password call site.
     await User.findByIdAndUpdate(req.params.id, {
       $unset: { refreshToken: 1 },
-      passwordEnc: encrypt(password),
       ...(sendEmail ? { mustChangePassword: true } : {}),
     });
 
@@ -376,8 +377,11 @@ router.get('/tenants/:id', async (req: AuthRequest, res, next) => {
     if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
 
     const tid = tenant._id;
-    const [usersRaw, recentCustomers, recentMessages, connectors, campaigns] = await Promise.all([
-      User.find({ tenantId: tid }).select('firstName lastName email role emailVerified createdAt passwordEnc loginId'),
+    const [usersRaw, customerCount, recentCustomers, recentMessages, connectors, campaigns] = await Promise.all([
+      User.find({ tenantId: tid }).select('firstName lastName email role emailVerified createdAt mustChangePassword loginId'),
+      // LR-ADMIN-001: the Tenants list computes this the same way — the
+      // detail page never did, so it always showed blank.
+      Customer.countDocuments({ tenantId: tid }),
       Customer.find({ tenantId: tid }).sort({ createdAt: -1 }).limit(5).select('name email phone channel createdAt'),
       Message.find({ tenantId: tid }).sort({ createdAt: -1 }).limit(10)
         .select('content channel direction aiGenerated status createdAt')
@@ -386,16 +390,8 @@ router.get('/tenants/:id', async (req: AuthRequest, res, next) => {
       Campaign.find({ tenantId: tid }).sort({ createdAt: -1 }).limit(5).select('name type status stats createdAt'),
     ]);
 
-    // Only present when a Super Admin issued/regenerated this credential —
-    // never for a self-chosen password (passwordEnc is cleared on change).
-    const users = usersRaw.map((u) => {
-      const obj = u.toObject() as unknown as Record<string, unknown>;
-      const password = tryDecryptPassword(u.passwordEnc);
-      delete obj.passwordEnc;
-      return { ...obj, password };
-    });
-
-    sendSuccess(res, { tenant, users, recentCustomers, recentMessages, connectors, campaigns }, 'Tenant detail fetched');
+    const tenantWithCounts = { ...tenant.toObject(), customerCount, userCount: usersRaw.length };
+    sendSuccess(res, { tenant: tenantWithCounts, users: usersRaw, recentCustomers, recentMessages, connectors, campaigns }, 'Tenant detail fetched');
   } catch (err) { next(err); }
 });
 
@@ -407,6 +403,11 @@ router.post('/tenants', async (req: AuthRequest, res, next) => {
     if (!name?.trim()) { sendError(res, 'Business name is required', 400); return; }
     if (!adminFirstName?.trim() || !adminLastName?.trim()) { sendError(res, 'Tenant admin first and last name are required', 400); return; }
     if (!adminEmail?.trim()) { sendError(res, 'Tenant admin email is required', 400); return; }
+    if (!z.string().email().safeParse(adminEmail.trim()).success) { sendError(res, 'A valid tenant admin email is required', 400); return; }
+    // LR-ADMIN-004: Business Contact Email had no format check at all.
+    if (contactEmail?.trim() && !z.string().email().safeParse(contactEmail.trim()).success) {
+      sendError(res, 'A valid business contact email is required', 400); return;
+    }
 
     const existing = await User.findOne({ email: adminEmail.toLowerCase().trim() });
     if (existing) { sendError(res, 'A user with this email already exists', 409); return; }
@@ -455,7 +456,7 @@ router.post('/tenants/:id/approve', async (req: AuthRequest, res, next) => {
     }
     adminUser.password = temporaryPassword; // hashed by the model's pre-save hook
     await adminUser.save();
-    await User.findByIdAndUpdate(adminUser._id, { mustChangePassword: true, passwordEnc: encrypt(temporaryPassword) });
+    await User.findByIdAndUpdate(adminUser._id, { mustChangePassword: true });
 
     tenant.approvalStatus = 'approved';
     await tenant.save();
@@ -526,7 +527,11 @@ router.patch('/clients/:id/toggle', async (req: AuthRequest, res, next) => {
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
       { tenantId: tenant._id.toString(), target: 'Tenant', targetId: tenant._id.toString(), detail: { tenantName: tenant.name, previousIsActive, newIsActive: tenant.isActive, ...(reason ? { reason } : {}) } },
     );
-    sendSuccess(res, { isActive: tenant.isActive }, `Client ${tenant.isActive ? 'activated' : 'deactivated'}`);
+    // LR-UX-001: user-facing message said "Client" while the rest of this
+    // UI (and the person using it) calls this a "Tenant" — the internal
+    // audit event name above is untouched, only the message shown to the
+    // Super Admin.
+    sendSuccess(res, { isActive: tenant.isActive }, `Tenant ${tenant.isActive ? 'activated' : 'deactivated'}`);
   } catch (err) { next(err); }
 });
 
@@ -661,9 +666,15 @@ router.get('/system/health', async (_req, res, next) => {
         model: '',
       },
       {
-        name: 'Meta WhatsApp', key: 'META_WA_ACCESS_TOKEN', set: !!config.meta.waAccessToken,
+        // isWhatsAppConfigured() (not a raw !!config.meta.waAccessToken check)
+        // — this repo's own .env ships literal placeholder values
+        // ('your-whatsapp-access-token' etc.), which a plain truthy check
+        // would misreport as "Configured" even though sendWhatsAppNow()
+        // treats them as absent and skips sending. See whatsapp.service.ts's
+        // own PLACEHOLDER_VALUES comment for the full reasoning.
+        name: 'Meta WhatsApp', key: 'META_WA_ACCESS_TOKEN', set: isWhatsAppConfigured(),
         usage: 'WhatsApp messaging', provider: 'meta',
-        activeRole: !!config.meta.waAccessToken ? 'primary' : 'inactive',
+        activeRole: isWhatsAppConfigured() ? 'primary' : 'inactive',
         freeLimit: '1,000 free conversations/month', paidNote: 'Pricing per conversation after free tier',
         rateLimit: '250 messages/sec', purpose: 'Sends and receives WhatsApp messages from leads and customers',
         model: '',
@@ -693,14 +704,23 @@ router.get('/system/health', async (_req, res, next) => {
         model: '',
       },
       {
-        name: 'JWT Secret', key: 'JWT_SECRET', set: !!config.jwt.secret,
+        // config.jwt.secret always has a truthy fallback value even when
+        // JWT_SECRET was never set (see config/index.ts) — checking the raw
+        // env var directly instead is the only way this badge can ever show
+        // "not configured" for a real misconfiguration. (A separate startup
+        // guard already blocks production boot on the insecure fallback;
+        // this fixes the Health page's own badge to agree with that, rather
+        // than always reporting "Configured".)
+        name: 'JWT Secret', key: 'JWT_SECRET', set: !!process.env.JWT_SECRET,
         usage: 'Auth token signing', provider: 'internal',
         activeRole: 'primary', freeLimit: null, paidNote: 'Internal — no external service',
         rateLimit: 'N/A', purpose: 'Signs and verifies user authentication tokens',
         model: '',
       },
       {
-        name: 'Encryption Key', key: 'ENCRYPTION_KEY', set: !!config.encryption.key,
+        // Same fallback-masking issue as JWT Secret above — config.encryption.key
+        // is never falsy, so the real env var must be checked directly.
+        name: 'Encryption Key', key: 'ENCRYPTION_KEY', set: !!process.env.ENCRYPTION_KEY,
         usage: 'Connector credential encryption', provider: 'internal',
         activeRole: 'primary', freeLimit: null, paidNote: 'Internal — no external service',
         rateLimit: 'N/A', purpose: 'Encrypts stored CRM connector OAuth credentials in MongoDB',
@@ -763,8 +783,8 @@ router.get('/system/key-stats', async (_req, res, next) => {
       usage[p].today += row.calls;
     }
 
-    // ── Service usage counters (Brevo, Twilio) from ServiceUsage collection ──
-    const serviceProviders = ['brevo', 'twilio'];
+    // ── Service usage counters (Brevo, Twilio, Meta WhatsApp) from ServiceUsage collection ──
+    const serviceProviders = ['brevo', 'twilio', 'meta'];
     const serviceRows = await ServiceUsage.aggregate([
       { $match: { provider: { $in: serviceProviders }, date: { $gte: day30Str } } },
       { $group: { _id: { provider: '$provider', period: { $cond: [{ $eq: ['$date', todayStr] }, 'today', { $cond: [{ $gte: ['$date', day7Str] }, 'week', 'month'] }] } }, sent: { $sum: '$sent' }, failed: { $sum: '$failed' } } },
@@ -776,6 +796,7 @@ router.get('/system/key-stats', async (_req, res, next) => {
       if (!usage[p]) usage[p] = { today: 0, week: 0, month: 0, model: '', escalations: 0, label: 'emails' };
       if (p === 'brevo')  usage[p].label = 'emails';
       if (p === 'twilio') usage[p].label = 'messages';
+      if (p === 'meta')   usage[p].label = 'messages';
       usage[p][period]      += (row.sent   as number) || 0;
       usage[p].escalations  += period === 'today' ? ((row.failed as number) || 0) : 0; // reuse escalations for failed count
       // week & month should also include today
@@ -798,63 +819,68 @@ router.get('/ai-usage', async (_req, res, next) => {
   try {
     const { AiTokenUsage } = await import('./ai-token-usage.model');
 
-    const now = new Date();
-    const monthStart = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`;
+    const tenants = await Tenant.find({ isActive: true })
+      .select('name plan aiConfig.monthlyTokenLimit aiConfig.monthlyVoiceMinutesLimit aiConfig.creditsLastResetAt').lean();
 
-    const [tenants, usageRows] = await Promise.all([
-      Tenant.find({ isActive: true }).select('name plan aiConfig.monthlyTokenLimit aiConfig.monthlyVoiceMinutesLimit').lean(),
-      AiTokenUsage.aggregate([
-        { $match: { date: { $gte: monthStart } } },
-        {
-          $group: {
-            _id: '$tenantId',
-            totalTokens: { $sum: '$totalTokens' },
-            estimatedCostUsd: { $sum: '$estimatedCostUsd' },
-            requestCount: { $sum: '$requestCount' },
-            moderationFallbackCount: { $sum: '$moderationFallbackCount' },
-            sttSeconds: { $sum: '$sttSeconds' },
-            ttsCharacters: { $sum: '$ttsCharacters' },
-            voiceCostUsd: { $sum: '$voiceCostUsd' },
-            voiceRequestCount: { $sum: '$voiceRequestCount' },
-            continuousVoiceMinutes: { $sum: '$continuousVoiceMinutes' },
-            continuousVoiceSessionCount: { $sum: '$continuousVoiceSessionCount' },
-            deepgramSttSeconds: { $sum: '$deepgramSttSeconds' },
-            cartesiaTtsCharacters: { $sum: '$cartesiaTtsCharacters' },
-            continuousVoiceCostUsd: { $sum: '$continuousVoiceCostUsd' },
-          },
-        },
-      ]),
-    ]);
+    // Prepaid-credit model: each tenant's own usage window starts at ITS
+    // OWN creditsLastResetAt, not a single shared calendar-month start — so
+    // this can no longer be one $match date >= X for every tenant at once.
+    // Self-heals any tenant missing the field (stamps "now"), then pulls
+    // every usage row from the EARLIEST reset date across all of them in one
+    // query, and filters/sums per-tenant in memory against that tenant's own
+    // date — still one DB round-trip, just not a single server-side $group.
+    const resetDates = await Promise.all(
+      tenants.map((t: any) => getOrInitCreditsResetDate(String(t._id), t.aiConfig?.creditsLastResetAt)),
+    );
+    const resetDateByTenant = new Map(tenants.map((t: any, i: number) => [String(t._id), resetDates[i]]));
+    const earliestReset = resetDates.reduce((min, d) => (d < min ? d : min), resetDates[0] ?? new Date());
+    const earliestResetKey = earliestReset.toISOString().slice(0, 10);
 
-    const usageByTenant = new Map(usageRows.map((r: any) => [String(r._id), r]));
+    const usageRows = await AiTokenUsage.find({ date: { $gte: earliestResetKey } }).lean();
 
-    // Mirrors ai/src/services/context.builder.ts's DEFAULT_MONTHLY_TOKEN_LIMITS —
-    // the two services don't share code, so this is kept in sync manually.
-    const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
-      starter: 300_000,
-      growth: 1_000_000,
-      professional: 1_500_000,
-      enterprise: 8_000_000,
-    };
-    // Mirrors ai/src/services/context.builder.ts's own default map for this
-    // same field — kept in sync manually, same as the token limits above.
-    const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
-      starter: 100,
-      growth: 250,
-      professional: 500,
-      enterprise: 3000,
-    };
+    const usageByTenant = new Map<string, any>();
+    for (const row of usageRows) {
+      const tid = String(row.tenantId);
+      const resetAt = resetDateByTenant.get(tid);
+      if (!resetAt || row.date < resetAt.toISOString().slice(0, 10)) continue; // before THIS tenant's own reset
+      const acc = usageByTenant.get(tid) ?? {
+        totalTokens: 0, estimatedCostUsd: 0, requestCount: 0, moderationFallbackCount: 0,
+        sttSeconds: 0, ttsCharacters: 0, voiceCostUsd: 0, voiceRequestCount: 0,
+        continuousVoiceMinutes: 0, continuousVoiceSessionCount: 0, deepgramSttSeconds: 0,
+        cartesiaTtsCharacters: 0, continuousVoiceCostUsd: 0,
+      };
+      acc.totalTokens += row.totalTokens || 0;
+      acc.estimatedCostUsd += row.estimatedCostUsd || 0;
+      acc.requestCount += row.requestCount || 0;
+      acc.moderationFallbackCount += row.moderationFallbackCount || 0;
+      acc.sttSeconds += row.sttSeconds || 0;
+      acc.ttsCharacters += row.ttsCharacters || 0;
+      acc.voiceCostUsd += row.voiceCostUsd || 0;
+      acc.voiceRequestCount += row.voiceRequestCount || 0;
+      acc.continuousVoiceMinutes += row.continuousVoiceMinutes || 0;
+      acc.continuousVoiceSessionCount += row.continuousVoiceSessionCount || 0;
+      acc.deepgramSttSeconds += row.deepgramSttSeconds || 0;
+      acc.cartesiaTtsCharacters += row.cartesiaTtsCharacters || 0;
+      acc.continuousVoiceCostUsd += row.continuousVoiceCostUsd || 0;
+      usageByTenant.set(tid, acc);
+    }
+
+    // Single shared source (Super-Admin-editable via Platform Defaults) —
+    // replaces what used to be 3 independently-hardcoded copies of the same
+    // per-plan maps (this file, tenant.service.ts, and ai/src/services/
+    // context.builder.ts). Fetched once outside the tenants loop below.
+    const aiPlanDefaults = await getAiPlanDefaults();
 
     const rows = tenants
       .map((t: any) => {
         const usageRow = usageByTenant.get(String(t._id));
-        const monthlyTokenLimit =
-          t.aiConfig?.monthlyTokenLimit ?? DEFAULT_MONTHLY_TOKEN_LIMITS[t.plan] ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter;
+        const planDefaults = aiPlanDefaults[t.plan as keyof typeof aiPlanDefaults] ?? aiPlanDefaults.starter;
+        const monthlyTokenLimit = t.aiConfig?.monthlyTokenLimit ?? planDefaults.monthlyTokenLimit;
         const tokensUsedThisMonth = usageRow?.totalTokens ?? 0;
-        const monthlyVoiceMinutesLimit =
-          t.aiConfig?.monthlyVoiceMinutesLimit ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS[t.plan] ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS.starter;
+        const monthlyVoiceMinutesLimit = t.aiConfig?.monthlyVoiceMinutesLimit ?? planDefaults.monthlyVoiceMinutesLimit;
         const continuousVoiceMinutesUsed = usageRow?.continuousVoiceMinutes ?? 0;
         return {
+          creditsLastResetAt: resetDateByTenant.get(String(t._id)),
           tenantId: String(t._id),
           tenantName: t.name,
           plan: t.plan,
@@ -1242,7 +1268,7 @@ router.get('/tenants/:id/features', async (req: AuthRequest, res, next) => {
 router.put('/tenants/:id/features', async (req: AuthRequest, res, next) => {
   try {
     const { flags, accessConfigMode, maxUsers } = req.body as {
-      flags: Record<string, boolean>; accessConfigMode?: 'default' | 'custom'; maxUsers?: number | null;
+      flags?: Record<string, boolean>; accessConfigMode?: 'default' | 'custom'; maxUsers?: number | null;
     };
     if (accessConfigMode && !['default', 'custom'].includes(accessConfigMode)) {
       sendError(res, "accessConfigMode must be 'default' or 'custom'", 400); return;
@@ -1259,7 +1285,7 @@ router.put('/tenants/:id/features', async (req: AuthRequest, res, next) => {
       req.params.id,
       {
         $set: {
-          featureFlags: flags,
+          ...(flags !== undefined ? { featureFlags: flags } : {}),
           ...(accessConfigMode ? { accessConfigMode } : {}),
           // Changing the ceiling never touches currentUserCount or any User
           // document — raising it takes effect on the very next invite,
@@ -1276,9 +1302,11 @@ router.put('/tenants/:id/features', async (req: AuthRequest, res, next) => {
     // so a reviewer doesn't have to manually compare the two.
     const previousFlagsObj = (previousFlags as unknown as { toObject?: () => Record<string, unknown> })?.toObject?.()
       ?? (previousFlags as unknown as Record<string, unknown> | undefined) ?? {};
-    const changes: { key: string; from: unknown; to: unknown }[] = Object.keys(flags)
-      .filter((key) => previousFlagsObj[key] !== flags[key])
-      .map((key) => ({ key, from: previousFlagsObj[key] ?? null, to: flags[key] }));
+    const changes: { key: string; from: unknown; to: unknown }[] = flags
+      ? Object.keys(flags)
+          .filter((key) => previousFlagsObj[key] !== flags[key])
+          .map((key) => ({ key, from: previousFlagsObj[key] ?? null, to: flags[key] }))
+      : [];
     if (accessConfigMode && accessConfigMode !== previousMode) {
       changes.push({ key: 'accessConfigMode', from: previousMode, to: accessConfigMode });
     }
@@ -1291,36 +1319,109 @@ router.put('/tenants/:id/features', async (req: AuthRequest, res, next) => {
       { tenantId: req.params.id, target: 'Tenant', targetId: req.params.id, detail: { tenantName: tenant.name, previousFlags, flags, changes, result: 'success' } },
     );
     const activeUsers = await User.countDocuments({ tenantId: tenant._id, role: { $ne: 'SUPER_ADMIN' }, isActive: true });
-    sendSuccess(res, { flags: tenant.featureFlags, accessConfigMode: tenant.accessConfigMode === 'custom' ? 'custom' : 'default', tenantName: tenant.name, maxUsers: tenant.settings?.maxUsers ?? null, activeUsers }, 'Feature flags updated');
+    // LR-ADMIN-002: lowering the seat limit below current usage is allowed
+    // (see the comment above — it only blocks new invites, never touches
+    // anyone already active), but doing it silently gave no warning that
+    // new invites would start failing right away.
+    const newMaxUsers = tenant.settings?.maxUsers ?? null;
+    const seatWarning = newMaxUsers !== null && newMaxUsers < activeUsers
+      ? `This tenant has ${activeUsers} active users, above the new limit of ${newMaxUsers}. No one will be removed, but new invites will be blocked until usage drops below the limit.`
+      : null;
+    sendSuccess(res, { flags: tenant.featureFlags, accessConfigMode: tenant.accessConfigMode === 'custom' ? 'custom' : 'default', tenantName: tenant.name, maxUsers: newMaxUsers, activeUsers, seatWarning }, 'Feature flags updated');
   } catch (err) { next(err); }
 });
 
 // GET /admin/platform-defaults — the global template new tenants inherit
 router.get('/platform-defaults', async (_req, res, next) => {
   try {
-    const flags = await getPlatformDefaults();
-    sendSuccess(res, { flags });
+    const [flags, aiPlanDefaults] = await Promise.all([getPlatformDefaults(), getAiPlanDefaults()]);
+    sendSuccess(res, { flags, aiPlanDefaults });
   } catch (err) { next(err); }
 });
 
 // PUT /admin/platform-defaults — edit the global template. Only affects
 // tenants on accessConfigMode:'default' (immediately) and future tenants
 // created from this point on — existing 'custom' tenants are untouched.
+// aiPlanDefaults is optional so existing {flags}-only callers keep working.
 router.put('/platform-defaults', async (req: AuthRequest, res, next) => {
   try {
-    const { flags } = req.body as { flags: Record<string, boolean> };
+    const { flags, aiPlanDefaults } = req.body as {
+      flags: Record<string, boolean>;
+      aiPlanDefaults?: Record<string, { monthlyTokenLimit: number; monthlyVoiceMinutesLimit: number; priceUsdPerMonth: number }>;
+    };
     const previousFlags = await getPlatformDefaults();
     const updatedFlags = await setPlatformDefaults(flags);
     const previousFlagsObj = previousFlags as unknown as Record<string, unknown>;
     const changes = Object.keys(flags)
       .filter((key) => previousFlagsObj[key] !== flags[key])
       .map((key) => ({ key, from: previousFlagsObj[key] ?? null, to: flags[key] }));
+
+    let updatedAiPlanDefaults = await getAiPlanDefaults();
+    if (aiPlanDefaults) {
+      const previousPlanDefaults = updatedAiPlanDefaults;
+      updatedAiPlanDefaults = await setAiPlanDefaults(aiPlanDefaults as typeof DEFAULT_AI_PLAN_DEFAULTS);
+      logAuditEvent(
+        'platform_defaults.ai_plans_updated',
+        { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+        { target: 'PlatformDefaults', targetId: 'platform-defaults', detail: { previousPlanDefaults, aiPlanDefaults: updatedAiPlanDefaults, result: 'success' } },
+      );
+    }
+
     logAuditEvent(
       'platform_defaults.updated',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
       { target: 'PlatformDefaults', targetId: 'platform-defaults', detail: { previousFlags, flags: updatedFlags, changes, result: 'success' } },
     );
-    sendSuccess(res, { flags: updatedFlags }, 'Platform defaults updated');
+    sendSuccess(res, { flags: updatedFlags, aiPlanDefaults: updatedAiPlanDefaults }, 'Platform defaults updated');
+  } catch (err) { next(err); }
+});
+
+// PUT /admin/tenants/:id/ai-config — Super-Admin-only control over a single
+// tenant's AI usage budget (monthly token/voice-minute limit + admin-facing
+// warning/critical thresholds). Mirrors PUT /admin/tenants/:id/features'
+// shape (partial payload, audit-logged diff) — this is the ONLY write path
+// for these 4 fields now; tenant.service.ts's updateTenant() (the
+// TENANT_ADMIN-reachable PUT /tenants/:id) deliberately excludes them so a
+// tenant can no longer raise its own AI budget. Sending `null` for a field
+// clears the override back to the plan default.
+router.put('/tenants/:id/ai-config', async (req: AuthRequest, res, next) => {
+  try {
+    const { monthlyTokenLimit, monthlyVoiceMinutesLimit, tokenWarningThresholdPercent, tokenCriticalThresholdPercent, resetUsageCounter } = req.body as {
+      monthlyTokenLimit?: number | null;
+      monthlyVoiceMinutesLimit?: number | null;
+      tokenWarningThresholdPercent?: number | null;
+      tokenCriticalThresholdPercent?: number | null;
+      resetUsageCounter?: boolean;
+    };
+    for (const [key, val] of Object.entries({ monthlyTokenLimit, monthlyVoiceMinutesLimit, tokenWarningThresholdPercent, tokenCriticalThresholdPercent })) {
+      if (val !== undefined && val !== null && (typeof val !== 'number' || val < 0)) {
+        sendError(res, `${key} must be a non-negative number, or null to clear it`, 400); return;
+      }
+    }
+    if (
+      typeof tokenWarningThresholdPercent === 'number' && typeof tokenCriticalThresholdPercent === 'number' &&
+      tokenWarningThresholdPercent >= tokenCriticalThresholdPercent
+    ) {
+      sendError(res, 'Warning threshold must be lower than critical threshold', 400); return;
+    }
+
+    const before = await Tenant.findById(req.params.id).select('name aiConfig');
+    if (!before) { sendError(res, 'Tenant not found', 404); return; }
+    const previousAiConfig = before.aiConfig;
+
+    const tenant = await updateTenantAiLimits(req.params.id, {
+      monthlyTokenLimit, monthlyVoiceMinutesLimit, tokenWarningThresholdPercent, tokenCriticalThresholdPercent, resetUsageCounter,
+    });
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+
+    logAuditEvent(
+      resetUsageCounter ? 'tenant_ai_usage.reset' : 'tenant_ai_config.updated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      { tenantId: req.params.id, target: 'Tenant', targetId: req.params.id, detail: { tenantName: tenant.name, previousAiConfig, aiConfig: tenant.aiConfig, result: 'success' } },
+    );
+
+    const usage = await getAiUsage(req.params.id);
+    sendSuccess(res, usage, 'AI usage limits updated');
   } catch (err) { next(err); }
 });
 

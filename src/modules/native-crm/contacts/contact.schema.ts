@@ -11,8 +11,21 @@ export const contactSchema = new Schema(
     lastName:  { type: String, required: true, trim: true },
     email:     { type: String, required: true, trim: true, lowercase: true },
     phone:     { type: String, trim: true },
+    // LR-LEAD-005/CONTACT-004: blind-index fields so a Contact can be found
+    // by email/phone even while those columns are encrypted — same purpose
+    // as Lead's own phoneSearch/emailDomain (pii.service.ts).
+    phoneSearch: { type: String, index: true },
+    emailDomain: { type: String },
+    emailSearch: { type: String, index: true },
     company:   { type: String, trim: true },
+    // LR-CONTACT-001: real ID link to a native-crm Company, alongside the
+    // existing free-text `company` (kept for display/back-compat, same
+    // pattern as Deal's companyName + companyId).
+    companyId: { type: String },
     jobTitle:  { type: String, trim: true },
+    // LR-CONTACT-001/LR-RULE-003: now a platform User._id (CRM/sales user),
+    // not free text — the field itself was always a plain String, so this
+    // is a data-contract change going forward, not a schema change.
     contactOwner:   { type: String, trim: true },
     lifecycleStage: {
       type: String,
@@ -34,7 +47,7 @@ export const contactSchema = new Schema(
     lockedBy:   { type: String },
     lockReason: { type: String },
   },
-  { timestamps: true }
+  { timestamps: true, optimisticConcurrency: true }
 );
 
 contactSchema.pre('save', function (next) {

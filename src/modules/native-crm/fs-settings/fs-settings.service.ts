@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { FSSettings } from './fs-settings.model';
 import { Tenant } from '../../tenants/tenant.model';
+import { Branch } from '../branches/branch.model';
 
 export async function getSettings(tenantId: string, branchId?: string | null) {
   const tid = new mongoose.Types.ObjectId(tenantId);
@@ -31,6 +32,41 @@ export async function upsertSettings(tenantId: string, data: any, branchId?: str
     { $set: safeData },
     { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
   );
+}
+
+/** One entry per active Company (Branch) plus a `branchId: null` entry for
+ * "Default Company" — just the two fields a transactional form's "Company"
+ * dropdown needs to auto-fill Discount %/GST % the instant it's selected
+ * (see FSDrawer.tsx's autofillFrom mechanism). A company with no FSSettings
+ * doc of its own yet inherits the org-wide (branchId: null) values, same
+ * "inherit until explicitly overridden" rule getSettings() already applies
+ * for the full settings object. Fetched once, up front, alongside the other
+ * lookup lists (customers/sites/teams/etc.) — no per-selection request. */
+export async function getAllSettingsDefaults(tenantId: string): Promise<Array<{
+  branchId: string | null; taxPercentage: number; discountPercentage: number;
+}>> {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const [orgDefault, branchDocs, branches] = await Promise.all([
+    FSSettings.findOne({ tenantId: tid, branchId: null }).select('taxPercentage discountPercentage').lean(),
+    FSSettings.find({ tenantId: tid, branchId: { $ne: null } }).select('branchId taxPercentage discountPercentage').lean(),
+    Branch.find({ tenantId: tid, status: 'active' }).select('_id').lean(),
+  ]);
+  const orgTax      = orgDefault?.taxPercentage ?? 0;
+  const orgDiscount = orgDefault?.discountPercentage ?? 0;
+  const byBranch = new Map(branchDocs.map((d) => [d.branchId!.toString(), d]));
+
+  const results: Array<{ branchId: string | null; taxPercentage: number; discountPercentage: number }> = [
+    { branchId: null, taxPercentage: orgTax, discountPercentage: orgDiscount },
+  ];
+  for (const b of branches) {
+    const doc = byBranch.get(b._id.toString());
+    results.push({
+      branchId: b._id.toString(),
+      taxPercentage: doc?.taxPercentage ?? orgTax,
+      discountPercentage: doc?.discountPercentage ?? orgDiscount,
+    });
+  }
+  return results;
 }
 
 export async function nextClientId(tenantId: string): Promise<string> {

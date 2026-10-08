@@ -5,12 +5,15 @@ import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeContract }  from '../contracts/contract.model';
 import { NativeStaff }     from '../staffs/staff.model';
+import { NativeTeam }      from '../teams/team.model';
 import { getSettings }     from '../fs-settings/fs-settings.service';
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
+import { applyDynamicFilters } from '../shared/dynamic-filter';
+import { getWorkorderFilterCatalog } from './workorder.filter-catalog';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -26,13 +29,26 @@ async function getDefaultDuration(tenantId: string, branchId?: string | null): P
   return Number.isFinite(def) && def > 0 ? def : null;
 }
 
-export async function listWorkorders(tenantId: string, opts: WorkorderListOptions, branchId?: string | null, scope?: DataScope) {
+const WORKORDER_DATE_FIELDS = new Set(['scheduledDate', 'completedDate', 'createdAt']);
+
+export async function listWorkorders(tenantId: string, opts: WorkorderListOptions, branchId?: string | null, scope?: DataScope, ownStaffId?: string | null) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
   const page  = Number(opts.page  ?? 1);
   const limit = Number(opts.limit ?? 20);
   const filter: any = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToFilter(filter, scope, 'staffIds');
+  if (opts.ownerTab === 'assigned') {
+    // Generic "has at least one staff member" — not expressible via the
+    // shared data-scope helper's my/unassigned-only ownerTab, so apply
+    // ordinary row-level scope and AND in the existence check separately.
+    applyDataScopeToFilter(filter, scope, 'staffIds');
+    filter.$and = [
+      ...(filter.$and ?? []),
+      { $or: [{ staffId: { $nin: [null, ''] } }, { staffIds: { $exists: true, $not: { $size: 0 } } }] },
+    ];
+  } else {
+    applyDataScopeToFilter(filter, scope, 'staffIds', opts.ownerTab, ownStaffId);
+  }
 
   if (opts.status) filter.status = opts.status;
   if (opts.search) filter.$or = [
@@ -41,6 +57,10 @@ export async function listWorkorders(tenantId: string, opts: WorkorderListOption
   ];
   if (opts.customerId) filter.customerId = opts.customerId;
   if (opts.contractId) filter.contractId = opts.contractId;
+  if (opts.teamId) {
+    const team = await NativeTeam.findOne({ _id: opts.teamId, tenantId: tid }).select('teamId').lean();
+    filter.teamId = team?.teamId ?? '__no_match__';
+  }
   if (opts.staffId) {
     const staffOr = [{ staffId: opts.staffId }, { staffIds: opts.staffId }];
     if (filter.$or) {
@@ -49,6 +69,12 @@ export async function listWorkorders(tenantId: string, opts: WorkorderListOption
     } else {
       filter.$or = staffOr;
     }
+  }
+  const dateField = opts.dateField && WORKORDER_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
+  applyDateRangeToFilter(filter, dateField, resolveDateRange(opts.range, opts.dateFrom, opts.dateTo));
+  if (opts.filters) {
+    const catalog = await getWorkorderFilterCatalog(tenantId, branchId);
+    applyDynamicFilters(filter, opts.filters, catalog);
   }
 
   const [items, total] = await Promise.all([

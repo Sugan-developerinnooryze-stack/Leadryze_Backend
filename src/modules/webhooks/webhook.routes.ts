@@ -21,6 +21,10 @@ router.post('/instagram', webhookRateLimit, controller.receiveInstagram);
 
 // Twilio (SMS / Phone)
 router.post('/twilio', webhookRateLimit, controller.receiveTwilio);
+router.post('/twilio/status', webhookRateLimit, controller.receiveTwilioStatus);
+
+// Brevo — campaign email delivery-status callbacks
+router.post('/brevo', webhookRateLimit, controller.receiveBrevo);
 
 // HubSpot CRM — bidirectional sync (HubSpot → LeadRyze)
 router.post('/hubspot', webhookRateLimit, controller.receiveHubSpot);

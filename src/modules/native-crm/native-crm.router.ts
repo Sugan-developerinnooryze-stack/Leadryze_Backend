@@ -17,6 +17,7 @@ import ticketRoutes   from './tickets/ticket.routes';
 import ticketSlaPolicyRoutes from './tickets/ticket-sla-policy.routes';
 import callRoutes     from './calls/call.routes';
 import meetingRoutes  from './meetings/meeting.routes';
+import conversationRoutes from './conversations/conversation.routes';
 import datasetRoutes  from './datasets/dataset.routes';
 
 /* ── Field-service modules (Phase 1) ─────────────────────────────────────── */
@@ -103,6 +104,7 @@ router.use('/tickets/sla-policy', requireModuleEnabled('native_tickets'), ticket
 router.use('/tickets',   requireModuleEnabled('native_tickets'),  ticketRoutes);
 router.use('/calls',     requireModuleEnabled('native_calls'),    callRoutes);
 router.use('/meetings',  requireModuleEnabled('native_meetings'), meetingRoutes);
+router.use('/conversations', requireModuleEnabled('native_conversations'), conversationRoutes);
 router.use('/datasets',  datasetRoutes);
 
 /* ── Field-service sub-routers ────────────────────────────────────────────── */

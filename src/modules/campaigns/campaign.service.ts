@@ -36,11 +36,23 @@ export async function getCampaignById(tenantId: string, id: string): Promise<ICa
   return Campaign.findOne({ _id: id, tenantId });
 }
 
+export class CampaignEditLockedError extends Error {}
+
+// A campaign that has left 'draft' can no longer be edited via this generic
+// update — duplicate it instead. This has zero effect on any campaign that
+// exists today, since nothing has ever moved a campaign out of 'draft' until
+// the send lifecycle shipped; it only starts applying to campaigns activated
+// after this point.
 export async function updateCampaign(
   tenantId: string,
   id: string,
   data: Partial<ICampaign>
 ): Promise<ICampaign | null> {
+  const existing = await Campaign.findOne({ _id: id, tenantId }).select('status');
+  if (!existing) return null;
+  if (existing.status !== 'draft') {
+    throw new CampaignEditLockedError('Campaign cannot be edited after activation — duplicate it instead.');
+  }
   return Campaign.findOneAndUpdate({ _id: id, tenantId }, { $set: data }, { new: true });
 }
 

@@ -1,5 +1,10 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
+/** The 4 subscription tiers — shared with platform-defaults.model.ts's
+ * per-plan AI token/voice-minute/price config, so both stay in sync on the
+ * same literal union instead of each redeclaring it. */
+export type PlanTier = 'starter' | 'growth' | 'professional' | 'enterprise';
+
 /**
  * @swagger
  * components:
@@ -41,6 +46,11 @@ export interface IFeatureFlags {
   native_tickets:   boolean;
   native_calls:     boolean;
   native_meetings:  boolean;
+  // "Connect with an expert" real-time human handoff — admin panel module
+  // visibility (Super-Admin-level platform control). Independent of
+  // widget.humanHandoff.enabled, the tenant-level visitor-facing button
+  // toggle in Widget Settings (see tenant.model.ts's own widget block).
+  native_conversations: boolean;
   // Field Service sub-items
   fs_leads:      boolean;
   fs_categories: boolean;
@@ -112,6 +122,7 @@ export const DEFAULT_FEATURE_FLAGS: IFeatureFlags = {
   native_tickets:   true,
   native_calls:     true,
   native_meetings:  true,
+  native_conversations: true,
   fs_leads:      true,
   fs_categories: true,
   fs_services:   true,
@@ -159,7 +170,7 @@ export interface ITenant extends Document {
   slug: string;
   clientId?: string;
   domain?: string;
-  plan: 'starter' | 'growth' | 'professional' | 'enterprise';
+  plan: PlanTier;
   isActive: boolean;
   // Undefined is treated as 'approved' everywhere this is read (matches
   // every pre-existing tenant and every legacy .lean() read) — only the
@@ -234,6 +245,17 @@ export interface ITenant extends Document {
      * 100%/exceeded, unchanged. Defaults to 80/95 if unset. */
     tokenWarningThresholdPercent?: number;
     tokenCriticalThresholdPercent?: number;
+    /** Prepaid-credit model, not a subscription allowance: tokens/voice-
+     * minutes used are summed from THIS date forward, not from the start of
+     * the current calendar month — a tenant who only uses half their budget
+     * in a month does not get it silently wiped and refilled for free. Only
+     * ever moves forward, and only via a Super Admin explicitly granting
+     * more credits (PUT /admin/tenants/:id/ai-config's resetUsageCounter —
+     * see updateTenantAiLimits()), never automatically. Unset for any tenant
+     * that predates this field — getAiUsage() self-heals that the first time
+     * it's read (stamps "now", one time only), so no separate migration is
+     * needed and no tenant's historical usage is retroactively counted. */
+    creditsLastResetAt?: Date;
     /** Which already-integrated LLM provider/model powers RAG/catalog/
      * booking tool-calling for the public widget specifically — undefined
      * means "use the global primary/fallback pair" (today's unchanged
@@ -295,6 +317,34 @@ export interface ITenant extends Document {
      * client-side (leadryze-widget) rendering choice, resolved from
      * GET /public/widget/config like every other widget-facing field. */
     template?: 'modern' | 'minimal' | 'chips' | 'dark';
+    /** Full color/font/size customization — independent of `template` (which
+     * is structure-only: gradient vs flat header, avatar visibility, bubble
+     * corner shapes). Every field is optional; getWidgetTheme() in
+     * public-widget.service.ts resolves each unset one from `template`'s own
+     * default palette, so every tenant always gets a complete, coherent
+     * theme without needing to set all 9 fields — a tenant can tweak just
+     * the ones they care about ("clients need colors we don't control in
+     * advance" — every field here exists specifically so Super Admin never
+     * has to touch code to match a new client's brand). */
+    theme?: {
+      accentColor?: string;
+      headerColor?: string;
+      headerTextColor?: string;
+      backgroundColor?: string;
+      botBubbleColor?: string;
+      botTextColor?: string;
+      userBubbleColor?: string;
+      userTextColor?: string;
+      fontFamily?: string;
+      size?: 'compact' | 'standard' | 'large';
+      /** Tiled (WhatsApp-wallpaper style) background image for the chat
+       * body — server-upload-only (dedicated endpoint -> S3 -> URL saved
+       * here), same write-protection precedent as widget.logoUrl, NEVER
+       * accepted from the generic tenant-update payload. Layered OVER
+       * backgroundColor (which keeps resolving as the fallback whenever
+       * this is unset), not a replacement for it. */
+      backgroundImageUrl?: string;
+    };
     /** Round-robin assignment scope for a Lead captured via this widget —
      * null/absent means rotate across every active staff member tenant-wide. */
     defaultTeamId?: mongoose.Types.ObjectId | null;
@@ -386,6 +436,18 @@ export interface ITenant extends Document {
         language: string;
       };
     };
+    /** "Connect with an expert" real-time human handoff — OFF by default for
+     * every tenant, old and new (see the Human Handoff feature's own ground
+     * rule #1: nothing about today's widget behavior changes until a tenant
+     * explicitly turns this on here). Independent of the `native_conversations`
+     * platform feature flag (which controls whether the admin Conversations
+     * inbox module exists at all) — this is the visitor-facing button toggle. */
+    humanHandoff?: {
+      enabled: boolean;
+      buttonText: string;
+      waitingMessage: string;
+      offlineMessage?: string;
+    };
   };
   /** Per-module "is row-level Supervisor/Agent data scoping enforced, or is
    * everyone shown full tenant-wide access" toggle — read via
@@ -424,6 +486,7 @@ export const featureFlagsSchemaFields = {
       native_tickets:        { type: Boolean, default: true },
       native_calls:          { type: Boolean, default: true },
       native_meetings:       { type: Boolean, default: true },
+      native_conversations:  { type: Boolean, default: true },
       fs_leads:              { type: Boolean, default: true },
       fs_categories:         { type: Boolean, default: true },
       fs_services:           { type: Boolean, default: true },
@@ -518,6 +581,7 @@ const tenantSchema = new Schema<ITenant>(
       // as a percent (not a fraction) to match the settings-UI input directly.
       tokenWarningThresholdPercent:  { type: Number, default: 80 },
       tokenCriticalThresholdPercent: { type: Number, default: 95 },
+      creditsLastResetAt: { type: Date },
       toolModelPreset: { type: String, enum: ['groq', 'anthropic', 'openai', 'google'] },
       autoConvertLeadOnMeetingCompleted: { type: Boolean, default: false },
     },
@@ -534,6 +598,19 @@ const tenantSchema = new Schema<ITenant>(
       autoSendLeadEmails:    { type: Boolean, default: true },
       logoUrl:        String,
       template:       { type: String, enum: ['modern', 'minimal', 'chips', 'dark'], default: 'modern' },
+      theme: {
+        accentColor:     String,
+        headerColor:     String,
+        headerTextColor: String,
+        backgroundColor: String,
+        botBubbleColor:  String,
+        botTextColor:    String,
+        userBubbleColor: String,
+        userTextColor:   String,
+        fontFamily:      String,
+        size:            { type: String, enum: ['compact', 'standard', 'large'] },
+        backgroundImageUrl: String,
+      },
       defaultTeamId:  { type: Schema.Types.ObjectId, ref: 'NativeTeam', default: null },
       websiteUrl:     String,
       lastCrawledAt:  Date,
@@ -592,6 +669,12 @@ const tenantSchema = new Schema<ITenant>(
           gender:      { type: String, enum: ['male', 'female'] },
           language:    String,
         },
+      },
+      humanHandoff: {
+        enabled:        { type: Boolean, default: false },
+        buttonText:     { type: String, default: 'Connect with an expert' },
+        waitingMessage: { type: String, default: "We're connecting you with a team member — someone will be with you shortly." },
+        offlineMessage: String,
       },
     },
     dataScopeConfig: { type: Schema.Types.Mixed, default: {} },

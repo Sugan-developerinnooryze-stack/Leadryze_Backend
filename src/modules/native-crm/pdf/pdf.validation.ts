@@ -6,3 +6,8 @@ export const shareEmailSchema = z.object({
   subject: z.string().trim().min(1),
   message: z.string().optional(),
 });
+
+export const shareWhatsAppSchema = z.object({
+  to:      z.string().trim().min(6),
+  message: z.string().optional(),
+});

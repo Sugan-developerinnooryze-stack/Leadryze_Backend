@@ -22,6 +22,11 @@ export interface IFSSettingsDoc extends Document {
   timezone?:          string;
   currency?:          string;
   taxPercentage?:     number;
+  // Company-wide default GST%/Discount% — Quotations/Work Orders/Invoices/
+  // Contracts auto-fill their own GST %/Discount % fields from these the
+  // moment this Company is selected (see FSDrawer.tsx's autofillFrom
+  // mechanism), the same way selecting a Customer auto-fills Address.
+  discountPercentage?: number;
   invoicePrefix?:     string;
   quotationPrefix?:   string;
   workOrderPrefix?:   string;
@@ -89,6 +94,7 @@ const schema = new Schema<IFSSettingsDoc>(
     timezone:           { type: String, trim: true, default: 'UTC' },
     currency:           { type: String, trim: true, default: 'AUD' },
     taxPercentage:      { type: Number, default: 0, min: 0, max: 100 },
+    discountPercentage: { type: Number, default: 0, min: 0, max: 100 },
     invoicePrefix:      { type: String, trim: true, default: 'INV' },
     quotationPrefix:    { type: String, trim: true, default: 'QUO' },
     workOrderPrefix:    { type: String, trim: true, default: 'WO' },

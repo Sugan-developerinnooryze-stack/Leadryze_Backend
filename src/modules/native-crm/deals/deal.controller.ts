@@ -11,11 +11,13 @@ import { logAuditEvent } from '../../logs/audit-log.model';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { page, limit, search, status, stage, sortBy, sortDir, customFieldFilters } = req.query as Record<string, string>;
+    const { page, limit, search, status, stage, sortBy, sortDir, customFieldFilters, contactId, companyId } = req.query as Record<string, string>;
     const result = await svc.listDeals(req.tenantId!, {
       page: parseInt(page || '1'), limit: Math.min(parseInt(limit || '20'), 100), search, status: status ?? stage,
       sortBy, sortDir: sortDir as 'asc' | 'desc' | undefined, customFieldFilters,
-    }, req.branchId, resolveEffectiveScope(req, 'deals'));
+      ...(contactId ? { contactId } : {}),
+      ...(companyId ? { companyId } : {}),
+    } as any, req.branchId, resolveEffectiveScope(req, 'deals'));
     sendSuccess(res, result.items, 'Success', 200, { total: result.total, page: result.page, totalPages: result.pages });
   } catch { sendError(res, 'Failed to fetch deals', 500); }
 }
@@ -30,7 +32,7 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const record = await svc.createDeal(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null });
+    const record = await svc.createDeal(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null, createdBy: req.user?.userId });
     logTimeline(req.tenantId!, 'deal', String(record._id), 'created', `Deal "${(record as any).title}" created`, req.user?.userId,
       { stage: (record as any).stage, amount: (record as any).amount }).catch(() => {});
     runAutomationsOnCreate(req.tenantId!, 'deal', record as any).catch(() => {});
@@ -53,7 +55,14 @@ export async function update(req: AuthRequest, res: Response) {
     if (req.body.stage) runAutomations(req.tenantId!, 'deal', record, req.body.stage).catch(() => {});
     if (prev) runAutomationsOnUpdate(req.tenantId!, 'deal', prev, record).catch(() => {});
     sendSuccess(res, record, 'Deal updated');
-  } catch (err: any) { sendError(res, err.message ?? 'Failed to update deal', 400); }
+  } catch (err: any) {
+    // LR-NEG-001: see lead.controller.ts's identical comment.
+    if (err?.name === 'VersionError') {
+      sendError(res, 'This deal was changed by someone else — please reload and try again.', 409);
+      return;
+    }
+    sendError(res, err.message ?? 'Failed to update deal', 400);
+  }
 }
 
 export async function remove(req: AuthRequest, res: Response) {

@@ -1,6 +1,6 @@
 export type ActivityKind = 'task' | 'ticket' | 'call' | 'meeting' | 'email';
 
-export type RelatedModule = 'contact' | 'company' | 'deal' | 'customer' | 'quotation' | 'workorder' | 'contract';
+export type RelatedModule = 'contact' | 'company' | 'deal' | 'customer' | 'quotation' | 'workorder' | 'contract' | 'lead';
 
 export interface ActivityFeedQuery {
   relatedModule: RelatedModule;

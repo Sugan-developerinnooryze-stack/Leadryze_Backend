@@ -210,8 +210,18 @@ export const RESOLVERS: Record<string, (ctx: RenderCtx) => string> = {
   // confusingly-identical "Due Date" entries in the invoice palette).
   'doc.dueDate':  (c) => esc(fmtDate(c.doc?.dueDate ?? c.doc?.validUntil)),
   'doc.status':   (c) => esc(String(c.doc?.status ?? '').toUpperCase()),
-  'doc.subtotal': (c) => esc(fmtMoney((c.doc?.servicesAmount ?? 0) + (c.doc?.discount ?? 0), c.cur)),
-  'doc.discount': (c) => esc(fmtMoney(c.doc?.discount ?? 0, c.cur)),
+  // discount is a percentage (0-100), not a flat amount — subtotal/discount
+  // amount are both derived straight from services+parts, same as totalsHtml().
+  'doc.subtotal': (c) => esc(fmtMoney(
+    (c.doc?.services ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0)
+    + (c.doc?.parts ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0),
+    c.cur,
+  )),
+  'doc.discount': (c) => {
+    const raw = (c.doc?.services ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0)
+      + (c.doc?.parts ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
+    return esc(fmtMoney(raw * ((c.doc?.discount ?? 0) / 100), c.cur));
+  },
   'doc.gst':      (c) => esc(`${c.doc?.gstPercentage ?? 0}%`),
   'doc.total':    (c) => esc(fmtMoney(c.doc?.servicesAmountWithTax ?? 0, c.cur)),
   'doc.amountPaid': (c) => esc(totalsValue('paid', c)),
@@ -354,9 +364,11 @@ export function totalsValue(key: TotalsRowKey, ctx: RenderCtx): string {
   const d = ctx.doc ?? {};
   const svc = (d.services ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
   const prt = (d.parts    ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
-  const discount = d.discount ?? 0;
+  const discountPct = d.discount ?? 0;
   const gstPct = d.gstPercentage ?? 0;
-  const afterDiscount = svc + prt - discount;
+  // discount is a percentage (0-100), not a flat amount — matches totalsHtml().
+  const discountAmt = (svc + prt) * (discountPct / 100);
+  const afterDiscount = svc + prt - discountAmt;
   // Derived fully from services/parts/discount/gst rather than trusting a
   // persisted servicesAmountWithTax field — identical result for docTypes
   // that do store one (invoice/quotation/contract keep them in sync, see
@@ -367,7 +379,7 @@ export function totalsValue(key: TotalsRowKey, ctx: RenderCtx): string {
     case 'servicesSubtotal': return fmtMoney(svc, ctx.cur);
     case 'partsSubtotal':    return fmtMoney(prt, ctx.cur);
     case 'subtotal':         return fmtMoney(svc + prt, ctx.cur);
-    case 'discount':         return discount > 0 ? `-${fmtMoney(discount, ctx.cur)}` : fmtMoney(0, ctx.cur);
+    case 'discount':         return discountAmt > 0 ? `-${fmtMoney(discountAmt, ctx.cur)}` : fmtMoney(0, ctx.cur);
     case 'gst':              return `${gstPct}% · ${fmtMoney(afterDiscount * (gstPct / 100), ctx.cur)}`;
     case 'total':            return fmtMoney(total, ctx.cur);
     case 'paid':             return fmtMoney((d.paid || d.status === (ctx.invoicePaidKey ?? 'paid')) ? total : 0, ctx.cur);

@@ -26,9 +26,10 @@ import { computeAvailableSlots, computeTeamAvailableSlots, isSlotFree } from '..
 import { createMeeting } from '../native-crm/meetings/meeting.service';
 import { claimWidgetSession, resolveWidgetSessionClaim, releaseWidgetSessionClaim } from './widget-session-claim.service';
 import {
-  trackAiTokenUsage, getTenantTokenUsageThisMonth,
-  trackContinuousVoiceUsage, getTenantVoiceMinutesUsageThisMonth,
+  trackAiTokenUsage, getTenantTokenUsageSince,
+  trackContinuousVoiceUsage, getTenantVoiceMinutesUsageSince,
 } from '../admin/ai-token-usage.model';
+import { getOrInitCreditsResetDate } from '../tenants/tenant.service';
 import {
   searchCatalogItems, getCatalogItemBySku, upsertCatalogItemFromSource,
   startKnowledgeSourceSync, finishKnowledgeSourceSync,
@@ -161,6 +162,19 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
       return;
     }
 
+    // Resolved here (Super-Admin-editable Platform Defaults plan table +
+    // this tenant's own optional override) so the AI service never needs
+    // its own copy of the per-plan default map — see context.builder.ts's
+    // resolveTenantConfig(), which just reads these two fields straight off
+    // aiConfig now instead of re-deriving them.
+    const { getPlanLimits } = await import('../admin/platform-defaults.model');
+    const planLimits = await getPlanLimits(tenant.plan);
+    const resolvedAiConfig = {
+      ...tenant.aiConfig,
+      monthlyTokenLimit: tenant.aiConfig?.monthlyTokenLimit ?? planLimits.monthlyTokenLimit,
+      monthlyVoiceMinutesLimit: tenant.aiConfig?.monthlyVoiceMinutesLimit ?? planLimits.monthlyVoiceMinutesLimit,
+    };
+
     // Build CRM module map — ONLY from active connector channels
     // Orphaned records from disconnected connectors are excluded here
     const activeChannelSet = new Set(connectors.map((c) => c.type as string));
@@ -202,7 +216,7 @@ router.get('/tenant-context/:tenantId', async (req: Request, res: Response, next
         plan: tenant.plan,
         settings: tenant.settings,
         branding: tenant.branding,
-        aiConfig: tenant.aiConfig,
+        aiConfig: resolvedAiConfig,
         featureFlags: tenant.featureFlags,
       },
       // Only the fields the continuous-voice worker actually needs (the
@@ -1752,9 +1766,12 @@ router.post('/ai-token-usage', async (req: Request, res: Response, next: NextFun
 
 /**
  * GET /api/internal/ai-token-usage/:tenantId
- * Returns the tenant's month-to-date total token usage — the source of
- * truth checkTenantTokenQuota() in the AI service briefly caches in Redis
- * (see rate-limiter.ts) rather than calling this on every single message.
+ * Returns the tenant's total token usage since its own aiConfig
+ * .creditsLastResetAt — a prepaid credit balance, not a calendar-month
+ * allowance (see getOrInitCreditsResetDate/getAiUsage in tenant.service.ts).
+ * The source of truth checkTenantTokenQuota() in the AI service briefly
+ * caches in Redis (see rate-limiter.ts) rather than calling this on every
+ * single message.
  */
 router.get('/ai-token-usage/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -1763,7 +1780,9 @@ router.get('/ai-token-usage/:tenantId', async (req: Request, res: Response, next
       sendError(res, 'Invalid tenantId', 400);
       return;
     }
-    const totalTokens = await getTenantTokenUsageThisMonth(tenantId);
+    const tenant = await Tenant.findById(tenantId).select('aiConfig.creditsLastResetAt').lean();
+    const resetAt = await getOrInitCreditsResetDate(tenantId, tenant?.aiConfig?.creditsLastResetAt);
+    const totalTokens = await getTenantTokenUsageSince(tenantId, resetAt.toISOString().slice(0, 10));
     sendSuccess(res, { totalTokens });
   } catch (err) { next(err); }
 });
@@ -1797,8 +1816,10 @@ router.post('/continuous-voice-usage', async (req: Request, res: Response, next:
 
 /**
  * GET /api/internal/continuous-voice-usage/:tenantId
- * Month-to-date continuous-voice minutes — the source of truth
- * checkTenantVoiceMinutesQuota() in the AI service briefly caches in Redis.
+ * Continuous-voice minutes since this tenant's own creditsLastResetAt —
+ * same prepaid-credit model as ai-token-usage/:tenantId above, shared reset
+ * date for both meters. The source of truth checkTenantVoiceMinutesQuota()
+ * in the AI service briefly caches in Redis.
  */
 router.get('/continuous-voice-usage/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -1807,7 +1828,9 @@ router.get('/continuous-voice-usage/:tenantId', async (req: Request, res: Respon
       sendError(res, 'Invalid tenantId', 400);
       return;
     }
-    const minutes = await getTenantVoiceMinutesUsageThisMonth(tenantId);
+    const tenant = await Tenant.findById(tenantId).select('aiConfig.creditsLastResetAt').lean();
+    const resetAt = await getOrInitCreditsResetDate(tenantId, tenant?.aiConfig?.creditsLastResetAt);
+    const minutes = await getTenantVoiceMinutesUsageSince(tenantId, resetAt.toISOString().slice(0, 10));
     sendSuccess(res, { minutes });
   } catch (err) { next(err); }
 });

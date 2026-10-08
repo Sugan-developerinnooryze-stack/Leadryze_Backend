@@ -1,6 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
-import { encryptPIIFields } from '../../../platform/pii/pii.service';
+import { encryptPIIFields, hashEmail } from '../../../platform/pii/pii.service';
 
 // A tenant-configurable stage key (native-crm/pipeline-config) — no longer a
 // fixed union, since each tenant defines their own pipeline. Default seed
@@ -143,6 +143,7 @@ export interface ILeadDoc extends Document {
   lockReason?:  string;
   phoneSearch?: string;
   emailDomain?: string;
+  emailSearch?: string;
 
   // Meta
   tags:           string[];
@@ -260,9 +261,13 @@ const schema = new Schema<ILeadDoc>(
     lockReason:  { type: String },
     phoneSearch: { type: String, index: true },
     emailDomain: { type: String, index: true },
+    // LR-LEAD-005: one-way hash of the real email (see pii.service.ts's
+    // hashEmail) — an exact-match blind index so "search by email" still
+    // works once email itself is encrypted at rest.
+    emailSearch: { type: String, index: true },
     importBatchId: { type: String, index: true },
   },
-  { timestamps: true }
+  { timestamps: true, optimisticConcurrency: true }
 );
 
 // Must run BEFORE the PII-encryption hook below — email/phone are plaintext
@@ -272,6 +277,8 @@ schema.pre('save', function (next) {
   if (this.isModified('email')) {
     const at = (this.email ?? '').indexOf('@');
     this.emailDomain = at > 0 ? this.email!.slice(at + 1).toLowerCase().trim() : undefined;
+    // LR-LEAD-005: exact-match blind index — see pii.service.ts's hashEmail.
+    this.emailSearch = this.email ? hashEmail(this.email) : undefined;
   }
   if (this.isModified('phone')) {
     const digits = (this.phone ?? '').replace(/\D/g, '');

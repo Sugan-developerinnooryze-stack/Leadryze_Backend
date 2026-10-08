@@ -17,11 +17,21 @@ import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAuto
 import { resolveEffectiveScope } from '../shared/data-scope';
 import { logTimeline } from '../timeline/timeline.service';
 import { logAuditEvent } from '../../logs/audit-log.model';
+import { getContractFilterCatalog } from './contract.filter-catalog';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
     const { items, total, page } = await listContracts(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'contracts'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
+export async function filterFields(req: AuthRequest, res: Response) {
+  try {
+    const catalog = await getContractFilterCatalog(req.tenantId!, req.branchId);
+    sendSuccess(res, catalog);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

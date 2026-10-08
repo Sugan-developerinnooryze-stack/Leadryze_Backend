@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { NativeReceipt } from './receipt.model';
+import { NativeInvoice } from '../invoices/invoice.model';
 import { ReceiptListOptions } from './receipt.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
@@ -35,7 +36,23 @@ export async function getReceiptById(id: string, tenantId: string, scope?: DataS
 }
 
 export async function createReceipt(data: any) {
+  // LR-RCPT-002: a receipt must be recorded against an invoice belonging to
+  // the same customer it's being created for — not just any invoice id.
+  const invoice = await NativeInvoice.findOne({ invoiceId: data.invoiceId, tenantId: data.tenantId });
+  if (!invoice) throw new Error(`Invoice "${data.invoiceId}" not found`);
+  if (invoice.customerId !== data.customerId) {
+    throw new Error(`Invoice "${data.invoiceId}" belongs to a different customer`);
+  }
+
   const created = await NativeReceipt.create(data);
+
+  // LR-RCPT-001: recording a receipt never updated the invoice at all —
+  // apply this payment towards it, and mark it paid once fully covered.
+  const paidAmount = (invoice.paidAmount ?? 0) + (Number(data.amount) || 0);
+  invoice.paidAmount = paidAmount;
+  if (paidAmount >= invoice.servicesAmountWithTax) invoice.paid = true;
+  await invoice.save();
+
   indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'receipts', created.toObject(), (created as any).receiptId);
   return created;
 }

@@ -100,13 +100,16 @@ export async function trackAiTokenUsage(
   } catch { /* never crash the app */ }
 }
 
-/** Sum of totalTokens for a tenant so far this calendar month — the source
- * of truth checkTenantTokenQuota() in the AI service caches briefly in Redis. */
-export async function getTenantTokenUsageThisMonth(tenantId: string): Promise<number> {
-  const now = new Date();
-  const monthStart = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`;
+/** Sum of totalTokens for a tenant since `sinceDate` ('YYYY-MM-DD') — a
+ * prepaid credit balance, not a calendar-month allowance: `sinceDate` is
+ * the tenant's own aiConfig.creditsLastResetAt (see getOrInitCreditsResetDate
+ * in tenant.service.ts), which only moves forward when a Super Admin
+ * explicitly grants more credits, never automatically on the 1st of the
+ * month. The source of truth checkTenantTokenQuota() in the AI service
+ * caches briefly in Redis. */
+export async function getTenantTokenUsageSince(tenantId: string, sinceDate: string): Promise<number> {
   const result = await AiTokenUsage.aggregate([
-    { $match: { tenantId: new mongoose.Types.ObjectId(tenantId), date: { $gte: monthStart } } },
+    { $match: { tenantId: new mongoose.Types.ObjectId(tenantId), date: { $gte: sinceDate } } },
     { $group: { _id: null, totalTokens: { $sum: '$totalTokens' } } },
   ]);
   return result[0]?.totalTokens ?? 0;
@@ -139,14 +142,12 @@ export async function trackContinuousVoiceUsage(
   } catch { /* never crash the worker */ }
 }
 
-/** Sum of continuousVoiceMinutes for a tenant so far this calendar month —
- * the source of truth checkTenantVoiceMinutesQuota() in the AI service
- * caches briefly in Redis, same pattern as getTenantTokenUsageThisMonth(). */
-export async function getTenantVoiceMinutesUsageThisMonth(tenantId: string): Promise<number> {
-  const now = new Date();
-  const monthStart = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`;
+/** Sum of continuousVoiceMinutes for a tenant since `sinceDate` — same
+ * prepaid-credit reasoning and source of `sinceDate` as
+ * getTenantTokenUsageSince() above, shared reset date for both meters. */
+export async function getTenantVoiceMinutesUsageSince(tenantId: string, sinceDate: string): Promise<number> {
   const result = await AiTokenUsage.aggregate([
-    { $match: { tenantId: new mongoose.Types.ObjectId(tenantId), date: { $gte: monthStart } } },
+    { $match: { tenantId: new mongoose.Types.ObjectId(tenantId), date: { $gte: sinceDate } } },
     { $group: { _id: null, minutes: { $sum: '$continuousVoiceMinutes' } } },
   ]);
   return result[0]?.minutes ?? 0;

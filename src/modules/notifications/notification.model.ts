@@ -7,6 +7,11 @@ export interface INotification extends Document {
   title: string;
   body: string;
   isRead: boolean;
+  /** Per-reader read state for a tenant-wide doc (userId absent) — a single
+   * `isRead` boolean would be shared by every staffer who can see it. Unused
+   * (always []) on a userId-targeted doc, which has exactly one reader and
+   * uses `isRead` instead. */
+  readBy: string[];
   data?: Record<string, unknown>;
 }
 
@@ -22,6 +27,7 @@ const notificationSchema = new Schema<INotification>(
     title: { type: String, required: true },
     body: { type: String, required: true },
     isRead: { type: Boolean, default: false },
+    readBy: { type: [String], default: [] },
     data: { type: Schema.Types.Mixed, default: {} },
   },
   { timestamps: true }

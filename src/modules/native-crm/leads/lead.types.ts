@@ -8,6 +8,11 @@ export interface LeadListOptions {
   priority?:   string;
   leadOwner?:  string;
   isConverted?: string;
+  /** 'unassigned' — leads with no leadOwnerStaffId set (see LR-DASH-001:
+   * the dashboard's unassigned-leads widget calls this but the backend
+   * never actually read it, so it silently returned the tenant's total
+   * lead count instead). */
+  owner?: 'unassigned';
   /** Built-in field name, or `customFields.<key>` for a tenant custom field
    * — both sort identically via Mongo's native dot-path sort. */
   sortBy?:     string;

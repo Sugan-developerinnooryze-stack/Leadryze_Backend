@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { Deal } from './deal.model';
 import { CreateDealDTO, UpdateDealDTO } from './deal.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
-import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
@@ -23,8 +23,14 @@ export async function listDeals(tenantId: string, opts: ListOptions = {}, branch
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   if (status) filter.stage = status;
+  // LR-CONTACT-001: a Contact's Deals tab used to match by fuzzy
+  // contactName text (two different "John Smith"s would show on each
+  // other's page) — contactId is a real, unambiguous reference.
+  if ((opts as { contactId?: string }).contactId) filter.contactId = (opts as { contactId?: string }).contactId;
+  // LR-OPP-001 (Company half): same reasoning as contactId above.
+  if ((opts as { companyId?: string }).companyId) filter.companyId = (opts as { companyId?: string }).companyId;
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     filter.$or = [{ title: re }, { contactName: re }, { companyName: re }, customFieldsSearchExpr(search)];
@@ -47,7 +53,7 @@ export async function listDeals(tenantId: string, opts: ListOptions = {}, branch
 export async function getDealById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   return Deal.findOne(filter).lean();
 }
 
@@ -63,16 +69,23 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   await assertValidStage(tenantId, dto.stage);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
-  const updated = await Deal.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
-  if (updated) indexNativeSearchRecord(tenantId, 'native', 'deals', updated, updated.title);
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
+  // LR-NEG-001: load-then-save instead of findOneAndUpdate() gets Mongoose's
+  // built-in __v optimistic-concurrency check for free — two concurrent
+  // edits no longer silently overwrite each other.
+  const doc = await Deal.findOne(filter);
+  if (!doc) return null;
+  doc.set(dto);
+  await doc.save();
+  const updated = doc.toObject();
+  indexNativeSearchRecord(tenantId, 'native', 'deals', updated, updated.title);
   return updated;
 }
 
 export async function deleteDeal(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   const deleted = await Deal.findOneAndDelete(filter).lean();
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'deals', String(deleted._id));
   return deleted;
@@ -81,31 +94,39 @@ export async function deleteDeal(tenantId: string, id: string, scope?: DataScope
 export async function getDealStats(tenantId: string, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   // Headline KPI totals (Deals count + Revenue) — all-time, before the
   // range filter below narrows `filter` in place (same reasoning as
   // Customers'/Leads' allTimeTotal).
   const allTimeFilter = { ...filter };
   applyDateRangeToFilter(filter, 'createdAt', resolveDateRange(range, customFrom, customTo));
 
+  // LR-DASH-002: Revenue means closed-WON value only, not every deal
+  // regardless of stage — mirrors the tenant's actual Won stage, same
+  // helper deal.controller.ts already uses for stage-change side effects.
+  const wonKey = await getOutcomeStageKey(tenantId, 'deal', 'won', 'closed_won');
+  const revenueFilter = { ...filter, stage: wonKey };
+  const allTimeRevenueFilter = { ...allTimeFilter, stage: wonKey };
+
   const priorRange = resolvePriorDateRange(range, customFrom, customTo);
   const priorFilter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToFilter(priorFilter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(priorFilter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   if (priorRange) applyDateRangeToFilter(priorFilter, 'createdAt', priorRange);
+  const priorRevenueFilter = { ...priorFilter, stage: wonKey };
 
   // KPI sparkline — fixed 14-day window, independent of `range` (also
   // backs the dashboard's Revenue tile, which reuses Deals' own data).
   const sparklineFilter: Record<string, unknown> = { tenantId: tid, createdAt: { $gte: sparklineWindowStart() } };
-  applyDataScopeToFilter(sparklineFilter, scope, 'assignedStaffId');
+  applyDataScopeToFilter(sparklineFilter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
 
   const [total, allTimeTotal, byStage, totalValue, allTimeTotalValue, priorTotal, priorTotalValue, dailyRaw] = await Promise.all([
     Deal.countDocuments(filter),
     Deal.countDocuments(allTimeFilter),
     Deal.aggregate([{ $match: filter }, { $group: { _id: '$stage', count: { $sum: 1 } } }]),
-    Deal.aggregate([{ $match: filter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-    Deal.aggregate([{ $match: allTimeFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Deal.aggregate([{ $match: revenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Deal.aggregate([{ $match: allTimeRevenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     priorRange ? Deal.countDocuments(priorFilter) : Promise.resolve(null),
-    priorRange ? Deal.aggregate([{ $match: priorFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]) : Promise.resolve(null),
+    priorRange ? Deal.aggregate([{ $match: priorRevenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]) : Promise.resolve(null),
     Deal.aggregate([
       { $match: sparklineFilter },
       { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },

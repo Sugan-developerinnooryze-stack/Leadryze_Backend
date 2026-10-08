@@ -1,9 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { generatePdf, shareDocumentEmail, previewHtml, previewDraftHtml, downloadDraftPdf, getLiveData } from './pdf.controller';
+import { generatePdf, shareDocumentEmail, shareDocumentWhatsApp, previewHtml, previewDraftHtml, downloadDraftPdf, getLiveData } from './pdf.controller';
 import { validate } from '../../../middleware/validate.middleware';
 import { requireModulePermission } from '../../../middlewares/auth.middleware';
-import { shareEmailSchema } from './pdf.validation';
+import { shareEmailSchema, shareWhatsAppSchema } from './pdf.validation';
 import { designElementSchema, templateRegionSchema } from '../custom-templates/custom-template.validation';
 
 const previewDraftSchema = z.object({
@@ -27,5 +27,6 @@ router.get('/:module/:id/preview-html',  requireModulePermission('module', 'view
 router.post('/:module/:id/preview-html', requireModulePermission('module', 'view'), validate({ body: previewDraftSchema }), previewDraftHtml);
 router.post('/:module/:id/download-draft', requireModulePermission('module', 'view'), validate({ body: previewDraftSchema }), downloadDraftPdf);
 router.post('/:module/:id/share-email',  requireModulePermission('module', 'edit'), validate({ body: shareEmailSchema }),  shareDocumentEmail);
+router.post('/:module/:id/share-whatsapp', requireModulePermission('module', 'edit'), validate({ body: shareWhatsAppSchema }), shareDocumentWhatsApp);
 
 export default router;

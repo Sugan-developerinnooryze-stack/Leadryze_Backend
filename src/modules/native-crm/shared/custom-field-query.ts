@@ -9,6 +9,11 @@
  * document). Meant to be OR'd alongside a module's existing built-in-field
  * search clauses, not used standalone. */
 export function customFieldsSearchExpr(search: string): Record<string, any> {
+  // LR-LEAD-006: $regexMatch takes a real regex, same as a plain RegExp
+  // would — an unescaped metacharacter (e.g. a "+" in a phone number)
+  // crashes the whole aggregation. Escape here, once, so every caller is
+  // protected rather than relying on each one to remember to pre-escape.
+  const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return {
     $expr: {
       $gt: [
@@ -18,7 +23,7 @@ export function customFieldsSearchExpr(search: string): Record<string, any> {
               input: { $objectToArray: { $ifNull: ['$customFields', {}] } },
               as: 'cf',
               cond: {
-                $regexMatch: { input: { $toString: '$$cf.v' }, regex: search, options: 'i' },
+                $regexMatch: { input: { $toString: '$$cf.v' }, regex: escaped, options: 'i' },
               },
             },
           },

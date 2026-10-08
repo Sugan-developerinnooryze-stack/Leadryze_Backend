@@ -13,11 +13,21 @@ import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
 import { resolveEffectiveScope } from '../shared/data-scope';
+import { getInvoiceFilterCatalog } from './invoice.filter-catalog';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
     const { items, total, page } = await listInvoices(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'invoices'));
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
+export async function filterFields(req: AuthRequest, res: Response) {
+  try {
+    const catalog = await getInvoiceFilterCatalog(req.tenantId!, req.branchId);
+    sendSuccess(res, catalog);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

@@ -11,6 +11,7 @@ import { initQueues } from './modules/scheduler/scheduler.service';
 import { ensureMeiliIndex } from './services/meilisearch.service';
 import { logger } from './utils/logger';
 import { logSecurityEvent } from './modules/logs/security-event.model';
+import { hasPermission } from './modules/rbac/permission.service';
 
 async function ensureSuperAdmin(): Promise<void> {
   try {
@@ -102,22 +103,53 @@ async function bootstrap(): Promise<void> {
 
   const io = new SocketServer(httpServer, {
     cors: {
-      origin: config.app.frontendUrl,
+      // Reflects whatever Origin sent the handshake, rather than the single
+      // fixed config.app.frontendUrl this was before — the admin dashboard
+      // is still the only connector of STAFF-shaped tokens, but the Human
+      // Handoff widget socket (leadryze-widget/src/loader.ts) connects from
+      // an arbitrary tenant website, exactly like the existing public-widget
+      // REST routes already allow (see public-widget.controller.ts's own
+      // per-tenant isOriginAllowed() check). CORS is not the real security
+      // boundary here either way — io.use()'s JWT verification is: a staff
+      // token and the narrowly-scoped widget token (scope:'widget', no
+      // userId/role) are checked there regardless of what Origin connected.
+      origin: (_origin, callback) => callback(null, true),
       methods: ['GET', 'POST'],
       credentials: true,
     },
   });
 
-  // Require a valid JWT before allowing any socket connection
+  // Require a valid JWT before allowing any socket connection. Two shapes
+  // are accepted: a normal staff/admin login token (tenantId/userId/role/
+  // roleId — same token the REST API uses), or a narrowly-scoped
+  // Human-Handoff widget token (scope:'widget', tenantId, sessionId — no
+  // userId/role at all) minted server-side when a visitor requests a
+  // handoff (see public-widget.controller.ts's postHandoffRequest). Both
+  // are verified with the same secret (no second secret to manage), but a
+  // widget token structurally cannot satisfy anything gated on
+  // socket.data.role/roleId below — it never reuses or extends staff-level
+  // access, it's a separate, deliberately minimal capability.
   io.use((socket, next) => {
     const token = (socket.handshake.auth?.token || socket.handshake.query?.token) as string | undefined;
     if (!token) {
       return next(new Error('Authentication required'));
     }
     try {
-      const payload = jwt.verify(token, config.jwt.secret) as { tenantId: string; userId: string };
-      socket.data.tenantId = payload.tenantId;
-      socket.data.userId   = payload.userId;
+      const payload = jwt.verify(token, config.jwt.secret) as {
+        scope?: string; tenantId: string; userId?: string; role?: string; roleId?: string; sessionId?: string;
+      };
+      if (payload.scope === 'widget') {
+        socket.data.isWidgetVisitor = true;
+        socket.data.tenantId        = payload.tenantId;
+        socket.data.widgetSessionId = payload.sessionId;
+        // Deliberately NOT setting userId/role/roleId — this connection
+        // must never be able to pass a staff-gated check below.
+      } else {
+        socket.data.tenantId = payload.tenantId;
+        socket.data.userId   = payload.userId;
+        socket.data.role     = payload.role;
+        socket.data.roleId   = payload.roleId;
+      }
       next();
     } catch {
       logSecurityEvent('websocket.auth_failed', {
@@ -130,9 +162,15 @@ async function bootstrap(): Promise<void> {
   });
 
   io.on('connection', (socket) => {
-    logger.info('WebSocket client connected', { socketId: socket.id, tenantId: socket.data.tenantId });
+    logger.info('WebSocket client connected', { socketId: socket.id, tenantId: socket.data.tenantId, isWidgetVisitor: !!socket.data.isWidgetVisitor });
 
     socket.on('join-tenant', (tenantId: string) => {
+      // Widget-scoped connections can never join a tenant-wide room —
+      // only their own single conversation (see join-own-session below).
+      if (socket.data.isWidgetVisitor) {
+        socket.emit('error', { message: 'Access denied' });
+        return;
+      }
       // Only allow joining own tenant room
       if (tenantId !== socket.data.tenantId) {
         socket.emit('error', { message: 'Access denied: cannot join another tenant room' });
@@ -146,6 +184,34 @@ async function bootstrap(): Promise<void> {
       if (typeof sessionId === 'string' && sessionId.length > 0) {
         socket.join(`session:${sessionId}`);
       }
+    });
+
+    // Human Handoff — staff-only shared inbox room, gated by the exact same
+    // permission check requirePermission('native_crm.conversations.view')
+    // already enforces on the REST routes (same hasPermission() call), so
+    // the socket-level gate and the REST-level gate can never drift apart.
+    // Deliberately a NARROWER room than the existing bare tenant:{id} one
+    // above — that room has no per-permission check at all, and handoff
+    // payloads carry visitor name/email/message previews that must not
+    // reach a staff connection without conversations.view.
+    socket.on('join-conversations', async (tenantId: string) => {
+      if (socket.data.isWidgetVisitor) { socket.emit('error', { message: 'Access denied' }); return; }
+      if (tenantId !== socket.data.tenantId) { socket.emit('error', { message: 'Access denied: cannot join another tenant room' }); return; }
+      const { role, roleId } = socket.data as { role?: string; roleId?: string };
+      const allowed = role === 'SUPER_ADMIN' || role === 'TENANT_ADMIN'
+        || (!!roleId && await hasPermission(tenantId, roleId, 'native_crm.conversations.view'));
+      if (!allowed) { socket.emit('error', { message: 'Access denied' }); return; }
+      socket.join(`tenant:${tenantId}:conversations`);
+    });
+
+    // Human Handoff — the ONLY room a widget-scoped visitor connection may
+    // ever join, and only the single session its own token was minted for
+    // (read off the verified token payload, never a client-supplied
+    // sessionId) — structurally impossible to join any other visitor's
+    // conversation, let alone a tenant-wide room.
+    socket.on('join-own-session', () => {
+      if (!socket.data.isWidgetVisitor || !socket.data.widgetSessionId) { socket.emit('error', { message: 'Access denied' }); return; }
+      socket.join(`session:${socket.data.widgetSessionId}`);
     });
 
     socket.on('disconnect', () => {

@@ -18,6 +18,7 @@ import { cleanupOrphanedImageUploads } from '../native-crm/datasets/dataset-imag
 import { recoverStuckImports } from '../native-crm/datasets/dataset.service';
 import { retryFailedChatbotLeadEmails } from '../native-crm/lead-capture/chatbot-lead-email.service';
 import { getFeatureFlagsForTenants, isFeatureFlagEnabled } from '../tenants/tenant.service';
+import { runCampaignSchedulePromotion, runCampaignDispatchTicks } from '../campaigns/campaign-scheduler.service';
 
 // ─── BullMQ (Redis-dependent) — graceful stub when Redis unavailable ──────────
 let _bullmqAvailable = false;
@@ -359,23 +360,18 @@ function initCronJobs(): void {
     await runDailyFollowupCheck();
   });
 
-  // Hourly campaign trigger check
-  cron.schedule('0 * * * *', async () => {
-    logger.info('Cron triggered: campaign schedule check');
-    // Campaign logic runs here when BullMQ is available
-    if (_bullmqAvailable) {
-      const { Campaign } = require('../campaigns/campaign.model');
-      const now = new Date();
-      const campaigns = await Campaign.find({ status: 'scheduled', 'schedule.startAt': { $lte: now } });
-      for (const campaign of campaigns) {
-        await Campaign.findByIdAndUpdate(campaign._id, { status: 'active' });
-        await emailQueue.add('campaign-send', {
-          campaignId: campaign._id.toString(),
-          tenantId: campaign.tenantId.toString(),
-        });
-        logger.info('Campaign triggered', { campaignId: campaign._id });
-      }
-    }
+  // Campaign send lifecycle — cron-only, no BullMQ dependency (see the
+  // Campaign Send Lifecycle plan's Context section for why). Replaces the
+  // old "Hourly campaign trigger check" dead stub, which only ever enqueued
+  // a 'campaign-send' BullMQ job that no Worker ever consumed — removed only
+  // after these two jobs were live-verified end to end (promotion from
+  // 'scheduled' to 'running', dispatch, completion, pause/resume/cancel all
+  // confirmed working against the real backend + DB with Redis unavailable).
+  cron.schedule('*/1 * * * *', async () => {
+    await runCampaignSchedulePromotion().catch((err) => logger.error('runCampaignSchedulePromotion crashed', { error: (err as Error).message }));
+  });
+  cron.schedule('*/1 * * * *', async () => {
+    await runCampaignDispatchTicks().catch((err) => logger.error('runCampaignDispatchTicks crashed', { error: (err as Error).message }));
   });
 
   // Meeting reminders — every 2 minutes
@@ -470,7 +466,7 @@ function initCronJobs(): void {
       .catch((err) => logger.warn('AI service keep-alive ping failed', { error: (err as Error).message }));
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign check (hourly), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min), AI service keep-alive (10min)');
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign schedule promotion (1min), campaign dispatch ticks (1min), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min), AI service keep-alive (10min)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────

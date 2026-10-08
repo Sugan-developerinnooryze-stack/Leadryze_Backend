@@ -36,6 +36,10 @@ export const config = {
     apiKey: process.env.BREVO_API_KEY || '',
     senderEmail: process.env.BREVO_SENDER_EMAIL || 'noreply@leadryze.ai',
     senderName: process.env.BREVO_SENDER_NAME || 'LeadRyze AI',
+    // Brevo doesn't HMAC-sign its webhooks by default — verified via this
+    // shared-secret header instead, configured when the webhook is set up
+    // in Brevo's dashboard.
+    webhookSecret: process.env.BREVO_WEBHOOK_SECRET || '',
   },
   meta: {
     waPhoneNumberId: process.env.META_WA_PHONE_NUMBER_ID || '',

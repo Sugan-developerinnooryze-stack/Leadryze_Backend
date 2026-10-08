@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError } from '../../../utils/response';
-import { getSettings, upsertSettings } from './fs-settings.service';
+import { getSettings, upsertSettings, getAllSettingsDefaults } from './fs-settings.service';
 import { DocTemplatePreference, ITemplateSections, DEFAULT_TEMPLATE_SECTIONS } from './doc-template-preference.model';
 import { uploadToS3 } from '../../../services/s3.service';
 
@@ -17,6 +17,15 @@ export async function get(req: AuthRequest, res: Response) {
   try {
     const settings = await getSettings(req.tenantId!, req.branchId ?? null);
     sendSuccess(res, settings ?? {});
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
+export async function getDefaults(req: AuthRequest, res: Response) {
+  try {
+    const defaults = await getAllSettingsDefaults(req.tenantId!);
+    sendSuccess(res, defaults);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

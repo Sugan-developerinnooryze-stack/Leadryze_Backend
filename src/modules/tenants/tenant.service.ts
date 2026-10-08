@@ -3,7 +3,7 @@ import { Tenant, ITenant, IFeatureFlags, DEFAULT_FEATURE_FLAGS } from './tenant.
 import { parsePagination, buildSkip } from '../../utils/pagination';
 import { uploadToS3, deleteFromS3, keyFromUrl } from '../../services/s3.service';
 import { DEFAULT_DATA_SCOPE_CONFIG } from '../native-crm/shared/data-scope';
-import { getTenantTokenUsageThisMonth, getTenantVoiceMinutesUsageThisMonth } from '../admin/ai-token-usage.model';
+import { getTenantTokenUsageSince, getTenantVoiceMinutesUsageSince } from '../admin/ai-token-usage.model';
 import { config } from '../../config';
 import { User } from '../auth/auth.model';
 import { Role } from '../rbac/role.model';
@@ -11,19 +11,6 @@ import { ensureSystemPermissions } from '../rbac/rbac.seed';
 import { generatePassword } from '../native-crm/shared/app-credentials.service';
 import { sendEmailNow, buildTenantCredentialsEmail } from '../messages/brevo.service';
 import { logger } from '../../utils/logger';
-import { encrypt } from '../../utils/crypto';
-
-// Mirrors admin.routes.ts's GET /admin/ai-usage and ai/src/services/
-// context.builder.ts's own default map for this same field — all three
-// kept in sync manually (no shared-constants module exists yet in this
-// codebase for cross-service config; matching the established pattern
-// rather than introducing one here).
-const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
-  starter: 300_000, growth: 1_000_000, professional: 1_500_000, enterprise: 8_000_000,
-};
-const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
-  starter: 100, growth: 250, professional: 500, enterprise: 3000,
-};
 
 /** Shared, nullish-safe feature-flag read — matches the `!== false` (default
  * true) convention already used throughout the frontend (Sidebar.tsx,
@@ -70,6 +57,26 @@ export async function getFeatureFlagsForTenants(tenantIds: string[]): Promise<Ma
 
 export type AiUsageStatus = 'normal' | 'warning' | 'critical' | 'exceeded';
 
+/** Prepaid-credit model: usage is summed from this tenant's own
+ * creditsLastResetAt forward, never from the calendar month's own 1st — a
+ * tenant that doesn't spend its whole budget in a month doesn't get it
+ * wiped and refilled for free, and a tenant that burns through it in 20
+ * days has genuinely hit their limit until a Super Admin grants more (see
+ * updateTenantAiLimits's resetUsageCounter). Self-heals a tenant that
+ * predates this field by stamping "now" the first time it's read — a
+ * one-time, idempotent-in-effect write (every later read sees the same
+ * persisted date), not a live migration script. */
+export async function getOrInitCreditsResetDate(tenantId: string, current: Date | undefined): Promise<Date> {
+  if (current) return current;
+  const now = new Date();
+  await Tenant.updateOne({ _id: tenantId }, { $set: { 'aiConfig.creditsLastResetAt': now } });
+  return now;
+}
+
+function toDateKey(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
 /** Self-service version of admin.routes.ts's GET /admin/ai-usage, scoped to
  * ONE tenant (a Tenant Admin's own) instead of the SUPER_ADMIN-only
  * cross-tenant table — this is what the new AI Usage & Limits settings page
@@ -81,16 +88,21 @@ export async function getAiUsage(tenantId: string) {
   const tenant = await Tenant.findById(tenantId).select('plan aiConfig').lean();
   if (!tenant) return null;
 
-  const planDefaultTokenLimit = DEFAULT_MONTHLY_TOKEN_LIMITS[tenant.plan] ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter;
-  const planDefaultVoiceMinutesLimit = DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS[tenant.plan] ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS.starter;
+  const { getPlanLimits } = await import('../admin/platform-defaults.model');
+  const planDefaults = await getPlanLimits(tenant.plan);
+  const planDefaultTokenLimit = planDefaults.monthlyTokenLimit;
+  const planDefaultVoiceMinutesLimit = planDefaults.monthlyVoiceMinutesLimit;
   const monthlyTokenLimit = tenant.aiConfig?.monthlyTokenLimit ?? planDefaultTokenLimit;
   const monthlyVoiceMinutesLimit = tenant.aiConfig?.monthlyVoiceMinutesLimit ?? planDefaultVoiceMinutesLimit;
   const warningThresholdPercent = tenant.aiConfig?.tokenWarningThresholdPercent ?? 80;
   const criticalThresholdPercent = tenant.aiConfig?.tokenCriticalThresholdPercent ?? 95;
 
+  const creditsLastResetAt = await getOrInitCreditsResetDate(tenantId, tenant.aiConfig?.creditsLastResetAt);
+  const sinceDate = toDateKey(creditsLastResetAt);
+
   const [tokensUsedThisMonth, voiceMinutesUsedThisMonth] = await Promise.all([
-    getTenantTokenUsageThisMonth(tenantId),
-    getTenantVoiceMinutesUsageThisMonth(tenantId),
+    getTenantTokenUsageSince(tenantId, sinceDate),
+    getTenantVoiceMinutesUsageSince(tenantId, sinceDate),
   ]);
 
   const percentUsed = monthlyTokenLimit > 0 ? (tokensUsedThisMonth / monthlyTokenLimit) * 100 : 0;
@@ -110,8 +122,11 @@ export async function getAiUsage(tenantId: string) {
     status,
     warningThresholdPercent,
     criticalThresholdPercent,
+    planDefaultVoiceMinutesLimit,
+    customVoiceMinutesLimit: tenant.aiConfig?.monthlyVoiceMinutesLimit ?? null,
     monthlyVoiceMinutesLimit,
     voiceMinutesUsedThisMonth,
+    creditsLastResetAt,
   };
 }
 
@@ -206,10 +221,6 @@ export async function provisionTenant(input: ProvisionTenantInput): Promise<Prov
   const user = await User.create({
     email: input.adminEmail.toLowerCase(),
     password: temporaryPassword, // hashed by the model's pre-save hook, never written raw
-    // Encrypted (reversible) copy so the Super Admin panel can show/copy
-    // the current password — only ever set for Super-Admin-issued
-    // credentials, cleared the moment the user changes it themselves.
-    passwordEnc: encrypt(temporaryPassword),
     firstName: input.adminFirstName,
     lastName: input.adminLastName,
     role: 'TENANT_ADMIN',
@@ -303,7 +314,7 @@ export async function updateTenant(
   };
   const update: Record<string, unknown> = { ...rest };
   if (widget && typeof widget === 'object') {
-    for (const key of ['enabled', 'allowedDomains', 'greeting', 'quickQuestions', 'showBookingQuickReply', 'autoSendLeadEmails', 'defaultTeamId', 'websiteUrl', 'booking', 'template', 'voice']) {
+    for (const key of ['enabled', 'allowedDomains', 'greeting', 'quickQuestions', 'showBookingQuickReply', 'autoSendLeadEmails', 'defaultTeamId', 'websiteUrl', 'booking', 'template', 'theme', 'voice', 'humanHandoff']) {
       if (widget[key] !== undefined) update[`widget.${key}`] = widget[key];
     }
     // lastCrawledAt/crawlPageCount are deliberately NOT in the allow-list above —
@@ -318,8 +329,15 @@ export async function updateTenant(
       if (branding[key] !== undefined) update[`branding.${key}`] = branding[key];
     }
   }
+  // monthlyTokenLimit/monthlyVoiceMinutesLimit/tokenWarningThresholdPercent/
+  // tokenCriticalThresholdPercent are deliberately EXCLUDED from this
+  // allow-list — same reasoning as maxUsers below: this route is reachable
+  // by TENANT_ADMIN (PUT /tenants/:id), and the AI usage budget must only be
+  // settable by Super Admin, via the dedicated
+  // PUT /admin/tenants/:id/ai-config (updateTenantAiLimits() below), or a
+  // tenant could raise its own AI budget for free.
   if (aiConfig && typeof aiConfig === 'object') {
-    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'monthlyTokenLimit', 'monthlyVoiceMinutesLimit', 'tokenWarningThresholdPercent', 'tokenCriticalThresholdPercent', 'toolModelPreset', 'autoConvertLeadOnMeetingCompleted']) {
+    for (const key of ['systemPrompt', 'language', 'fallbackToHuman', 'agentName', 'toolModelPreset', 'autoConvertLeadOnMeetingCompleted']) {
       if (aiConfig[key] !== undefined) update[`aiConfig.${key}`] = aiConfig[key];
     }
   }
@@ -351,6 +369,37 @@ export async function updateTenant(
       if (settings[key] !== undefined) update[`settings.${key}`] = settings[key];
     }
   }
+  return Tenant.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });
+}
+
+/** Super-Admin-only counterpart to the 4 aiConfig fields updateTenant()
+ * above deliberately excludes from the tenant-writable allow-list — backs
+ * PUT /admin/tenants/:id/ai-config. `null` clears an override back to the
+ * plan default (getPlanLimits()); `undefined` leaves the existing value
+ * untouched, same "partial payload never wipes siblings" convention as
+ * updateTenant()'s own dot-notation $set. */
+export async function updateTenantAiLimits(
+  id: string,
+  limits: {
+    monthlyTokenLimit?: number | null;
+    monthlyVoiceMinutesLimit?: number | null;
+    tokenWarningThresholdPercent?: number | null;
+    tokenCriticalThresholdPercent?: number | null;
+    /** The actual "grant more credits" action in the prepaid-credit model —
+     * stamps aiConfig.creditsLastResetAt to now, so getAiUsage()'s usage sum
+     * starts counting from zero again from this moment forward. Deliberately
+     * separate from the limit fields above: a Super Admin can raise a
+     * tenant's limit without resetting what they've already used, or reset
+     * the counter without changing the limit (a tenant who asks for a fresh
+     * start on their existing plan). */
+    resetUsageCounter?: boolean;
+  },
+): Promise<ITenant | null> {
+  const update: Record<string, unknown> = {};
+  for (const key of ['monthlyTokenLimit', 'monthlyVoiceMinutesLimit', 'tokenWarningThresholdPercent', 'tokenCriticalThresholdPercent'] as const) {
+    if (limits[key] !== undefined) update[`aiConfig.${key}`] = limits[key];
+  }
+  if (limits.resetUsageCounter) update['aiConfig.creditsLastResetAt'] = new Date();
   return Tenant.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });
 }
 
@@ -456,6 +505,53 @@ export async function removeWidgetLogo(id: string): Promise<ITenant | null> {
   const previousUrl = existing?.widget?.logoUrl;
 
   const tenant = await Tenant.findByIdAndUpdate(id, { $unset: { 'widget.logoUrl': '' } }, { new: true });
+
+  if (previousUrl) {
+    try { await deleteFromS3(keyFromUrl(previousUrl)); } catch { /* best-effort cleanup */ }
+  }
+
+  return tenant;
+}
+
+/** Same upload/replace/cleanup pattern as uploadWidgetLogo() above, for the
+ * chat body's background image (tiled, WhatsApp-wallpaper style) — a
+ * distinct field from theme.backgroundColor, not a replacement for it:
+ * resolveWidgetTheme() keeps resolving backgroundColor as the fallback
+ * whenever no image is set, and the widget layers the image OVER the color
+ * (so a semi-transparent/PNG pattern still looks right), never instead of
+ * it. Also server-upload-only, same write-protection precedent as logoUrl/
+ * widgetKey (never accepted from the generic tenant-update payload). */
+export async function uploadWidgetBackgroundImage(
+  id: string,
+  file: { originalname: string; mimetype: string; buffer: Buffer }
+): Promise<ITenant | null> {
+  const existing = await Tenant.findById(id).select('widget.theme.backgroundImageUrl').lean();
+  const previousUrl = existing?.widget?.theme?.backgroundImageUrl;
+
+  const url = await uploadToS3({
+    tenantId: id,
+    folder:   'widget-background',
+    filename: file.originalname,
+    mimetype: file.mimetype,
+    buffer:   file.buffer,
+  });
+
+  const tenant = await Tenant.findByIdAndUpdate(id, { $set: { 'widget.theme.backgroundImageUrl': url } }, { new: true });
+
+  if (previousUrl) {
+    try { await deleteFromS3(keyFromUrl(previousUrl)); } catch { /* best-effort cleanup */ }
+  }
+
+  return tenant;
+}
+
+/** Clears the background image (falls back to theme.backgroundColor, same
+ * as if it were never set). Best-effort deletes the S3 object. */
+export async function removeWidgetBackgroundImage(id: string): Promise<ITenant | null> {
+  const existing = await Tenant.findById(id).select('widget.theme.backgroundImageUrl').lean();
+  const previousUrl = existing?.widget?.theme?.backgroundImageUrl;
+
+  const tenant = await Tenant.findByIdAndUpdate(id, { $unset: { 'widget.theme.backgroundImageUrl': '' } }, { new: true });
 
   if (previousUrl) {
     try { await deleteFromS3(keyFromUrl(previousUrl)); } catch { /* best-effort cleanup */ }

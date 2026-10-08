@@ -9,6 +9,7 @@ import { requireUnlocked } from '../record-lock/record-lock.middleware';
 const router = Router();
 
 router.get('/',       requirePermission('fs.invoices.view'),   ctrl.list);
+router.get('/filter-fields', requirePermission('fs.invoices.view'), ctrl.filterFields);
 router.post('/',      requirePermission('fs.invoices.create'), validate({ body: createInvoiceSchema }),                       ctrl.create);
 router.get('/:id',    requirePermission('fs.invoices.view'),   validate({ params: idParam }),                                  ctrl.getOne);
 router.put('/:id',    requirePermission('fs.invoices.edit'),   validate({ params: idParam, body: updateInvoiceSchema }),      requireUnlocked('invoices'), ctrl.update);

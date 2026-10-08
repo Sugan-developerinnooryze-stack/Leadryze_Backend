@@ -6,6 +6,7 @@ import * as ctrl from './public-widget.controller';
 import {
   widgetConfigQuerySchema, widgetChatQuerySchema, widgetChatBodySchema, widgetVoiceChatBodySchema,
   widgetVoiceTokenBodySchema, widgetHistoryQuerySchema,
+  widgetHandoffRequestBodySchema, widgetHandoffHistoryQuerySchema,
 } from './public-widget.validation';
 
 /** Public, unauthenticated — the website widget's entry point. Deliberately
@@ -20,10 +21,12 @@ const router = Router();
 // widgetKey/tenant resolved fresh here too (see preflight()'s own comment).
 // No rate limit on OPTIONS itself — browsers issue these automatically and
 // they do no real work (no DB write, no AI call).
-router.options(['/config', '/chat', '/voice/chat', '/voice/token'], ctrl.preflight);
+router.options(['/config', '/chat', '/voice/chat', '/voice/token', '/handoff/request', '/handoff/history'], ctrl.preflight);
 
 router.get('/config', widgetRateLimit, validate({ query: widgetConfigQuerySchema }), ctrl.getConfig);
 router.get('/history', widgetRateLimit, validate({ query: widgetHistoryQuerySchema }), ctrl.getHistory);
+router.post('/handoff/request', widgetRateLimit, validate({ query: widgetChatQuerySchema, body: widgetHandoffRequestBodySchema }), ctrl.postHandoffRequest);
+router.get('/handoff/history', widgetRateLimit, validate({ query: widgetHandoffHistoryQuerySchema }), ctrl.getHandoffHistory);
 router.post('/chat', widgetRateLimit, validate({ query: widgetChatQuerySchema, body: widgetChatBodySchema }), ctrl.postChat);
 // multer runs BEFORE validate() here — req.body only contains the text
 // fields (sessionId/visitorId/pageUrl/durationSeconds) once multer has

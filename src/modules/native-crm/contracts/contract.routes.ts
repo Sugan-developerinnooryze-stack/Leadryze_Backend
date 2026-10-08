@@ -9,6 +9,7 @@ import { requireUnlocked } from '../record-lock/record-lock.middleware';
 const router = Router();
 
 router.get('/',       requirePermission('fs.contracts.view'),   ctrl.list);
+router.get('/filter-fields', requirePermission('fs.contracts.view'), ctrl.filterFields);
 router.post('/',      requirePermission('fs.contracts.create'), validate({ body: createContractSchema }),                      ctrl.create);
 // Schedule engine endpoints — registered before /:id
 router.post('/schedule-preview',           requirePermission('fs.contracts.view'),   ctrl.schedulePreview);

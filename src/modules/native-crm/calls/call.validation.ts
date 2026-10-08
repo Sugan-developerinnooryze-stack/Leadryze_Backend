@@ -4,7 +4,9 @@ import { customFields } from '../../../utils/common.schemas';
 export const createCallSchema = z.object({
   contactName: z.string().trim().min(1).max(200),
   direction:   z.enum(['inbound','outbound']).optional(),
-  duration:    z.number().min(0).optional(),
+  // LR-ACT-001: the form submits this as a string ("5"), not a number —
+  // coerce rather than reject.
+  duration:    z.coerce.number().min(0).optional(),
   callStatus:  z.enum(['planned','completed','missed','cancelled']).optional(),
   date:        z.string().optional(),
   notes:       z.string().optional(),
@@ -14,7 +16,8 @@ export const createCallSchema = z.object({
   // trio must accept '' as a real, savable value — that's how the frontend
   // clears a previously-set link via $set; transforming '' to undefined would
   // make Mongoose silently drop it from $set, leaving the stale link in place.
-  relatedModule: z.union([z.enum(['contact','company','deal','customer','quotation','workorder','contract']), z.literal('')]).optional(),
+  // LR-ACT-002: Lead was missing here (meeting.validation.ts already had it).
+  relatedModule: z.union([z.enum(['contact','company','deal','customer','quotation','workorder','contract','lead']), z.literal('')]).optional(),
   relatedId:     z.string().trim().optional(),
   relatedLabel:  z.string().trim().optional(),
   customFields,

@@ -1,7 +1,16 @@
 import { z } from 'zod';
 import { customFields } from '../../../utils/common.schemas';
 
-export const createMeetingSchema = z.object({
+// LR-ACT-003: nothing stopped an end time before the start time — checked
+// on both create and update (update's fields are all optional, so this is
+// a no-op unless the caller actually sent both).
+function endAfterStart(data: { startDate?: string; endDate?: string }): boolean {
+  if (!data.startDate || !data.endDate) return true;
+  return new Date(data.endDate).getTime() > new Date(data.startDate).getTime();
+}
+const TIME_ORDER_ISSUE = { message: 'End time must be after start time', path: ['endDate'] };
+
+const meetingSchemaBase = z.object({
   title:         z.string().trim().min(1).max(300),
   startDate:     z.string().optional(),
   endDate:       z.string().optional(),
@@ -32,4 +41,5 @@ export const createMeetingSchema = z.object({
   customFields,
 });
 
-export const updateMeetingSchema = createMeetingSchema.partial();
+export const createMeetingSchema = meetingSchemaBase.refine(endAfterStart, TIME_ORDER_ISSUE);
+export const updateMeetingSchema = meetingSchemaBase.partial().refine(endAfterStart, TIME_ORDER_ISSUE);

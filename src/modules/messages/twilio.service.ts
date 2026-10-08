@@ -14,6 +14,10 @@ export interface SmsOptions {
   to: string;
   body: string;
   from?: string;
+  // Only set by the campaign dispatcher (for delivery-status webhook
+  // correlation) — every existing caller omits this, so their requests are
+  // byte-for-byte unchanged.
+  statusCallbackUrl?: string;
 }
 
 export async function sendSmsNow(opts: SmsOptions): Promise<string | null> {
@@ -24,6 +28,7 @@ export async function sendSmsNow(opts: SmsOptions): Promise<string | null> {
 
   const from = opts.from || config.twilio.phoneNumber;
   const params = new URLSearchParams({ To: opts.to, From: from, Body: opts.body });
+  if (opts.statusCallbackUrl) params.set('StatusCallback', opts.statusCallbackUrl);
 
   try {
     const response = await axios.post(

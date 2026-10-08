@@ -44,12 +44,13 @@ export interface IUser extends Document {
   passwordResetToken?: string;
   passwordResetExpiry?: Date;
   mustChangePassword?: boolean;
-  // AES-256-GCM encrypted copy of the password, set ONLY when a Super Admin
-  // issues/regenerates a credential (Create Tenant, Approve, Add User,
-  // admin Reset/Regenerate Password), never for a self-chosen password —
-  // lets the Super Admin panel show/copy a currently-working password. Any
-  // self-service password change (Settings, forgot-password) clears this
-  // rather than leaving a stale value behind. See utils/crypto.ts.
+  // Deprecated (LR-SEC-001): no longer written anywhere. Used to hold an
+  // AES-256-GCM reversible copy of an admin-issued password so the Super
+  // Admin panel could show/copy it on every later visit — a standing
+  // plaintext-equivalent-at-rest exposure. The one-time reveal right after
+  // create/reset (which doesn't touch this field) is unaffected. Field kept,
+  // unwritten, so old stored values harmlessly age out rather than needing
+  // a migration.
   passwordEnc?: string;
   // Sidebar drag/pin/hide customization — UI ordering preference only, never
   // an authorization source. The frontend always re-applies its own

@@ -1,13 +1,17 @@
 import { Request, Response } from 'express';
 import axios from 'axios';
 import { randomUUID } from 'crypto';
+import jwt from 'jsonwebtoken';
 import { AccessToken } from 'livekit-server-sdk';
 import { config } from '../../config';
 import { sendSuccess, sendError } from '../../utils/response';
 import { logger } from '../../utils/logger';
-import { resolveTenantByWidgetKey, isOriginAllowed } from './public-widget.service';
+import { resolveTenantByWidgetKey, isOriginAllowed, resolveWidgetTheme } from './public-widget.service';
 import { ITenant } from '../tenants/tenant.model';
 import { ChatSession } from '../bot/chat-session.model';
+import { requestHandoff, appendVisitorMessage } from '../bot/chat-handoff.service';
+import { emitHandoffRequested, emitHandoffMessage } from '../../realtime/emit-helpers';
+import { createHandoffNotification } from '../notifications/notification.service';
 
 const aiHeaders = { 'x-api-key': config.ai.internalApiKey };
 const AI_URL = config.app.aiServiceUrl;
@@ -62,6 +66,7 @@ export async function getConfig(req: Request, res: Response): Promise<void> {
     // branding logo, then to no logo at all (widget renders a letter avatar).
     logoUrl:      tenant.widget?.logoUrl || tenant.branding?.logoUrl,
     primaryColor: tenant.branding?.primaryColor || '#00B8D9',
+    theme:        resolveWidgetTheme(tenant),
     greeting:     tenant.widget?.greeting || 'Hi! How can I help you today?',
     language:     tenant.aiConfig?.language || 'en',
     template:     tenant.widget?.template || 'modern',
@@ -76,6 +81,13 @@ export async function getConfig(req: Request, res: Response): Promise<void> {
     voiceAutoPlay: tenant.widget?.voice?.autoPlay !== false,
     continuousVoiceEnabled: !!tenant.widget?.voice?.continuousModeEnabled,
     allowTextDuringVoice: tenant.widget?.voice?.allowTextDuringVoice !== false,
+    // Explicit `=== true` check, never a truthy-ish fallback — an absent or
+    // malformed humanHandoff block must always resolve to "button hidden,"
+    // matching ground rule #1 (default OFF for every tenant, old and new).
+    humanHandoffEnabled: tenant.widget?.humanHandoff?.enabled === true,
+    humanHandoffButtonText: tenant.widget?.humanHandoff?.buttonText || 'Connect with an expert',
+    humanHandoffWaitingMessage: tenant.widget?.humanHandoff?.waitingMessage
+      || "We're connecting you with a team member — someone will be with you shortly.",
   });
 }
 
@@ -135,6 +147,30 @@ export async function postChat(req: Request, res: Response): Promise<void> {
     sessionId: string; visitorId?: string; message: string; pageUrl?: string;
   };
 
+  // Human Handoff AI-pause gate — checked BEFORE the AI proxy call below,
+  // not as an after-the-fact filter. `=== 'human'` (never `!== 'ai'`), so a
+  // session with no handoff fields at all (every tenant that's never used
+  // this feature) always, safely falls through to the unchanged AI path
+  // beneath this block.
+  try {
+    const existing = await ChatSession.findOne({ tenantId: tenant._id, sessionId }).select('mode').lean();
+    if (existing?.mode === 'human') {
+      const updated = await appendVisitorMessage(String(tenant._id), sessionId, message);
+      if (updated) {
+        const io = req.app.get('io');
+        emitHandoffMessage(io, String(tenant._id), sessionId, {
+          role: 'user', content: message, timestamp: new Date(),
+        });
+        await createHandoffNotification(String(tenant._id), updated, 'message');
+      }
+      sendSuccess(res, { response: '', humanMode: true }, 'Message sent to the team');
+      return;
+    }
+  } catch (err) {
+    logger.error('Human handoff pause-gate check failed', { tenantId: String(tenant._id), sessionId, error: (err as Error).message });
+    // Fall through to the normal AI path — fail safe, not fail open.
+  }
+
   try {
     // The EXISTING, unmodified AI /api/chat endpoint, called with the
     // EXISTING private internal key — identical shape to ai.routes.ts's own
@@ -189,6 +225,21 @@ export async function postVoiceChat(req: Request, res: Response): Promise<void> 
   const { sessionId, visitorId, pageUrl, durationSeconds } = req.body as {
     sessionId: string; visitorId?: string; pageUrl?: string; durationSeconds?: string;
   };
+
+  // Same AI-pause gate as postChat() — voice is channel-agnostic to the
+  // "AI never responds again once handed off" guarantee. Rejected outright
+  // (no partial/empty-response shape to invent for audio) — the widget UI
+  // hides voice controls once it sees humanMode from a prior text turn, so
+  // this is a defense-in-depth 403, not the primary UX signal.
+  try {
+    const existing = await ChatSession.findOne({ tenantId: tenant._id, sessionId }).select('mode').lean();
+    if (existing?.mode === 'human') {
+      sendError(res, 'Voice is paused while you are connected with a team member', 403);
+      return;
+    }
+  } catch (err) {
+    logger.error('Human handoff pause-gate check failed', { tenantId: String(tenant._id), sessionId, error: (err as Error).message });
+  }
 
   try {
     const voice = tenant.widget.voice;
@@ -307,6 +358,19 @@ export async function getVoiceToken(req: Request, res: Response): Promise<void> 
   const { sessionId, visitorId } = req.body as { sessionId: string; visitorId?: string };
   if (!sessionId) { sendError(res, 'sessionId is required', 400); return; }
 
+  // Same AI-pause gate — rejects minting a NEW continuous-voice room while
+  // handed off. An already-in-progress LiveKit call can't be interrupted
+  // mid-call by this check (accepted V1 edge case, out of scope per plan).
+  try {
+    const existing = await ChatSession.findOne({ tenantId: tenant._id, sessionId }).select('mode').lean();
+    if (existing?.mode === 'human') {
+      sendError(res, 'Voice is paused while you are connected with a team member', 403);
+      return;
+    }
+  } catch (err) {
+    logger.error('Human handoff pause-gate check failed', { tenantId: String(tenant._id), sessionId, error: (err as Error).message });
+  }
+
   try {
     const room = `voice-${String(tenant._id)}-${sessionId}`;
     const identity = `visitor-${visitorId || randomUUID()}`;
@@ -328,5 +392,98 @@ export async function getVoiceToken(req: Request, res: Response): Promise<void> 
   } catch (err) {
     logger.error('LiveKit token minting failed', { tenantId: String(tenant._id), error: (err as Error).message });
     sendError(res, 'Voice conversation is temporarily unavailable', 502);
+  }
+}
+
+/** A visitor clicks "Connect with an expert." Explicit `=== true` gate (same
+ * reasoning as getConfig()'s humanHandoffEnabled) — a tenant that's never
+ * configured this, or has it explicitly off, gets a clean 403, never a
+ * half-started handoff. On success: flips the session to human/waiting via
+ * the shared state-machine service, notifies the staff queue over the
+ * existing Socket.IO server, and mints a narrowly-scoped widget socket
+ * token (scope:'widget' — deliberately no userId/role, see server.ts's own
+ * io.use comment) so the widget can open a real, bidirectional connection
+ * for just this one conversation. */
+export async function postHandoffRequest(req: Request, res: Response): Promise<void> {
+  const widgetKey = req.query.widgetKey as string;
+  const tenant = await resolveTenantByWidgetKey(widgetKey);
+  if (!tenant) { sendError(res, 'Widget not found or disabled', 404); return; }
+  if (!applyCorsHeader(req, res, tenant)) { sendError(res, 'Origin not allowed for this widget', 403); return; }
+  if (tenant.widget?.humanHandoff?.enabled !== true) {
+    sendError(res, 'Connecting with an expert is not available for this widget', 403);
+    return;
+  }
+
+  const { sessionId, visitorId, visitorName, visitorEmail, visitorPhone } = req.body as {
+    sessionId: string; visitorId?: string; visitorName?: string; visitorEmail?: string; visitorPhone?: string;
+  };
+
+  try {
+    const tenantId = String(tenant._id);
+    const session = await requestHandoff(tenantId, sessionId, {
+      visitorId, visitorName, visitorEmail, visitorPhone, channel: 'web',
+    });
+
+    const io = req.app.get('io');
+    emitHandoffRequested(io, tenantId, {
+      sessionId,
+      visitorName: session.visitorName,
+      visitorEmail: session.visitorEmail,
+      pageUrl: (req.body as { pageUrl?: string }).pageUrl,
+      requestedAt: session.handoffRequestedAt,
+    });
+    await createHandoffNotification(tenantId, session, 'requested');
+
+    // Short-lived, single-conversation widget socket token — see server.ts's
+    // io.use for the matching verification branch. No `userId`/`role` in
+    // this payload at all (structurally distinct from a staff login token).
+    const widgetToken = jwt.sign(
+      { scope: 'widget', tenantId, sessionId },
+      config.jwt.secret,
+      { expiresIn: '2h' },
+    );
+
+    sendSuccess(res, {
+      status: session.handoffStatus,
+      widgetToken,
+      waitingMessage: tenant.widget?.humanHandoff?.waitingMessage
+        || "We're connecting you with a team member — someone will be with you shortly.",
+    }, 'Handoff requested');
+  } catch (err) {
+    logger.error('Human handoff request failed', { tenantId: String(tenant._id), sessionId, error: (err as Error).message });
+    sendError(res, 'Could not connect you with a team member right now — please try again shortly', 502);
+  }
+}
+
+/** One-time catch-up fetch for the handoff thread specifically — called once
+ * on widget reopen/reconnect, NOT polled on an interval (the whole point of
+ * the real Socket.IO upgrade is that no polling is needed for live updates).
+ * Reuses getHistory()'s exact tenantId+sessionId+visitorId ownership
+ * pattern — same three-factor check, same field allow-list. */
+export async function getHandoffHistory(req: Request, res: Response): Promise<void> {
+  const widgetKey = req.query.widgetKey as string;
+  const tenant = await resolveTenantByWidgetKey(widgetKey);
+  if (!tenant) { sendError(res, 'Widget not found or disabled', 404); return; }
+  if (!applyCorsHeader(req, res, tenant)) { sendError(res, 'Origin not allowed for this widget', 403); return; }
+
+  const sessionId = req.query.sessionId as string;
+  const visitorId = req.query.visitorId as string;
+
+  try {
+    const session = await ChatSession.findOne({ tenantId: tenant._id, sessionId, visitorId })
+      .select('messages mode handoffStatus assignedToName')
+      .lean();
+
+    if (!session) { sendSuccess(res, { messages: [], mode: 'ai', handoffStatus: 'none' }); return; }
+
+    sendSuccess(res, {
+      messages: (session.messages || []).map((m) => ({ role: m.role, content: m.content, timestamp: m.timestamp })),
+      mode: session.mode || 'ai',
+      handoffStatus: session.handoffStatus || 'none',
+      assignedToName: session.assignedToName,
+    });
+  } catch (err) {
+    logger.error('Widget handoff history fetch failed', { tenantId: String(tenant._id), error: (err as Error).message });
+    sendError(res, 'Could not load conversation history', 502);
   }
 }

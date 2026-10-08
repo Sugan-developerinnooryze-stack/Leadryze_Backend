@@ -6,6 +6,11 @@ import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
+import { NativeQuotation } from '../quotations/quotation.model';
+import { NativeWorkorder } from '../workorders/workorder.model';
+import { NativeInvoice } from '../invoices/invoice.model';
+import { NativeReceipt } from '../receipts/receipt.model';
+import { NativeContract } from '../contracts/contract.model';
 
 export async function listCustomers(tenantId: string, opts: CustomerListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -61,6 +66,32 @@ export async function deleteCustomer(id: string, tenantId: string, scope?: DataS
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  const existing = await NativeCustomer.findOne(filter).select('customerId').lean();
+  if (!existing) return null;
+
+  // LR-DEL-001: Quotation/WorkOrder/Invoice/Receipt/Contract all reference
+  // the customer only by this plain customerId string (no cascade, no
+  // Mongo ref) — deleting out from under them orphaned every one of those
+  // documents. Block the delete instead, same as a real FK constraint
+  // would, rather than silently leaving them pointing at nothing.
+  const cid = existing.customerId;
+  const [quotations, workorders, invoices, receipts, contracts] = await Promise.all([
+    NativeQuotation.countDocuments({ tenantId: tid, customerId: cid }),
+    NativeWorkorder.countDocuments({ tenantId: tid, customerId: cid }),
+    NativeInvoice.countDocuments({ tenantId: tid, customerId: cid }),
+    NativeReceipt.countDocuments({ tenantId: tid, customerId: cid }),
+    NativeContract.countDocuments({ tenantId: tid, customerId: cid }),
+  ]);
+  const linked: string[] = [];
+  if (quotations) linked.push(`${quotations} quotation${quotations > 1 ? 's' : ''}`);
+  if (workorders) linked.push(`${workorders} work order${workorders > 1 ? 's' : ''}`);
+  if (invoices)   linked.push(`${invoices} invoice${invoices > 1 ? 's' : ''}`);
+  if (receipts)   linked.push(`${receipts} receipt${receipts > 1 ? 's' : ''}`);
+  if (contracts)  linked.push(`${contracts} contract${contracts > 1 ? 's' : ''}`);
+  if (linked.length) {
+    throw new Error(`Cannot delete — this customer has ${linked.join(', ')}. Remove or reassign them first.`);
+  }
+
   const deleted = await NativeCustomer.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'customers', String(deleted._id));
   return deleted;

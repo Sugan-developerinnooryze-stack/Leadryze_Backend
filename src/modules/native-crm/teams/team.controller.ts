@@ -39,7 +39,7 @@ export async function create(req: AuthRequest, res: Response) {
 
 export async function update(req: AuthRequest, res: Response) {
   try {
-    const item = await updateTeam(req.params.id, req.tenantId!, req.body);
+    const item = await updateTeam(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'teams'));
     if (!item) return sendError(res, 'Team not found', 404);
     sendSuccess(res, item);
   } catch (err: any) {

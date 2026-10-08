@@ -5,6 +5,10 @@ import { customFields } from '../../../utils/common.schemas';
 // no longer a fixed enum — validity against the tenant's own stage list is
 // checked at the service layer instead.
 const statusSchema = z.string().trim().min(1);
+// LR-LEAD-003: a phone field accepted letters ("abc123") outright — digits,
+// spaces, and the usual +/-/() punctuation only. .or(literal('')) mirrors
+// email's own optional-but-not-""-isn't-a-format-error pattern below.
+const phoneSchema = z.string().trim().regex(/^[0-9+\-\s()]+$/, 'Enter a valid phone number').optional().or(z.literal(''));
 const sourceEnum   = z.enum(['website','landing_page','chatbot','whatsapp','facebook','google','manual','csv','api','referral','other']);
 const ratingEnum   = z.enum(['hot','warm','cold']);
 const priorityEnum = z.enum(['high','medium','low']);
@@ -22,10 +26,10 @@ export const createLeadSchema = z.object({
 
   email:          z.string().trim().email().optional().or(z.literal('')),
   secondaryEmail: z.string().trim().email().optional().or(z.literal('')),
-  phone:          z.string().trim().optional(),
-  mobile:         z.string().trim().optional(),
-  whatsapp:       z.string().trim().optional(),
-  alternatePhone: z.string().trim().optional(),
+  phone:          phoneSchema,
+  mobile:         phoneSchema,
+  whatsapp:       phoneSchema,
+  alternatePhone: phoneSchema,
   linkedin:       z.string().trim().optional(),
   facebook:       z.string().trim().optional(),
   twitter:        z.string().trim().optional(),
@@ -45,7 +49,10 @@ export const createLeadSchema = z.object({
   leadOwner: z.string().optional(),
   leadOwnerStaffId: z.string().optional(),
 
-  expectedRevenue:   z.number().optional(),
+  // LR-LEAD-004: unbounded negative/absurd values here corrupted Pipeline
+  // Value aggregates — min(0) plus a generous sanity ceiling (anything
+  // above this is a typo, not a real deal size).
+  expectedRevenue:   z.number().min(0).max(1_000_000_000_000).optional(),
   expectedCloseDate: z.string().optional(),
   budget:            z.number().optional(),
   interestedProducts: z.array(z.string()).optional(),

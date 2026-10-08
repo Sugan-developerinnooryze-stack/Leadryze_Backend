@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { getLeadRaw } from './lead.service';
+import { decrypt, isEncrypted } from '../../../utils/crypto';
 import { Contact }        from '../contacts/contact.model';
 import { Deal }           from '../deals/deal.model';
 import { NativeCustomer } from '../customers/customer.model';
@@ -26,6 +27,21 @@ export async function convertLeadToContact(
   const alreadyDone = lead.conversionHistory?.some((h) => h.type === 'contact');
   if (alreadyDone) throw new Error('Lead has already been converted to a Contact');
 
+  // Contact has no mobile/whatsapp/address fields of its own (unlike
+  // Customer, which does) — rather than silently dropping them, fold
+  // whichever of Lead's extra fields a Contact can't represent into notes
+  // so the information survives the conversion. Lead's PII fields are
+  // encrypted at rest (see pii.service.ts) — getLeadRaw() returns the raw
+  // document, so decrypt before embedding as plain text.
+  const plain = (v?: string | null) => (v && isEncrypted(v)) ? decrypt(v) : (v ?? '');
+  const extra: string[] = [];
+  const mobilePlain = plain(lead.mobile);
+  if (mobilePlain && mobilePlain !== plain(lead.phone)) extra.push(`Mobile: ${mobilePlain}`);
+  if (lead.whatsapp) extra.push(`WhatsApp: ${plain(lead.whatsapp)}`);
+  const addressParts = [plain(lead.address), lead.city, lead.state, lead.country, lead.postalCode].filter(Boolean);
+  if (addressParts.length) extra.push(`Address: ${addressParts.join(', ')}`);
+  const notes = [`Created from Lead ${lead.leadId}`, ...extra].join('\n');
+
   const contact = await Contact.create({
     tenantId,
     firstName:      lead.firstName,
@@ -37,7 +53,7 @@ export async function convertLeadToContact(
     source:         CONTACT_SOURCE_MAP[lead.source] ?? 'other',
     status:         'contact',
     lifecycleStage: 'sales_qualified_lead',
-    notes:          `Created from Lead ${lead.leadId}`,
+    notes,
     tags:           lead.tags ?? [],
     leadId:         lead._id.toString(),
     createdBy:      performedBy,
@@ -45,10 +61,16 @@ export async function convertLeadToContact(
 
   const name = [lead.firstName, lead.lastName].filter(Boolean).join(' ');
   lead.contactId      = contact._id.toString();
-  lead.isConverted    = true;
   lead.lastActivityAt = new Date();
   (lead.conversionHistory as any[]).push({ type: 'contact', entityId: contact._id.toString(), name, createdAt: new Date(), createdBy: performedBy });
   await lead.save();
+
+  // If this Lead was already converted to an Opportunity first, that Deal
+  // was created with no Contact to point to yet (contactId: '') — link it
+  // up now rather than leaving the two permanently disconnected.
+  if (lead.opportunityId) {
+    await Deal.updateOne({ _id: lead.opportunityId, tenantId }, { $set: { contactId: contact._id.toString() } });
+  }
 
   logTimeline(tenantId, 'leads', lead._id.toString(), 'status_changed',
     `Converted to Contact: ${name}`, performedBy,
@@ -75,6 +97,9 @@ export async function convertLeadToOpportunity(
     tenantId,
     title,
     amount:      lead.expectedRevenue,
+    // Matches the New Deal form's own default (DealsPage.tsx) rather than
+    // falling through to the schema's unrelated 'USD' default.
+    currency:    'INR',
     stage:       'prospect',
     closeDate:   lead.expectedCloseDate,
     contactName: [lead.firstName, lead.lastName].filter(Boolean).join(' '),
@@ -82,11 +107,13 @@ export async function convertLeadToOpportunity(
     notes:       `Created from Lead ${lead.leadId}`,
     leadId:      lead._id.toString(),
     contactId:   lead.contactId ?? '',
+    // Carries the Lead's own owner forward, same reasoning as
+    // convertLeadToCustomer's assignedStaffId below.
+    assignedStaffId: lead.leadOwnerStaffId,
     createdBy:   performedBy,
   });
 
   lead.opportunityId  = deal._id.toString();
-  lead.isConverted    = true;
   lead.lastActivityAt = new Date();
   (lead.conversionHistory as any[]).push({ type: 'opportunity', entityId: deal._id.toString(), name: title, createdAt: new Date(), createdBy: performedBy });
   await lead.save();

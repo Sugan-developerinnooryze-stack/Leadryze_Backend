@@ -40,12 +40,14 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
   { key: 'campaigns.create',  module: 'campaigns', resource: 'campaigns', action: 'create',    label: 'Campaigns — Create'  },
   { key: 'campaigns.edit',    module: 'campaigns', resource: 'campaigns', action: 'edit',      label: 'Campaigns — Edit'    },
   { key: 'campaigns.delete',  module: 'campaigns', resource: 'campaigns', action: 'delete',    label: 'Campaigns — Delete'  },
+  { key: 'campaigns.activate', module: 'campaigns', resource: 'campaigns', action: 'activate', label: 'Campaigns — Activate' },
 
   // Templates
   { key: 'templates.view',    module: 'templates', resource: 'templates', action: 'view',      label: 'Templates — View'    },
   { key: 'templates.create',  module: 'templates', resource: 'templates', action: 'create',    label: 'Templates — Create'  },
   { key: 'templates.edit',    module: 'templates', resource: 'templates', action: 'edit',      label: 'Templates — Edit'    },
   { key: 'templates.delete',  module: 'templates', resource: 'templates', action: 'delete',    label: 'Templates — Delete'  },
+  { key: 'templates.activate', module: 'templates', resource: 'templates', action: 'activate', label: 'Templates — Activate' },
 
   // Analytics
   { key: 'analytics.view',    module: 'analytics', resource: 'analytics', action: 'view',      label: 'Analytics — View'    },
@@ -97,6 +99,15 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
   // One-off Ticket SLA policy permission — the flatMap above only generates
   // view/create/edit/delete/export, not this custom action.
   { key: 'native_crm.tickets.manage_sla', module: 'native_crm', resource: 'tickets', action: 'manage_sla', label: 'CRM Tickets — Manage SLA Policy' },
+
+  // Human Handoff ("Connect with an expert") Conversations inbox — a custom
+  // action set, not the standard view/create/edit/delete/export shape above:
+  // a conversation is never "created" or "deleted" by staff, it's claimed
+  // from a shared queue, replied to, and handed back.
+  { key: 'native_crm.conversations.view',     module: 'native_crm', resource: 'conversations', action: 'view',     label: 'CRM Conversations — View' },
+  { key: 'native_crm.conversations.claim',    module: 'native_crm', resource: 'conversations', action: 'claim',    label: 'CRM Conversations — Claim' },
+  { key: 'native_crm.conversations.reply',    module: 'native_crm', resource: 'conversations', action: 'reply',    label: 'CRM Conversations — Reply' },
+  { key: 'native_crm.conversations.handback', module: 'native_crm', resource: 'conversations', action: 'handback', label: 'CRM Conversations — Hand back to AI' },
 
   // Field Service modules
   // 'datasets' added after dataset.routes.ts's own requirePermission()
@@ -220,6 +231,13 @@ const AGENT_PERMISSIONS = [
   'customers.view', 'customers.create', 'customers.edit', 'customers.assign',
   'campaigns.view',
   'templates.view',
+  // LR-UI-002: an Agent's own Timeline/Activity views already surface
+  // another teammate's raw User._id in text (e.g. "Reassigned ... by
+  // <id>") with no way to resolve it — this was never a deliberate
+  // read-only restriction, just a gap; matches the same "enforcement
+  // catching up to already-expressed intent" reasoning used elsewhere in
+  // this list. View-only, same as every other *.view grant here.
+  'users.view',
   'analytics.view',
   'knowledge.view',
   'bot.view', 'bot.use',
@@ -259,6 +277,12 @@ const AGENT_PERMISSIONS = [
   'native_crm.deals.view',     'native_crm.deals.create',     'native_crm.deals.edit',
   'native_crm.tickets.view',   'native_crm.tickets.create',   'native_crm.tickets.edit',
   'native_crm.calls.view',     'native_crm.calls.create',     'native_crm.calls.edit',
+  // Human Handoff shared claim queue — any Agent can see waiting requests,
+  // claim one, reply, and hand it back (matches the user's own explicit
+  // "shared queue, first to claim it gets it" decision, not a Manager-only
+  // gate).
+  'native_crm.conversations.view', 'native_crm.conversations.claim',
+  'native_crm.conversations.reply', 'native_crm.conversations.handback',
   // Added when the top-level "Management" activities module
   // (backend/src/modules/activities/activity.routes.ts — distinct from
   // fs.activities.* above) first got a real requirePermission gate

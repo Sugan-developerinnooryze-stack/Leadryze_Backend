@@ -11,6 +11,29 @@ import {
 import { Customer } from '../customers/customer.model';
 import { CRMRecord } from '../crm/crm-record.model';
 import mongoose from 'mongoose';
+import { CampaignRecipient, ICampaignRecipient } from '../campaigns/campaign-recipient.model';
+import { Campaign } from '../campaigns/campaign.model';
+
+// Shared across all 3 tracking receivers below — never let a webhook move a
+// recipient's status backward (e.g. a late 'sent' event arriving after we
+// already recorded 'read'). 'failed' only overwrites the pre-send states.
+const STATUS_RANK: Record<ICampaignRecipient['status'], number> = {
+  pending: 0, queued: 1, failed: 2, sent: 2, delivered: 3, read: 4, replied: 5, skipped: 0,
+};
+
+async function applyCampaignRecipientStatus(
+  providerMessageId: string,
+  newStatus: ICampaignRecipient['status'],
+  timestampField?: 'sentAt' | 'deliveredAt' | 'readAt' | 'repliedAt' | 'failedAt'
+): Promise<void> {
+  const recipient = await CampaignRecipient.findOne({ providerMessageId });
+  if (!recipient) return; // not a campaign send (or already-expired lookup) — nothing to do
+  if (STATUS_RANK[newStatus] <= STATUS_RANK[recipient.status]) return;
+  const update: Record<string, unknown> = { status: newStatus };
+  if (timestampField) update[timestampField] = new Date();
+  await CampaignRecipient.updateOne({ _id: recipient._id }, { $set: update });
+  await Campaign.updateOne({ _id: recipient.campaignId }, { $inc: { [`stats.${newStatus === 'read' ? 'opened' : newStatus}`]: 1 } });
+}
 
 export function verifyWhatsApp(req: Request, res: Response): void {
   const mode = req.query['hub.mode'];
@@ -77,6 +100,24 @@ export async function receiveWhatsApp(
           status: status.status,
           recipient: status.recipient_id,
         });
+        // Campaign delivery tracking — a no-op for any messageId that isn't
+        // a campaign send (findOne simply finds nothing).
+        const metaStatus = status.status as string;
+        const mapped: ICampaignRecipient['status'] | null =
+          metaStatus === 'sent' ? 'sent' :
+          metaStatus === 'delivered' ? 'delivered' :
+          metaStatus === 'read' ? 'read' :
+          metaStatus === 'failed' ? 'failed' : null;
+        const tsField =
+          mapped === 'sent' ? 'sentAt' :
+          mapped === 'delivered' ? 'deliveredAt' :
+          mapped === 'read' ? 'readAt' :
+          mapped === 'failed' ? 'failedAt' : undefined;
+        if (mapped) {
+          await applyCampaignRecipientStatus(status.id, mapped, tsField).catch((err) =>
+            logger.error('applyCampaignRecipientStatus failed', { messageId: status.id, error: (err as Error).message })
+          );
+        }
       }
     }
 
@@ -156,6 +197,88 @@ export async function receiveTwilio(req: Request, res: Response): Promise<void> 
     callStatus: req.body.CallStatus,
   });
   res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+}
+
+// Twilio's delivery-status callback — a genuinely separate URL/payload shape
+// (MessageSid/MessageStatus/To) from the inbound-SMS webhook above
+// (From/Body/CallStatus). Same HMAC scheme as receiveTwilio, reused here.
+const TWILIO_SMS_STATUS_MAP: Record<string, ICampaignRecipient['status'] | undefined> = {
+  sent: 'sent', delivered: 'delivered', failed: 'failed', undelivered: 'failed',
+};
+
+export async function receiveTwilioStatus(req: Request, res: Response): Promise<void> {
+  const twilioSignature = req.headers['x-twilio-signature'] as string | undefined;
+  const authToken = config.twilio.authToken;
+
+  if (authToken && twilioSignature) {
+    const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    const params = req.body as Record<string, string>;
+    const sortedParams = Object.keys(params).sort().reduce((acc, key) => acc + key + params[key], '');
+    const expected = crypto.createHmac('sha1', authToken).update(url + sortedParams).digest('base64');
+    const sigBuf = Buffer.from(twilioSignature);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      logger.warn('Twilio status webhook: invalid signature');
+      logSecurityEvent('webhook.sig_invalid', {
+        ip: req.ip ?? 'unknown', userAgent: (req.headers['user-agent'] as string) ?? 'unknown',
+        detail: { provider: 'twilio-status' },
+      });
+      res.sendStatus(401);
+      return;
+    }
+  } else if (!authToken) {
+    logger.warn('Twilio status webhook: authToken not configured — skipping signature verification');
+  }
+
+  const messageSid = req.body.MessageSid as string | undefined;
+  const messageStatus = (req.body.MessageStatus as string | undefined)?.toLowerCase();
+  const mapped = messageStatus ? TWILIO_SMS_STATUS_MAP[messageStatus] : undefined;
+  if (messageSid && mapped) {
+    const tsField = mapped === 'sent' ? 'sentAt' : mapped === 'delivered' ? 'deliveredAt' : 'failedAt';
+    await applyCampaignRecipientStatus(messageSid, mapped, tsField).catch((err) =>
+      logger.error('applyCampaignRecipientStatus failed', { messageSid, error: (err as Error).message })
+    );
+  }
+  res.sendStatus(200);
+}
+
+// Brevo doesn't HMAC-sign its webhooks by default — verified via a
+// shared-secret header configured when the webhook is set up in Brevo's
+// dashboard (config.brevo.webhookSecret / BREVO_WEBHOOK_SECRET).
+const BREVO_EVENT_MAP: Record<string, ICampaignRecipient['status'] | undefined> = {
+  delivered: 'delivered', opened: 'read', click: 'read',
+  hard_bounce: 'failed', soft_bounce: 'failed', blocked: 'failed', error: 'failed',
+};
+
+export async function receiveBrevo(req: Request, res: Response): Promise<void> {
+  if (config.brevo.webhookSecret) {
+    const provided = req.headers['x-brevo-webhook-secret'] as string | undefined;
+    if (provided !== config.brevo.webhookSecret) {
+      logger.warn('Brevo webhook: invalid or missing shared secret');
+      logSecurityEvent('webhook.sig_invalid', {
+        ip: req.ip ?? 'unknown', userAgent: (req.headers['user-agent'] as string) ?? 'unknown',
+        detail: { provider: 'brevo' },
+      });
+      res.sendStatus(401);
+      return;
+    }
+  } else {
+    logger.warn('Brevo webhook: BREVO_WEBHOOK_SECRET not configured — skipping verification');
+  }
+
+  const events = Array.isArray(req.body) ? req.body : [req.body];
+  for (const event of events) {
+    const messageId = event['message-id'] as string | undefined;
+    const eventType = (event.event as string | undefined)?.toLowerCase();
+    const mapped = eventType ? BREVO_EVENT_MAP[eventType] : undefined;
+    if (messageId && mapped) {
+      const tsField = mapped === 'delivered' ? 'deliveredAt' : mapped === 'read' ? 'readAt' : 'failedAt';
+      await applyCampaignRecipientStatus(messageId, mapped, tsField).catch((err) =>
+        logger.error('applyCampaignRecipientStatus failed', { messageId, error: (err as Error).message })
+      );
+    }
+  }
+  res.sendStatus(200);
 }
 
 // ── HubSpot CRM webhook (HubSpot → LeadRyze) ─────────────────────────────────

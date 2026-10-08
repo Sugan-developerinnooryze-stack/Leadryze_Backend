@@ -31,6 +31,7 @@ import { applyDataScopeToFilter } from '../shared/data-scope';
 import { resolveTeamFromStaffId, resolveSupervisorName } from '../shared/team-resolution';
 import { resolveEffectiveScope } from '../shared/data-scope';
 import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
+import { findDuplicateContact } from '../shared/duplicate-check';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -131,6 +132,10 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
+    // LR-LEAD-001: flag (never block, per LR-IMP-001's exact-match-only
+    // rule) an exact email/phone match against an existing lead, so the
+    // creator at least sees a warning instead of a silent duplicate.
+    const duplicate = await findDuplicateContact(Lead, req.tenantId!, req.body);
     const item = await createLead({
       ...req.body,
       tenantId:  req.tenantId!,
@@ -148,7 +153,7 @@ export async function create(req: AuthRequest, res: Response) {
       performedBy:  req.user?.userId,
     });
     runAutomationsOnCreate(req.tenantId!, 'lead', item.toObject()).catch(() => {});
-    sendCreated(res, item);
+    sendCreated(res, { ...item.toObject(), duplicateWarning: duplicate });
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -212,6 +217,14 @@ export async function update(req: AuthRequest, res: Response) {
     }
     sendSuccess(res, item);
   } catch (err: any) {
+    // LR-NEG-001: updateLead() now loads-then-saves (see LR-LEAD-005's fix),
+    // which gives Mongoose's built-in __v optimistic-concurrency check for
+    // free — two concurrent edits no longer silently overwrite each other,
+    // the second save fails here instead.
+    if (err.name === 'VersionError') {
+      sendError(res, 'This lead was changed by someone else — please reload and try again.', 409);
+      return;
+    }
     sendError(res, err.message, 400);
   }
 }
@@ -265,7 +278,7 @@ export async function stats(req: AuthRequest, res: Response) {
     const customFrom = req.query.customFrom as string | undefined;
     const customTo = req.query.customTo as string | undefined;
     const matchFilter: Record<string, unknown> = { tenantId: tid };
-    applyDataScopeToFilter(matchFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    applyDataScopeToFilter(matchFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId', undefined, undefined, 'createdBy');
     // Headline KPI total — all-time, before the range filter below narrows
     // `matchFilter` in place (same reasoning as Customers' allTimeTotal).
     const allTimeFilter = { ...matchFilter };
@@ -286,13 +299,13 @@ export async function stats(req: AuthRequest, res: Response) {
     // at all, keeping every pre-existing caller's response shape identical.
     const priorRange = resolvePriorDateRange(range, customFrom, customTo);
     const priorFilter: Record<string, unknown> = { tenantId: tid };
-    applyDataScopeToFilter(priorFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    applyDataScopeToFilter(priorFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId', undefined, undefined, 'createdBy');
     if (priorRange) applyDateRangeToFilter(priorFilter, 'createdAt', priorRange);
 
     // KPI sparkline — fixed 14-day window, independent of the range
     // selector above (see date-range.ts's own comment on SPARKLINE_DAYS).
     const sparklineFilter: Record<string, unknown> = { tenantId: tid, createdAt: { $gte: sparklineWindowStart() } };
-    applyDataScopeToFilter(sparklineFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    applyDataScopeToFilter(sparklineFilter, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId', undefined, undefined, 'createdBy');
 
     const [pipeline, total, allTimeTotal, converted, priorTotal, dailyRaw] = await Promise.all([
       Lead.aggregate([

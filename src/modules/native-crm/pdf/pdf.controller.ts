@@ -27,6 +27,8 @@ import {
   buildVarMap, cellValue, totalsValue,
 } from './variable-catalog';
 import { sendEmailNow }          from '../../messages/brevo.service';
+import { sendWhatsAppDocumentNow } from '../../messages/whatsapp.service';
+import { uploadToS3 }            from '../../../services/s3.service';
 import { getOutcomeStageKey }    from '../pipeline-config/pipeline-config.service';
 
 /** Resolved once per render — see RenderCtx.invoicePaidKey. */
@@ -405,5 +407,55 @@ export async function shareDocumentEmail(req: AuthRequest, res: Response) {
     sendSuccess(res, { sent: true });
   } catch (err: any) {
     sendError(res, err.message ?? 'Failed to send email', 500);
+  }
+}
+
+/** Real Meta Cloud API send — replaces the old client-side `wa.me` deep-link
+ * (which never touched Meta's API at all and couldn't attach the PDF; the
+ * user had to manually press Send themselves in a new tab). The PDF has to
+ * be reachable at a real public URL for Meta's servers to fetch it — it's
+ * never persisted anywhere else in this codebase (generatePdf/downloadDraftPdf/
+ * shareDocumentEmail all just stream or base64-attach the in-memory buffer
+ * directly) — so this uploads it to S3 first, same storage/proxy-URL path
+ * already used for logos and custom-template assets.
+ *
+ * Real constraint this can't route around: Meta only allows a business to
+ * INITIATE a conversation (as opposed to replying within an open one) via an
+ * approved template message. This sends a plain document message, so it
+ * only succeeds if the customer has messaged this WhatsApp number within
+ * the last 24 hours — otherwise Meta rejects it with a real "re-engagement
+ * message" error, which sendWhatsAppDocumentNow() surfaces as-is (not
+ * swallowed) so the user sees why, not just "failed". */
+export async function shareDocumentWhatsApp(req: AuthRequest, res: Response) {
+  try {
+    const { module, id } = req.params;
+    const { to, message } = req.body as { to: string; message?: string };
+
+    const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      templateId: req.query.templateId ? String(req.query.templateId) : undefined,
+      variant:    req.query.template,
+    });
+    if ('error' in result) return sendError(res, result.error, result.status);
+
+    const buffer = await generatePdfFromHtml(result.html, result.pdfOptions);
+    const documentUrl = await uploadToS3({
+      tenantId: req.tenantId!,
+      folder:   'shared-documents',
+      filename: result.filename,
+      mimetype: 'application/pdf',
+      buffer,
+    });
+
+    // Meta expects digits only (country code + number, no "+"/spaces/dashes)
+    const toDigits = to.replace(/\D/g, '');
+    await sendWhatsAppDocumentNow(toDigits, {
+      link:     documentUrl,
+      filename: result.filename,
+      caption:  message,
+    });
+
+    sendSuccess(res, { sent: true });
+  } catch (err: any) {
+    sendError(res, err.message ?? 'Failed to send WhatsApp message', 500);
   }
 }

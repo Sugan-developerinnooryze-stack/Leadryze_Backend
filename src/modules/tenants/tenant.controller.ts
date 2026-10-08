@@ -91,6 +91,25 @@ export async function removeWidgetLogo(req: AuthRequest, res: Response, next: Ne
   } catch (err) { next(err); }
 }
 
+export async function uploadWidgetBackgroundImage(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    if (!req.file) { sendError(res, 'file is required', 400); return; }
+    const tenant = await tenantService.uploadWidgetBackgroundImage(req.params.id, {
+      originalname: req.file.originalname, mimetype: req.file.mimetype, buffer: req.file.buffer,
+    });
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, { backgroundImageUrl: tenant.widget?.theme?.backgroundImageUrl }, 'Background image uploaded');
+  } catch (err) { next(err); }
+}
+
+export async function removeWidgetBackgroundImage(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const tenant = await tenantService.removeWidgetBackgroundImage(req.params.id);
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, null, 'Background image removed');
+  } catch (err) { next(err); }
+}
+
 export async function getAiUsage(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
     const usage = await tenantService.getAiUsage(req.params.id);

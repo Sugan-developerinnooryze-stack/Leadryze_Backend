@@ -9,6 +9,8 @@ export interface IDeal {
   contactName?: string;
   companyName?: string;
   assignedStaffId?: string;
+  contactId?: string;
+  companyId?: string;
   notes?: string;
   tags?: string[];
   createdBy?: string;
@@ -26,6 +28,8 @@ export interface CreateDealDTO {
   contactName?: string;
   companyName?: string;
   assignedStaffId?: string;
+  contactId?: string;
+  companyId?: string;
   notes?: string;
   tags?: string[];
   importBatchId?: string;

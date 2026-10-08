@@ -5,6 +5,7 @@ import { requirePermission } from '../../../middlewares/auth.middleware';
 
 const router = Router();
 
+router.get('/defaults',              requirePermission('fs.settings.view'), ctrl.getDefaults);
 router.get('/',                      requirePermission('fs.settings.view'), ctrl.get);
 router.put('/',                      requirePermission('fs.settings.edit'), ctrl.upsert);
 router.post('/upload',               requirePermission('fs.settings.edit'), upload.single('file'), ctrl.uploadFile);

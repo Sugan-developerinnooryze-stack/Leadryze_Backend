@@ -91,7 +91,7 @@ const schema = new Schema<ICustomerDoc>(
     lockedAt:    { type: Date },
     lockedBy:    { type: String },
     lockReason:  { type: String },
-    phoneSearch: { type: String, index: true },   // first 6 digits unencrypted for search
+    phoneSearch: { type: String, index: true },   // digits-only, unencrypted, for search (see pii.service.ts)
     emailDomain: { type: String, index: true },   // domain part unencrypted for search
     // App credentials — select:false keeps secrets out of every list/get response
     appUsername:               { type: String, trim: true, lowercase: true },

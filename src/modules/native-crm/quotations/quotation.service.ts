@@ -5,8 +5,12 @@ import { QuotationListOptions } from './quotation.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
+import { NativeTeam } from '../teams/team.model';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { advanceWorkflow } from '../workflow/workflow.engine';
+import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
+import { applyDynamicFilters } from '../shared/dynamic-filter';
+import { getQuotationFilterCatalog } from './quotation.filter-catalog';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -14,6 +18,8 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
     throw new Error(`"${status}" is not a valid stage for this tenant's Quotation pipeline`);
   }
 }
+
+const QUOTATION_DATE_FIELDS = new Set(['validUntil', 'createdAt']);
 
 export async function listQuotations(tenantId: string, opts: QuotationListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -28,6 +34,17 @@ export async function listQuotations(tenantId: string, opts: QuotationListOption
     { title:      new RegExp(opts.search, 'i') },
     { customerId: new RegExp(opts.search, 'i') },
   ];
+  if (opts.teamId) {
+    const team = await NativeTeam.findOne({ _id: opts.teamId, tenantId: tid }).select('teamId').lean();
+    filter.teamId = team?.teamId ?? '__no_match__';
+  }
+  if (opts.staffId) filter.staffId = opts.staffId;
+  const dateField = opts.dateField && QUOTATION_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
+  applyDateRangeToFilter(filter, dateField, resolveDateRange(opts.range, opts.dateFrom, opts.dateTo));
+  if (opts.filters) {
+    const catalog = await getQuotationFilterCatalog(tenantId, branchId);
+    applyDynamicFilters(filter, opts.filters, catalog);
+  }
 
   const [items, total] = await Promise.all([
     NativeQuotation.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
@@ -51,7 +68,10 @@ export async function createQuotation(data: any) {
   const prtTotal = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
   const discount = Number(data.discount ?? 0);
   const gst      = Number(data.gstPercentage ?? 0);
-  const after    = svcTotal + prtTotal - discount;
+  // discount is a percentage (0-100), not a flat amount — matches the
+  // on-screen preview in ServiceLinesEditor.tsx.
+  const subtotal = svcTotal + prtTotal;
+  const after    = subtotal - (subtotal * discount) / 100;
   const created = await NativeQuotation.create({
     ...data,
     partsAmount:           prtTotal,
@@ -84,7 +104,9 @@ export async function updateQuotation(id: string, tenantId: string, data: any, s
     const gst       = Number(data.gstPercentage ?? (existing as any)?.gstPercentage ?? 0);
     const svcTotal  = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
     const prtTotal  = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-    const after     = svcTotal + prtTotal - discount;
+    // discount is a percentage (0-100), not a flat amount — matches createQuotation.
+    const subtotal  = svcTotal + prtTotal;
+    const after     = subtotal - (subtotal * discount) / 100;
     data.partsAmount           = prtTotal;
     data.servicesAmount        = after;
     data.servicesAmountWithTax = after + (after * gst) / 100;

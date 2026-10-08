@@ -133,6 +133,14 @@ export function applyDataScopeToFilter(
   ownerField: string,
   ownerTab?: 'my' | 'unassigned',
   ownStaffId?: string | null,
+  // LR-PERM-002: a Manager/Agent with no linked Staff profile (and, for a
+  // Manager, no managed Team either) has empty staffIds — {$in: []} then
+  // matches nothing for ANYONE, including records they created themselves.
+  // Pass the record's own createdBy field name here to OR that case back
+  // in, exactly like Contacts/Companies etc. already do via
+  // applyDataScopeToCreatedByFilter. Opt-in and unused by every existing
+  // caller, so nothing changes for them.
+  alsoMatchCreatedBy?: string,
 ): void {
   const scoped = !!scope && scope.kind !== 'all';
 
@@ -149,6 +157,13 @@ export function applyDataScopeToFilter(
   }
 
   if (!scope || scope.kind === 'all') return;
+  if (alsoMatchCreatedBy) {
+    filter.$or = [
+      { [ownerField]: { $in: scope.staffIds } },
+      { [alsoMatchCreatedBy]: { $in: scope.createdByUserIds } },
+    ];
+    return;
+  }
   filter[ownerField] = { $in: scope.staffIds };
 }
 

@@ -9,6 +9,7 @@ import { requireUnlocked } from '../record-lock/record-lock.middleware';
 const router = Router();
 
 router.get('/',       requirePermission('fs.quotations.view'),   ctrl.list);
+router.get('/filter-fields', requirePermission('fs.quotations.view'), ctrl.filterFields);
 router.post('/',      requirePermission('fs.quotations.create'), validate({ body: createQuotationSchema }),                    ctrl.create);
 router.get('/:id',    requirePermission('fs.quotations.view'),   validate({ params: idParam }),                                ctrl.getOne);
 router.put('/:id',    requirePermission('fs.quotations.edit'),   validate({ params: idParam, body: updateQuotationSchema }),  requireUnlocked('quotations'), ctrl.update);

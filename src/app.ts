@@ -126,11 +126,17 @@ if (config.app.env !== 'production') {
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 // The widget's own client script (leadryze-widget/'s build output, deployed
-// here) — served publicly, cached briefly. Not app-wide CORS-gated like
-// everything else in this file; a plain <script src="..."> tag load is
-// never subject to CORS in the first place (only the widget's own fetch()
-// calls to /public/widget/* are, handled by that module's own dynamic CORS).
-app.use('/widget', express.static(path.join(process.cwd(), 'public/widget'), { maxAge: '1h' }));
+// here) — served publicly. Not app-wide CORS-gated like everything else in
+// this file; a plain <script src="..."> tag load is never subject to CORS
+// in the first place (only the widget's own fetch() calls to
+// /public/widget/* are, handled by that module's own dynamic CORS).
+// Deliberately NO maxAge (was '1h' — confirmed live to silently serve a
+// stale cached bundle to a browser that had already loaded it once, even
+// well after a rebuild shipped real fixes) — express.static's default ETag
+// revalidation still makes a repeat load fast (a 304 with no body) while
+// guaranteeing every tenant site actually gets a changed bundle the moment
+// it ships, not up to an hour later.
+app.use('/widget', express.static(path.join(process.cwd(), 'public/widget')));
 
 // Health check
 app.get('/health', (_req, res) =>

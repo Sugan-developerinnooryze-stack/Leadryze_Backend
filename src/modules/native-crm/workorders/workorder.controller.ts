@@ -11,18 +11,31 @@ import {
   findNearestStaff,
   getWorkorderStats,
 } from './workorder.service';
+import { getWorkorderFilterCatalog } from './workorder.filter-catalog';
 import { logTimeline } from '../timeline/timeline.service';
 import { logAuditEvent } from '../../logs/audit-log.model';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { uploadToS3 } from '../../../services/s3.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../automation-rules/automation-rule.service';
-import { resolveEffectiveScope } from '../shared/data-scope';
+import { resolveEffectiveScope, resolveOwnStaffId } from '../shared/data-scope';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
-    const { items, total, page } = await listWorkorders(req.tenantId!, req.query, req.branchId, resolveEffectiveScope(req, 'workorders'));
+    const owner = req.query.owner as string | undefined;
+    const ownerTab = owner === 'my' || owner === 'unassigned' || owner === 'assigned' ? owner : undefined;
+    const ownStaffId = ownerTab === 'my' ? await resolveOwnStaffId(req.tenantId!, req.user!.userId) : null;
+    const { items, total, page } = await listWorkorders(req.tenantId!, { ...req.query, ownerTab } as any, req.branchId, resolveEffectiveScope(req, 'workorders'), ownStaffId);
     sendPaginated(res, items, total, page, Number(req.query.limit ?? 20));
+  } catch (err: any) {
+    sendError(res, err.message, 500);
+  }
+}
+
+export async function filterFields(req: AuthRequest, res: Response) {
+  try {
+    const catalog = await getWorkorderFilterCatalog(req.tenantId!, req.branchId);
+    sendSuccess(res, catalog);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

@@ -109,12 +109,13 @@ function totalsHtml(doc: any, label: string, cur: string): string {
   const disc = doc.discount       ?? 0;
   const gst  = doc.gstPercentage  ?? 0;
   const raw  = svc + prt;          // subtotal before discount
-  const sub  = raw - disc;         // after discount, before tax
+  const discAmt = raw * (disc / 100); // disc is a percentage (0-100), not a flat amount
+  const sub  = raw - discAmt;      // after discount, before tax
   const tot  = sub + sub * (gst / 100);
   return `
     <div class="totals-box">
       <div class="t-row"><span class="t-lbl">Subtotal</span><span>${fmt(raw, cur)}</span></div>
-      ${disc > 0 ? `<div class="t-row"><span class="t-lbl" style="color:#dc2626">Discount</span><span style="color:#dc2626">-${fmt(disc, cur)}</span></div>` : ''}
+      ${disc > 0 ? `<div class="t-row"><span class="t-lbl" style="color:#dc2626">Discount (${disc}%)</span><span style="color:#dc2626">-${fmt(discAmt, cur)}</span></div>` : ''}
       ${gst > 0  ? `<div class="t-row"><span class="t-lbl">GST (${gst}%)</span><span>${fmt(tot - sub, cur)}</span></div>` : ''}
       <div class="t-row grand"><span>${label}</span><span>${fmt(tot, cur)}</span></div>
     </div>`;
