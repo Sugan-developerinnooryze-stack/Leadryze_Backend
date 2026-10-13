@@ -7,8 +7,8 @@ import { PipelineModule } from '../pipeline-config/pipeline-config.model';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { getTemplateById, renderTemplate } from '../../templates/template.service';
 import { sendEmailNow } from '../../messages/brevo.service';
-import { sendSmsNow } from '../../messages/twilio.service';
-import { sendWhatsAppNow } from '../../messages/whatsapp.service';
+import { sendSmsNowDetailed } from '../../messages/twilio.service';
+import { sendWhatsAppNowDetailed } from '../../messages/whatsapp.service';
 import { writeLog } from '../../notifications/email-log.service';
 import { logger } from '../../../utils/logger';
 import {
@@ -24,8 +24,10 @@ import { Tenant } from '../../tenants/tenant.model';
 import { Branch } from '../branches/branch.model';
 import {
   decryptWebhookHeadersForExecution, redactWebhookHeadersForDisplay,
-  encryptWebhookSecrets, maskWebhookSecretsForRead,
+  encryptWebhookSecrets, maskWebhookSecretsForRead, isSensitiveHeaderName, MASKED_HEADER_PLACEHOLDER,
 } from './webhook-secret.util';
+import { generateRecordPdfBuffer } from '../pdf/pdf.controller';
+import { Recipient } from '../../notifications/recipient-resolver';
 import cronParser from 'cron-parser';
 
 /** "Advanced Mode" engine — see automation-flow.model.ts's top comment for
@@ -56,6 +58,50 @@ const RUN_TIMEOUT_MS = 30 * 60_000;
 const WEBHOOK_MAX_BODY_BYTES = 1_000_000; // 1 MB — request AND response body
 const WEBHOOK_MAX_RETRY_AFTER_MS = 120_000; // cap on how long a 429's Retry-After is honored
 
+/* ── Execution input/output logging — redacted and size-capped ───────────
+   One shared point for every processOneNode branch below to build the
+   new (additive) IFlowRunStep.input/output fields from data already in
+   scope at that call site, rather than duplicating the redaction/cap
+   logic per branch. Reuses isSensitiveHeaderName (webhook-secret.util.ts)
+   — the same list already trusted for webhook headers — plus a broader
+   name-pattern check for any record/payload field that merely LOOKS like
+   a credential, since input/output here can originate from arbitrary
+   tenant-defined field names, not just a fixed header vocabulary. */
+const SENSITIVE_FIELD_NAME_RE = /password|secret|token|api[-_]?key|authorization/i;
+const LOG_VALUE_MAX_CHARS = 4000; // per-field cap
+const LOG_OBJECT_MAX_KEYS = 50;
+
+function redactAndCapForLog(value: unknown, depth = 0): unknown {
+  if (value === null || value === undefined) return value;
+  if (depth > 3) return '[truncated: too deep]';
+  if (typeof value === 'string') {
+    return value.length > LOG_VALUE_MAX_CHARS ? `${value.slice(0, LOG_VALUE_MAX_CHARS)}… [truncated]` : value;
+  }
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, LOG_OBJECT_MAX_KEYS).map((v) => redactAndCapForLog(v, depth + 1));
+  }
+  const entries = Object.entries(value as Record<string, unknown>).slice(0, LOG_OBJECT_MAX_KEYS);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of entries) {
+    if (isSensitiveHeaderName(k) || SENSITIVE_FIELD_NAME_RE.test(k)) {
+      out[k] = MASKED_HEADER_PLACEHOLDER;
+    } else {
+      out[k] = redactAndCapForLog(v, depth + 1);
+    }
+  }
+  return out;
+}
+
+/** Thin convenience wrapper — redacts/caps both sides at once, used at
+ * every processOneNode log() call that now carries input/output. */
+function forLog(input: unknown, output: unknown): { input?: Record<string, unknown>; output?: Record<string, unknown> } {
+  return {
+    input:  input === undefined ? undefined : (redactAndCapForLog(input) as Record<string, unknown>),
+    output: output === undefined ? undefined : (redactAndCapForLog(output) as Record<string, unknown>),
+  };
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -64,6 +110,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       (err) => { clearTimeout(timer); reject(err); },
     );
   });
+}
+
+/** Tells a definite provider rejection apart from an outcome we genuinely
+ * can't confirm — used only for send_email/send_whatsapp/send_sms, where
+ * the distinction decides whether an automatic retry is safe (see the send
+ * branch below). Not used for withTimeout()'s other callers (create_linked_
+ * record, update_record, add_note, webhook_call) — those aren't "did this
+ * real-world message maybe already go out" risks, so this classification
+ * doesn't apply to them.
+ *
+ * `err.response === undefined` means no reply reached us at all — a
+ * connection reset, DNS failure, or axios's own request timeout
+ * (ECONNABORTED/ETIMEDOUT) firing before any response arrived. The provider
+ * may have still received and processed the request; we just never found
+ * out. A 502/503/504 means the provider's own upstream/gateway failed,
+ * which can also happen after it already accepted the request. Both count
+ * as ambiguous. Anything else with a real response (400/401/429/...) is the
+ * provider explicitly telling us no — a definite, safe-to-retry rejection,
+ * exactly as today. */
+export function classifySendError(err: unknown): { message: string; ambiguous: boolean } {
+  const axiosErr = err as { response?: { status?: number; data?: any }; message?: string; code?: string };
+  const status = axiosErr?.response?.status;
+  const body = axiosErr?.response?.data;
+  const bodyMessage = body?.message || body?.error?.message || body?.error_message;
+  if (axiosErr?.response === undefined) {
+    return { message: bodyMessage || axiosErr?.message || 'No response received from the provider', ambiguous: true };
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return { message: bodyMessage || `Provider returned ${status}`, ambiguous: true };
+  }
+  return { message: bodyMessage || axiosErr?.message || 'Send failed', ambiguous: false };
 }
 
 /* ── Structural validation (v1: branching TREE + flat fork→merge) ────────── */
@@ -86,7 +163,27 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * orphaned nodes. This function is the one place the current shape
  * assumption lives — relaxing it further later means editing this function,
  * not hunting through the executor. */
-function assertValidFlowShape(nodes: IFlowNode[], edges: IFlowEdge[]): void {
+// Collected by the save-time validators below and surfaced as one list —
+// "Cannot publish — N issues found" instead of stopping at the first
+// problem. Only the checks confirmed safe to run independently of each
+// other (see each function's own comment) ever push onto this instead of
+// throwing; the structural invariants everything else depends on (exactly
+// one trigger, unique ids, edges referencing real nodes, no cycles/orphans,
+// fork/merge topology) still throw immediately on the first problem, same
+// as before this existed — those aren't independent complaints about one
+// node, they're prerequisites later checks assume already hold (e.g.
+// `triggerNodes[0].id` below requires the one-trigger check to have already
+// passed; the reachability walk assumes edges only reference real nodes).
+export class FlowValidationError extends Error {
+  issues: string[];
+  constructor(issues: string[]) {
+    super(issues[0] ?? 'Validation failed');
+    this.name = 'FlowValidationError';
+    this.issues = issues;
+  }
+}
+
+function assertValidFlowShape(nodes: IFlowNode[], edges: IFlowEdge[], issues: string[]): void {
   const triggerNodes = nodes.filter((n) => n.type === 'trigger');
   if (triggerNodes.length !== 1) {
     throw new Error(`A flow must have exactly one trigger node (found ${triggerNodes.length})`);
@@ -110,22 +207,26 @@ function assertValidFlowShape(nodes: IFlowNode[], edges: IFlowEdge[]): void {
     inDegree.set(e.to, (inDegree.get(e.to) ?? 0) + 1);
   }
 
+  // Stage 2 — per-node content/port checks. Each is independent of every
+  // OTHER node's own check (nothing here reads a result from a previous
+  // iteration), so collecting every one instead of stopping at the first is
+  // safe — confirmed node by node below, not assumed.
   for (const n of nodes) {
     const outs = outEdges.get(n.id) ?? [];
     const nodeInDegree = inDegree.get(n.id) ?? 0;
 
     if (n.type === 'merge') {
-      if (nodeInDegree < 2) throw new Error(`Merge node "${n.id}" needs at least two incoming edges`);
-      if (outs.length > 1) throw new Error(`Merge node "${n.id}" has more than one outgoing edge`);
-      if (outs.some((e) => e.fromPort)) throw new Error(`Node "${n.id}" is a merge node — its outgoing edge cannot have a fromPort`);
+      if (nodeInDegree < 2) issues.push(`Merge node "${n.id}" needs at least two incoming edges`);
+      if (outs.length > 1) issues.push(`Merge node "${n.id}" has more than one outgoing edge`);
+      if (outs.some((e) => e.fromPort)) issues.push(`Node "${n.id}" is a merge node — its outgoing edge cannot have a fromPort`);
       continue;
     }
-    if (nodeInDegree > 1) throw new Error(`Node "${n.id}" has more than one incoming edge — only a merge node can`);
+    if (nodeInDegree > 1) issues.push(`Node "${n.id}" has more than one incoming edge — only a merge node can`);
 
     if (n.type === 'condition') {
       const ports = outs.map((e) => e.fromPort);
       if (ports.some((p) => p !== 'true' && p !== 'false')) {
-        throw new Error(`Condition node "${n.id}"'s outgoing edges must each be marked fromPort: 'true' or 'false'`);
+        issues.push(`Condition node "${n.id}"'s outgoing edges must each be marked fromPort: 'true' or 'false'`);
       }
     } else if (n.type === 'action') {
       // Error Branch: an action node EITHER has only untagged edges (today's
@@ -137,26 +238,26 @@ function assertValidFlowShape(nodes: IFlowNode[], edges: IFlowEdge[]): void {
       const ports = outs.map((e) => e.fromPort);
       const anyTagged = ports.some((p) => p !== undefined);
       if (anyTagged && ports.some((p) => p !== 'success' && p !== 'failure')) {
-        throw new Error(`Action node "${n.id}"'s outgoing edges must each be marked fromPort: 'success' or 'failure' (or left untagged)`);
+        issues.push(`Action node "${n.id}"'s outgoing edges must each be marked fromPort: 'success' or 'failure' (or left untagged)`);
       }
     } else if (n.type === 'delay') {
       // Structurally simple like a trigger — waits, then continues to
       // exactly one place, never branches, never forks (see this function's
       // own top comment for why delay is the one deliberate exception).
-      if (outs.length > 1) throw new Error(`Delay node "${n.id}" has more than one outgoing edge — delay nodes can't branch`);
-      if (outs.some((e) => e.fromPort)) throw new Error(`Node "${n.id}" is a delay node — its outgoing edge cannot have a fromPort`);
+      if (outs.length > 1) issues.push(`Delay node "${n.id}" has more than one outgoing edge — delay nodes can't branch`);
+      if (outs.some((e) => e.fromPort)) issues.push(`Node "${n.id}" is a delay node — its outgoing edge cannot have a fromPort`);
     } else if (n.type === 'subFlow') {
       // Same shape as delay — a single inline call, never branches, never
       // forks (see this file's top comment on why Sub-Flow's own execution,
       // like delay's, can't coexist with the pause/resume or fork mechanism).
-      if (outs.length > 1) throw new Error(`Sub-Flow node "${n.id}" has more than one outgoing edge — subFlow nodes can't branch`);
-      if (outs.some((e) => e.fromPort)) throw new Error(`Node "${n.id}" is a subFlow node — its outgoing edge cannot have a fromPort`);
+      if (outs.length > 1) issues.push(`Sub-Flow node "${n.id}" has more than one outgoing edge — subFlow nodes can't branch`);
+      if (outs.some((e) => e.fromPort)) issues.push(`Node "${n.id}" is a subFlow node — its outgoing edge cannot have a fromPort`);
     } else if (n.type === 'loop') {
       // Same shape as delay/subFlow — a Loop node's own execution is fully
       // synchronous within one processOneNode call, so it can't coexist with
       // pause/resume or fork mechanics either.
-      if (outs.length > 1) throw new Error(`Loop node "${n.id}" has more than one outgoing edge — loop nodes can't branch`);
-      if (outs.some((e) => e.fromPort)) throw new Error(`Node "${n.id}" is a loop node — its outgoing edge cannot have a fromPort`);
+      if (outs.length > 1) issues.push(`Loop node "${n.id}" has more than one outgoing edge — loop nodes can't branch`);
+      if (outs.some((e) => e.fromPort)) issues.push(`Node "${n.id}" is a loop node — its outgoing edge cannot have a fromPort`);
     } else if (n.type === 'approval') {
       // Stricter than a condition node's own "up to two" edges — a decision
       // gate is only meaningful with BOTH outcomes wired (an approval with
@@ -168,20 +269,25 @@ function assertValidFlowShape(nodes: IFlowNode[], edges: IFlowEdge[]): void {
       // duplicate on either port would make that lookup ambiguous.
       const ports = outs.map((e) => e.fromPort);
       if (outs.length !== 2) {
-        throw new Error(`Approval node "${n.id}" must have exactly two outgoing edges, tagged 'approve' and 'reject'`);
+        issues.push(`Approval node "${n.id}" must have exactly two outgoing edges, tagged 'approve' and 'reject'`);
       }
       if (ports.some((p) => p !== 'approve' && p !== 'reject')) {
-        throw new Error(`Approval node "${n.id}"'s outgoing edges must each be marked fromPort: 'approve' or 'reject'`);
+        issues.push(`Approval node "${n.id}"'s outgoing edges must each be marked fromPort: 'approve' or 'reject'`);
       }
       if (new Set(ports).size !== ports.length) {
-        throw new Error(`Approval node "${n.id}" has a duplicate fromPort — 'approve' and 'reject' may each appear at most once`);
+        issues.push(`Approval node "${n.id}" has a duplicate fromPort — 'approve' and 'reject' may each appear at most once`);
       }
     } else {
       // trigger — may now fan out too (Parallel + Merge), still never tagged.
-      if (outs.some((e) => e.fromPort)) throw new Error(`Node "${n.id}" is a trigger — its outgoing edge cannot have a fromPort`);
+      if (outs.some((e) => e.fromPort)) issues.push(`Node "${n.id}" is a trigger — its outgoing edge cannot have a fromPort`);
     }
   }
 
+  // Stage 1 again — the graph-topology invariants (trigger structure,
+  // reachability/cycles). Kept fail-fast, not accumulated: the reachability
+  // walk below is a single live computation, not N independent per-node
+  // checks — aborting it partway through on a cycle is correct, continuing
+  // it would risk an infinite loop or a misleading partial "orphans" list.
   const triggerId = triggerNodes[0].id;
   if ((inDegree.get(triggerId) ?? 0) !== 0) throw new Error('The trigger node cannot have an incoming edge');
 
@@ -297,47 +403,143 @@ function assertValidForkMergeShape(nodes: IFlowNode[], edges: IFlowEdge[]): void
    reimplemented small rather than exported — these are message-formatting
    helpers, not shared execution state) ────────────────────────────────── */
 
-async function assertValidNodes(tenantId: string, nodes: IFlowNode[]): Promise<void> {
+// Converted to accumulate (per the research backing plan item #8): every
+// check in this function is an independent complaint about one node, with
+// two local exceptions that still need to gate the check after them rather
+// than let it run on bad input — the branchIds malformed-id check must skip
+// the DB-ownership lookup for that same block, and create_linked_record's
+// missing-targetModule/missing-fieldMappings checks must skip the
+// catalog-lookup loop, which otherwise runs on an undefined module/empty
+// array. Both are handled below by only entering the dependent check when
+// the precondition held, mirroring how assertValidSubFlowHierarchy gates
+// its own target-lookup the same way.
+async function assertValidNodes(tenantId: string, nodes: IFlowNode[], issues: string[]): Promise<void> {
+  // Every action node is configured against the FLOW'S trigger module as
+  // its assumed record context — the same precedent the frontend already
+  // relies on (ActionNodeConfig.tsx passes the trigger's own field catalog
+  // as every action node's sourceFields, regardless of where that node sits
+  // in the graph, since there's no static way to know the true "current"
+  // module at an arbitrary point — see that file's own comment). Fetched at
+  // most once per call, not once per node, since every check below shares
+  // the same catalog.
+  const triggerModule = nodes.find((n) => n.type === 'trigger')?.module as PipelineModule | undefined;
+  let triggerCatalogPromise: ReturnType<typeof getFieldCatalog> | undefined;
+  const getTriggerCatalog = () => {
+    if (!triggerModule) return Promise.resolve([]);
+    if (!triggerCatalogPromise) triggerCatalogPromise = getFieldCatalog(tenantId, triggerModule);
+    return triggerCatalogPromise;
+  };
+
   for (const node of nodes) {
     if (node.type === 'trigger') {
-      if (!node.module) throw new Error('Trigger node is missing its module');
-      if ((node.triggerType ?? 'status_changed') === 'status_changed') {
-        if (!(await isValidStageKey(tenantId, node.module as PipelineModule, String(node.triggerStage)))) {
-          throw new Error(`"${node.triggerStage}" is not a valid stage for this tenant's ${node.module} pipeline`);
+      if (!node.module) {
+        issues.push('Trigger node is missing its module');
+      } else {
+        if ((node.triggerType ?? 'status_changed') === 'status_changed') {
+          if (!(await isValidStageKey(tenantId, node.module as PipelineModule, String(node.triggerStage)))) {
+            issues.push(`"${node.triggerStage}" is not a valid stage for this tenant's ${node.module} pipeline`);
+          }
         }
-      }
-      if (node.triggerType === 'record_updated') {
-        const catalog = await getFieldCatalog(tenantId, node.module as PipelineModule);
-        if (!catalog.some((f) => f.key === node.triggerField)) {
-          throw new Error(`"${node.triggerField}" is not a field on ${node.module}`);
+        if (node.triggerType === 'record_updated') {
+          const catalog = await getFieldCatalog(tenantId, node.module as PipelineModule);
+          if (!catalog.some((f) => f.key === node.triggerField)) {
+            issues.push(`"${node.triggerField}" is not a field on ${node.module}`);
+          }
         }
-      }
-      // Phase 6 — mirrors the existing rigor level for every other
-      // referenced-id field in this function (targetFlowId/loopSubFlowId,
-      // below/in assertValidSubFlowHierarchy): a stale or foreign branch id
-      // is rejected at save time, not silently saved as an unreachable
-      // scope. Zod already rejects branchIds on a webhook trigger before
-      // this ever runs (automation-flow.validation.ts), so no need to
-      // re-check that here.
-      if (node.branchIds && node.branchIds.length > 0) {
-        const validIds = node.branchIds.filter((id) => mongoose.isValidObjectId(id));
-        if (validIds.length !== node.branchIds.length) {
-          throw new Error(`Node "${node.id}": branchIds contains an invalid branch id`);
-        }
-        const count = await Branch.countDocuments({ _id: { $in: validIds }, tenantId: new mongoose.Types.ObjectId(tenantId) });
-        if (count !== node.branchIds.length) {
-          throw new Error(`Node "${node.id}": branchIds contains a branch that does not belong to this tenant`);
+        // Phase 6 — mirrors the existing rigor level for every other
+        // referenced-id field in this function (targetFlowId/loopSubFlowId,
+        // below/in assertValidSubFlowHierarchy): a stale or foreign branch id
+        // is rejected at save time, not silently saved as an unreachable
+        // scope. Zod already rejects branchIds on a webhook trigger before
+        // this ever runs (automation-flow.validation.ts), so no need to
+        // re-check that here.
+        if (node.branchIds && node.branchIds.length > 0) {
+          const validIds = node.branchIds.filter((id) => mongoose.isValidObjectId(id));
+          if (validIds.length !== node.branchIds.length) {
+            issues.push(`Node "${node.id}": branchIds contains an invalid branch id`);
+          } else {
+            const count = await Branch.countDocuments({ _id: { $in: validIds }, tenantId: new mongoose.Types.ObjectId(tenantId) });
+            if (count !== node.branchIds.length) {
+              issues.push(`Node "${node.id}": branchIds contains a branch that does not belong to this tenant`);
+            }
+          }
         }
       }
     } else if (node.actionType === 'create_linked_record') {
-      if (!node.targetModule) throw new Error(`Node "${node.id}": targetModule is required for create_linked_record`);
+      if (!node.targetModule) issues.push(`Node "${node.id}": targetModule is required for create_linked_record`);
       if (!node.fieldMappings || node.fieldMappings.length === 0) {
-        throw new Error(`Node "${node.id}": at least one field mapping is required for create_linked_record`);
+        issues.push(`Node "${node.id}": at least one field mapping is required for create_linked_record`);
       }
-      const catalog = await getFieldCatalog(tenantId, node.targetModule as PipelineModule);
+      if (node.targetModule && node.fieldMappings && node.fieldMappings.length > 0) {
+        const catalog = await getFieldCatalog(tenantId, node.targetModule as PipelineModule);
+        for (const m of node.fieldMappings) {
+          if (!catalog.some((f) => f.key === m.targetField)) {
+            issues.push(`Node "${node.id}": "${m.targetField}" is not a field on ${node.targetModule}`);
+          }
+        }
+      }
+    }
+
+    // Field mappings' SOURCE side — a deleted/renamed custom field left
+    // behind in a stale mapping would otherwise silently resolve to nothing
+    // at runtime rather than fail loudly. Generic across every action type
+    // that carries fieldMappings (create_linked_record's own TARGET field is
+    // already checked above against the target module instead — a
+    // different property, not a duplicate of this). Phase 2 (plan item #8's
+    // mapping-validation half).
+    if (node.fieldMappings && node.fieldMappings.length > 0) {
+      const catalog = await getTriggerCatalog();
       for (const m of node.fieldMappings) {
-        if (!catalog.some((f) => f.key === m.targetField)) {
-          throw new Error(`Node "${node.id}": "${m.targetField}" is not a field on ${node.targetModule}`);
+        if (m.sourceType !== 'field') continue;
+        if (!m.sourceField) {
+          issues.push(`Node "${node.id}": a field mapping is set to "From field" but no source field is selected`);
+        } else if (!catalog.some((f) => f.key === m.sourceField)) {
+          issues.push(`Node "${node.id}": field mapping references "${m.sourceField}", which is not a field on ${triggerModule ?? 'the trigger module'}`);
+        }
+      }
+    }
+
+    // Send Email/WhatsApp/SMS — recipient override mapping + inline
+    // {{token}} validity. Neither is enforced by Zod (fieldMappingSchema's
+    // sourceField/staticValue are both optional, and renderTemplate()
+    // leaves an unrecognized token untouched rather than erroring, so a
+    // typo'd variable would otherwise silently leak into the real message
+    // instead of failing at save time).
+    if (node.actionType === 'send_email' || node.actionType === 'send_whatsapp' || node.actionType === 'send_sms') {
+      const mapping = node.actionType === 'send_email' ? node.emailTo : node.actionType === 'send_whatsapp' ? node.whatsappTo : node.smsTo;
+      const mappingLabel = node.actionType === 'send_email' ? 'emailTo' : node.actionType === 'send_whatsapp' ? 'whatsappTo' : 'smsTo';
+      if (mapping) {
+        if (mapping.sourceType === 'field') {
+          if (!mapping.sourceField) {
+            issues.push(`Node "${node.id}": ${mappingLabel} is set to "From a field" but no field is selected`);
+          } else {
+            const catalog = await getTriggerCatalog();
+            if (!catalog.some((f) => f.key === mapping.sourceField)) {
+              issues.push(`Node "${node.id}": ${mappingLabel}'s source field "${mapping.sourceField}" is not a field on ${triggerModule ?? 'the trigger module'}`);
+            }
+          }
+        } else if (!mapping.staticValue?.trim()) {
+          issues.push(`Node "${node.id}": ${mappingLabel} is set to a fixed value, but it's empty`);
+        }
+      }
+
+      const templatedFields: [string, string | undefined][] = node.actionType === 'send_email'
+        ? [['emailSubject', node.emailSubject], ['emailBody', node.emailBody]]
+        : node.actionType === 'send_whatsapp'
+        ? [['whatsappBody', node.whatsappBody]]
+        : [['smsBody', node.smsBody]];
+      if (templatedFields.some(([, v]) => v)) {
+        const catalog = await getTriggerCatalog();
+        // Same base set buildVariables() always includes (automation-rule.
+        // service.ts), plus one `record.<key>` entry per real catalog field.
+        const resolvable = new Set(['name', 'status', 'title', 'id', 'company', 'today', ...catalog.map((f) => `record.${f.key}`)]);
+        for (const [fieldName, text] of templatedFields) {
+          if (!text) continue;
+          for (const match of text.matchAll(/\{\{([\w.]+)\}\}/g)) {
+            if (!resolvable.has(match[1])) {
+              issues.push(`Node "${node.id}": ${fieldName} references unknown variable "{{${match[1]}}}"`);
+            }
+          }
         }
       }
     }
@@ -346,22 +548,22 @@ async function assertValidNodes(tenantId: string, nodes: IFlowNode[]): Promise<v
     // API layer, but assertValidNodes is also called for direct
     // service-layer use, so it's re-checked here too.
     if (node.type !== 'action' && node.type !== 'loop' && (node.retryCount !== undefined || node.retryBackoffMs !== undefined)) {
-      throw new Error(`Node "${node.id}": retryCount/retryBackoffMs are only valid on action or loop nodes`);
+      issues.push(`Node "${node.id}": retryCount/retryBackoffMs are only valid on action or loop nodes`);
     }
     // Same reasoning for Delay's own field.
     if (node.type === 'delay' && node.delayMinutes === undefined) {
-      throw new Error(`Node "${node.id}": delay node requires delayMinutes`);
+      issues.push(`Node "${node.id}": delay node requires delayMinutes`);
     }
     if (node.type !== 'delay' && node.delayMinutes !== undefined) {
-      throw new Error(`Node "${node.id}": delayMinutes is only valid on delay nodes`);
+      issues.push(`Node "${node.id}": delayMinutes is only valid on delay nodes`);
     }
     // Same reasoning for Loop's own required fields.
     if (node.type === 'loop') {
-      if (!node.loopSourceModule) throw new Error(`Node "${node.id}": loop node requires loopSourceModule`);
-      if (!node.loopSubFlowId) throw new Error(`Node "${node.id}": loop node requires loopSubFlowId`);
-      if (node.loopMaxItems === undefined) throw new Error(`Node "${node.id}": loop node requires loopMaxItems`);
-      if (node.loopBatchSize === undefined) throw new Error(`Node "${node.id}": loop node requires loopBatchSize`);
-      if (node.loopConcurrency === undefined) throw new Error(`Node "${node.id}": loop node requires loopConcurrency`);
+      if (!node.loopSourceModule) issues.push(`Node "${node.id}": loop node requires loopSourceModule`);
+      if (!node.loopSubFlowId) issues.push(`Node "${node.id}": loop node requires loopSubFlowId`);
+      if (node.loopMaxItems === undefined) issues.push(`Node "${node.id}": loop node requires loopMaxItems`);
+      if (node.loopBatchSize === undefined) issues.push(`Node "${node.id}": loop node requires loopBatchSize`);
+      if (node.loopConcurrency === undefined) issues.push(`Node "${node.id}": loop node requires loopConcurrency`);
     }
   }
 }
@@ -384,17 +586,24 @@ async function assertValidNodes(tenantId: string, nodes: IFlowNode[]): Promise<v
  * already be referenced by anything, since nothing can know its _id yet):
  * if THIS flow (being saved) contains a subFlow/loop/delay/approval node, it
  * must NOT already be referenced as some OTHER flow's Sub-Flow/Loop target. */
-async function assertValidSubFlowHierarchy(tenantId: string, nodes: IFlowNode[], selfId?: string): Promise<void> {
+// Converted to accumulate (research: "largely mechanical") — the one local
+// dependency is the same shape as assertValidNodes' branchIds block: the
+// target-exists check must gate the target-shape check, since the latter
+// reads `target.nodes` and would crash on a null target.
+async function assertValidSubFlowHierarchy(tenantId: string, nodes: IFlowNode[], issues: string[], selfId?: string): Promise<void> {
   const tid = new mongoose.Types.ObjectId(tenantId);
 
   for (const node of nodes) {
     const calledFlowId = node.type === 'subFlow' ? node.targetFlowId : node.type === 'loop' ? node.loopSubFlowId : undefined;
     if (!calledFlowId) continue;
     const target = await AutomationFlow.findOne({ _id: calledFlowId, tenantId: tid }).lean();
-    if (!target) throw new Error(`Node "${node.id}": ${node.type === 'loop' ? 'loopSubFlowId' : 'targetFlowId'} "${calledFlowId}" does not exist`);
-    const targetHasRestrictedNode = (target.nodes ?? []).some((n) => n.type === 'subFlow' || n.type === 'loop' || n.type === 'delay' || n.type === 'approval');
-    if (targetHasRestrictedNode) {
-      throw new Error(`Node "${node.id}": the target flow "${target.name}" can't be used as a Sub-Flow — it contains a subFlow/loop/delay/approval node of its own, and a callee can't itself call, loop, pause, or wait on a decision`);
+    if (!target) {
+      issues.push(`Node "${node.id}": ${node.type === 'loop' ? 'loopSubFlowId' : 'targetFlowId'} "${calledFlowId}" does not exist`);
+    } else {
+      const targetHasRestrictedNode = (target.nodes ?? []).some((n) => n.type === 'subFlow' || n.type === 'loop' || n.type === 'delay' || n.type === 'approval');
+      if (targetHasRestrictedNode) {
+        issues.push(`Node "${node.id}": the target flow "${target.name}" can't be used as a Sub-Flow — it contains a subFlow/loop/delay/approval node of its own, and a callee can't itself call, loop, pause, or wait on a decision`);
+      }
     }
   }
 
@@ -405,9 +614,53 @@ async function assertValidSubFlowHierarchy(tenantId: string, nodes: IFlowNode[],
       $or: [{ 'nodes.targetFlowId': selfId }, { 'nodes.loopSubFlowId': selfId }],
     }).lean();
     if (referrer) {
-      throw new Error(`This flow is used as a Sub-Flow by "${referrer.name}" — a flow can't both contain a subFlow/loop/delay/approval node AND be referenced as someone else's Sub-Flow. Remove the reference in "${referrer.name}" first.`);
+      issues.push(`This flow is used as a Sub-Flow by "${referrer.name}" — a flow can't both contain a subFlow/loop/delay/approval node AND be referenced as someone else's Sub-Flow. Remove the reference in "${referrer.name}" first.`);
     }
   }
+}
+
+/** Single entry point for "is this flow allowed to be saved/published" —
+ * runs the four validators above in dependency order and combines every
+ * independent issue they found into one FlowValidationError, instead of
+ * the caller juggling four separate calls (and four separate try/catches)
+ * itself. `includeSubFlowHierarchy` is false for dryRunFlow, which doesn't
+ * persist anything, so the cross-flow reference checks (both directions)
+ * don't apply — matches dryRunFlow's existing call shape, which never
+ * called assertValidSubFlowHierarchy. */
+async function validateFlowOrThrow(
+  tenantId: string,
+  nodes: IFlowNode[],
+  edges: IFlowEdge[],
+  opts: { selfId?: string; includeSubFlowHierarchy: boolean }
+): Promise<void> {
+  const issues: string[] = [];
+
+  // Stage 1: structural invariants. Each of these two functions still
+  // throws on its own first problem — confirmed unsafe to accumulate (see
+  // their own comments) — so a throw here is reported alone, immediately,
+  // without waiting on the stage-2 checks below.
+  try {
+    assertValidFlowShape(nodes, edges, issues);
+  } catch (err) {
+    throw new FlowValidationError([(err as Error).message]);
+  }
+  try {
+    assertValidForkMergeShape(nodes, edges);
+  } catch (err) {
+    // Any stage-2 issues assertValidFlowShape already collected are real,
+    // independent complaints — report them alongside the fork/merge error
+    // rather than discarding them.
+    throw new FlowValidationError([...issues, (err as Error).message]);
+  }
+
+  // Stage 2: accumulate-capable, per-node content checks — only reached
+  // once the graph's basic structure is confirmed sound.
+  await assertValidNodes(tenantId, nodes, issues);
+  if (opts.includeSubFlowHierarchy) {
+    await assertValidSubFlowHierarchy(tenantId, nodes, issues, opts.selfId);
+  }
+
+  if (issues.length > 0) throw new FlowValidationError(issues);
 }
 
 /* ── CRUD ──────────────────────────────────────────────────────────────── */
@@ -434,10 +687,7 @@ export async function getFlowById(tenantId: string, id: string) {
 }
 
 export async function createFlow(tenantId: string, data: Partial<IAutomationFlow>) {
-  assertValidFlowShape(data.nodes ?? [], data.edges ?? []);
-  assertValidForkMergeShape(data.nodes ?? [], data.edges ?? []);
-  await assertValidNodes(tenantId, data.nodes ?? []);
-  await assertValidSubFlowHierarchy(tenantId, data.nodes ?? []);
+  await validateFlowOrThrow(tenantId, data.nodes ?? [], data.edges ?? [], { includeSubFlowHierarchy: true });
   const triggerNode = (data.nodes ?? []).find((n) => n.type === 'trigger');
   if (triggerNode?.triggerType === 'webhook') {
     triggerNode.webhookToken = await generateWebhookToken((t) => AutomationFlow.exists({ 'nodes.webhookToken': t }).then(Boolean));
@@ -474,10 +724,7 @@ export async function updateFlow(tenantId: string, id: string, data: Partial<IAu
     return result ? maskFlowSecretsForRead(result) : result;
   }
 
-  assertValidFlowShape(data.nodes, data.edges ?? []);
-  assertValidForkMergeShape(data.nodes, data.edges ?? []);
-  await assertValidNodes(tenantId, data.nodes);
-  await assertValidSubFlowHierarchy(tenantId, data.nodes, id);
+  await validateFlowOrThrow(tenantId, data.nodes, data.edges ?? [], { selfId: id, includeSubFlowHierarchy: true });
 
   const existing = await AutomationFlow.findOne({ _id: id, tenantId: tid }).lean();
   if (!existing) return null;
@@ -532,10 +779,7 @@ export async function publishFlow(tenantId: string, id: string) {
   if (!flow) return null;
   if (!flow.draft) throw new Error('This flow has no unpublished changes to publish');
 
-  assertValidFlowShape(flow.draft.nodes, flow.draft.edges);
-  assertValidForkMergeShape(flow.draft.nodes, flow.draft.edges);
-  await assertValidNodes(tenantId, flow.draft.nodes);
-  await assertValidSubFlowHierarchy(tenantId, flow.draft.nodes, id);
+  await validateFlowOrThrow(tenantId, flow.draft.nodes, flow.draft.edges, { selfId: id, includeSubFlowHierarchy: true });
 
   const published = await AutomationFlow.findOneAndUpdate(
     { _id: id, tenantId: tid },
@@ -568,6 +812,16 @@ export interface IDryRunStep {
   nodeType: string;
   label: string;
   result: string;
+  /** 'would-skip' flags a step dry-run determined would NOT actually fire
+   * for a real reason (no template, no resolvable recipient) — distinct
+   * from 'ok' so the frontend's flow diagram can render it visibly
+   * differently (amber, not green) instead of treating every reached step
+   * as uniformly successful. */
+  status: 'ok' | 'would-skip';
+  /** Only set on a condition node — which port was actually taken, so the
+   * frontend can highlight the real branch on the canvas instead of
+   * re-deriving it from the free-text `result`. */
+  branch?: 'true' | 'false';
 }
 
 /** Simulates a flow against one real sample record WITHOUT sending any
@@ -604,9 +858,7 @@ export async function dryRunFlow(
   const nodes = usingDraft ? flow.draft!.nodes : flow.nodes;
   const edges = usingDraft ? flow.draft!.edges : flow.edges;
 
-  assertValidFlowShape(nodes, edges);
-  assertValidForkMergeShape(nodes, edges);
-  await assertValidNodes(tenantId, nodes);
+  await validateFlowOrThrow(tenantId, nodes, edges, { includeSubFlowHierarchy: false });
 
   const triggerNode = nodes.find((n) => n.type === 'trigger');
   if (!triggerNode) throw new Error('Flow has no trigger node');
@@ -615,7 +867,7 @@ export async function dryRunFlow(
   if (!sampleRecord) throw new Error('Sample record not found');
 
   const steps: IDryRunStep[] = [{
-    nodeId: triggerNode.id, nodeType: 'trigger', label: describeNodeForLog(triggerNode), result: 'trigger fired (simulated)',
+    nodeId: triggerNode.id, nodeType: 'trigger', label: describeNodeForLog(triggerNode), result: 'trigger fired (simulated)', status: 'ok',
   }];
 
   const currentRecord = sampleRecord;
@@ -630,20 +882,20 @@ export async function dryRunFlow(
     if (!node) break;
 
     if (node.type === 'merge') {
-      steps.push({ nodeId: node.id, nodeType: 'merge', label: 'Merge', result: 'reached (branches not simulated independently in dry-run)' });
+      steps.push({ nodeId: node.id, nodeType: 'merge', label: 'Merge', result: 'reached (branches not simulated independently in dry-run)', status: 'ok' });
       cursorId = edges.find((e) => e.from === node.id)?.to;
       continue;
     }
 
     if (node.type === 'condition') {
       const result = evaluateConditionNode(currentRecord, node);
-      steps.push({ nodeId: node.id, nodeType: 'condition', label: describeNodeForLog(node), result: `evaluated to ${result}` });
+      steps.push({ nodeId: node.id, nodeType: 'condition', label: describeNodeForLog(node), result: `evaluated to ${result}`, status: 'ok', branch: result ? 'true' : 'false' });
       cursorId = edges.find((e) => e.from === node.id && e.fromPort === (result ? 'true' : 'false'))?.to;
       continue;
     }
 
     if (node.type === 'delay') {
-      steps.push({ nodeId: node.id, nodeType: 'delay', label: describeNodeForLog(node), result: `would pause for ${node.delayMinutes} minute(s)` });
+      steps.push({ nodeId: node.id, nodeType: 'delay', label: describeNodeForLog(node), result: `would pause for ${node.delayMinutes} minute(s)`, status: 'ok' });
       cursorId = edges.find((e) => e.from === node.id)?.to;
       continue;
     }
@@ -653,13 +905,14 @@ export async function dryRunFlow(
       steps.push({
         nodeId: node.id, nodeType: 'approval', label: describeNodeForLog(node),
         result: recipient?.email ? `would pause for approval, notifying ${recipient.email}` : 'would pause for approval — no resolvable recipient to notify',
+        status: recipient?.email ? 'ok' : 'would-skip',
       });
       break; // a real run genuinely stops here too, pending a decision
     }
 
     if (node.type === 'subFlow') {
       const target = await AutomationFlow.findOne({ _id: node.targetFlowId, tenantId: tid }).select('name').lean();
-      steps.push({ nodeId: node.id, nodeType: 'subFlow', label: describeNodeForLog(node), result: `would invoke Sub-Flow "${target?.name ?? node.targetFlowId}" (not simulated further)` });
+      steps.push({ nodeId: node.id, nodeType: 'subFlow', label: describeNodeForLog(node), result: `would invoke Sub-Flow "${target?.name ?? node.targetFlowId}" (not simulated further)`, status: 'ok' });
       cursorId = edges.find((e) => e.from === node.id)?.to;
       continue;
     }
@@ -672,6 +925,7 @@ export async function dryRunFlow(
       steps.push({
         nodeId: node.id, nodeType: 'loop', label: describeNodeForLog(node),
         result: `would process up to ${Math.min(matched, capped)} matching item(s)${matched > capped ? ` (${matched - capped}+ more matched but capped)` : ''} via Sub-Flow (not simulated further)`,
+        status: 'ok',
       });
       cursorId = edges.find((e) => e.from === node.id)?.to;
       continue;
@@ -686,7 +940,7 @@ export async function dryRunFlow(
       }
       steps.push({
         nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
-        result: `would create a ${node.targetModule} record with: ${JSON.stringify(payload)}`,
+        result: `would create a ${node.targetModule} record with: ${JSON.stringify(payload)}`, status: 'ok',
       });
       // currentRecord/currentModule deliberately NOT advanced to the
       // would-be-created record — nothing real exists to hand to a
@@ -700,7 +954,7 @@ export async function dryRunFlow(
       }
       steps.push({
         nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
-        result: `would update this ${currentModule} record with: ${JSON.stringify(payload)}`,
+        result: `would update this ${currentModule} record with: ${JSON.stringify(payload)}`, status: 'ok',
       });
       // currentRecord/currentModule NOT mutated — same "don't fabricate a
       // result nothing real produced" reasoning as create_linked_record above.
@@ -709,7 +963,7 @@ export async function dryRunFlow(
       const noteVariables = buildVariables(currentRecord, '', triggerNode.triggerStage ?? '', noteCatalog);
       steps.push({
         nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
-        result: `would add a note: "${renderTemplate(node.noteSubject ?? '', noteVariables)}"`,
+        result: `would add a note: "${renderTemplate(node.noteSubject ?? '', noteVariables)}"`, status: 'ok',
       });
     } else if (node.actionType === 'webhook_call') {
       // Deliberately never resolves DNS or calls resolveAndPinSafeUrl here —
@@ -724,24 +978,46 @@ export async function dryRunFlow(
       const redactedHeaders = redactWebhookHeadersForDisplay(node.webhookHeaders ?? []);
       steps.push({
         nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
-        result: `would ${node.webhookMethod ?? 'POST'} to ${node.webhookUrl} with headers ${JSON.stringify(redactedHeaders)} and body: ${JSON.stringify(payload)}`,
+        result: `would ${node.webhookMethod ?? 'POST'} to ${node.webhookUrl} with headers ${JSON.stringify(redactedHeaders)} and body: ${JSON.stringify(payload)}`, status: 'ok',
       });
     } else {
+      // Mirrors processOneNode's own send_email/send_whatsapp/send_sms
+      // branch exactly (inline body takes priority over a saved template;
+      // an emailTo/whatsappTo/smsTo mapping overrides recipientStrategy
+      // when set) — this used to only know about the template/strategy
+      // path, so a node using the newer inline-content fields (#2/#3) was
+      // always misreported as "would be skipped — template not found" even
+      // though a real run would successfully send it. Still performs ZERO
+      // real network activity — resolves what WOULD be sent, never calls
+      // sendEmailNow/sendWhatsAppNow/sendSmsNow.
       const channel: 'email' | 'sms' | 'whatsapp' =
         node.actionType === 'send_email' ? 'email' : node.actionType === 'send_whatsapp' ? 'whatsapp' : 'sms';
-      const template = node.templateId ? await getTemplateById(tenantId, node.templateId) : null;
-      if (!template) {
-        steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: 'would be skipped — template not found' });
+      const inlineBody =
+        node.actionType === 'send_email' ? node.emailBody :
+        node.actionType === 'send_whatsapp' ? node.whatsappBody : node.smsBody;
+      const template = !inlineBody && node.templateId ? await getTemplateById(tenantId, node.templateId) : null;
+      if (!inlineBody && !template) {
+        steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: 'would be skipped — template not found', status: 'would-skip' });
       } else {
-        const recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.recipientStrategy ?? 'record_contact');
+        const overrideMapping =
+          node.actionType === 'send_email' ? node.emailTo :
+          node.actionType === 'send_whatsapp' ? node.whatsappTo : node.smsTo;
+        let recipient: Recipient | null;
+        if (overrideMapping) {
+          const raw = overrideMapping.sourceType === 'static' ? overrideMapping.staticValue : readSourceField(currentRecord, overrideMapping.sourceField!);
+          const value = raw ? String(raw) : '';
+          recipient = value ? { email: channel === 'email' ? value : undefined, phone: channel !== 'email' ? value : undefined, name: '' } : null;
+        } else {
+          recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.recipientStrategy ?? 'record_contact');
+        }
         if (!recipient || (channel === 'email' && !recipient.email) || (channel !== 'email' && !recipient.phone)) {
-          steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: 'would be skipped — no resolvable recipient' });
+          steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: 'would be skipped — no resolvable recipient', status: 'would-skip' });
         } else {
           const catalog = await getFieldCatalog(tenantId, currentModule);
           const variables = buildVariables(currentRecord, recipient.name, triggerNode.triggerStage ?? '', catalog);
-          const body = renderTemplate(template.body, variables).replace(/<[^>]+>/g, ' ').trim().slice(0, 200);
+          const body = renderTemplate(inlineBody || template!.body, variables).replace(/<[^>]+>/g, ' ').trim().slice(0, 200);
           const to = channel === 'email' ? recipient.email : recipient.phone;
-          steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: `would send ${channel} to ${to}: ${body}` });
+          steps.push({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), result: `would send ${channel} to ${to}: ${body}`, status: 'ok' });
         }
       }
     }
@@ -820,6 +1096,23 @@ export async function getFlowRunStats(tenantId: string) {
         ],
         todaySummary: [
           { $match: { startedAt: { $gte: startOfToday } } },
+          // A run survives its flow's deletion on purpose (flowSnapshot
+          // preserves that run's own diagram for audit/history — see
+          // AutomationFlowRun's own doc comment) — but that means without
+          // this $lookup, a tenant who deletes an old flow after it's run a
+          // few times today would see "Total Automations" correctly drop
+          // while "Runs Today"/"Failed Today" kept counting runs from a flow
+          // that no longer exists, a real, confusing, reproducible mismatch
+          // (confirmed live: 0 flows, 20 "runs today", all 20 orphaned).
+          // Scoped to this one dashboard roll-up only — an individual run's
+          // own detail view (Executions tab, flowSnapshot diagram) is
+          // untouched and still correctly shows orphaned-flow runs; this
+          // only keeps them out of the top-line counts next to a flow list
+          // that no longer includes them.
+          { $lookup: {
+              from: 'native_automation_flows', localField: 'flowId', foreignField: '_id', as: '_flow',
+          } },
+          { $match: { '_flow.0': { $exists: true } } },
           { $group: {
               _id: null,
               runsToday:      { $sum: 1 },
@@ -1066,10 +1359,17 @@ async function processOneNode(
     const result = evaluateConditionNode(currentRecord, node);
     const port = result ? 'true' : 'false';
     const finishedAt = new Date();
+    // The real field value(s) this condition actually read, not just the
+    // static config text describeNodeForLog() already captures — this is
+    // what makes the Data tab's "input" meaningful for a condition node.
+    const conditionInput = Object.fromEntries(
+      (node.conditions ?? []).map((c) => [c.field, readSourceField(currentRecord, c.field)]),
+    );
     await log({
       nodeId: node.id, nodeType: 'condition', label: describeNodeForLog(node),
       status: 'success', startedAt: stepStart, finishedAt, durationMs: finishedAt.getTime() - stepStart.getTime(),
       result: String(result),
+      ...forLog(conditionInput, { result, branch: port }),
     });
     await writeLog({
       tenantId, channel: 'system', kind: 'automation', sourceModule: currentModule,
@@ -1312,6 +1612,7 @@ async function processOneNode(
       nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
       status: 'success', startedAt: stepStart, finishedAt: successAt, durationMs: successAt.getTime() - stepStart.getTime(),
       result: sourceIdentifierOf(created), createdRecordModule: node.targetModule, createdRecordId: sourceIdentifierOf(created),
+      ...forLog(payload, created),
     });
 
     // Same reasoning as automation-rule.service.ts's runCreateLinkedRecordAction:
@@ -1389,6 +1690,7 @@ async function processOneNode(
       nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
       status: 'success', startedAt: stepStart, finishedAt: successAt, durationMs: successAt.getTime() - stepStart.getTime(),
       result: sourceIdentifierOf(updated), createdRecordModule: currentModule, createdRecordId: sourceIdentifierOf(updated),
+      ...forLog(payload, updated),
     });
 
     // updateDeal/updateLead/etc, like createDeal/createLead, don't self-fire
@@ -1434,31 +1736,38 @@ async function processOneNode(
     const noteVariables = buildVariables(currentRecord, '', toStage, noteCatalog);
     let ok = false;
     let sendResult = '';
+    // Mirrors create_linked_record/update_record's own forLog(payload,
+    // created) pattern exactly — add_note genuinely creates a real record
+    // with real rendered content just like those two, so it should carry
+    // the same real input/output into IFlowRunStep, not just a summary
+    // string. (Confirmed missing live: a successful add_note step's detail
+    // panel showed only "note ... added," no input/output section at all,
+    // unlike its sibling action types.)
+    let noteInput: Record<string, unknown> = {};
+    let noteOutput: Record<string, unknown> | undefined;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const attemptStart = new Date();
       try {
         const { createActivity } = await import('../activities/activity.service');
-        const created = await withTimeout(createActivity({
-          tenantId,
-          type: 'note',
+        noteInput = {
           subject: renderTemplate(node.noteSubject ?? '', noteVariables),
           description: node.noteBody ? renderTemplate(node.noteBody, noteVariables) : undefined,
-          relatedModule: currentModule,
-          relatedId: sourceId,
-          assignedTo: node.noteAssignedTo,
-        }), ACTION_TIMEOUT_MS, 'add_note');
+          relatedModule: currentModule, relatedId: sourceId, assignedTo: node.noteAssignedTo,
+        };
+        const created = await withTimeout(createActivity({ tenantId, type: 'note', ...noteInput } as any), ACTION_TIMEOUT_MS, 'add_note');
         ok = true;
-        sendResult = `note ${String((created as any).activityId ?? (created as any)._id)} added`;
+        noteOutput = { activityId: String((created as any).activityId ?? (created as any)._id) };
+        sendResult = `note ${noteOutput.activityId} added`;
       } catch (err) {
         ok = false;
         sendResult = (err as Error).message;
       }
       const finishedAt = new Date();
       if (ok) {
-        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), result: sendResult, ...(stampAttempt ? { attempt } : {}) });
+        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), result: sendResult, ...(stampAttempt ? { attempt } : {}), ...forLog(noteInput, noteOutput) });
         break;
       }
-      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), error: sendResult, ...(stampAttempt ? { attempt } : {}) });
+      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), error: sendResult, ...(stampAttempt ? { attempt } : {}), ...forLog(noteInput, undefined) });
       if (attempt < maxAttempts && backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
     }
     if (!ok) {
@@ -1494,6 +1803,8 @@ async function processOneNode(
       const attemptStart = new Date();
       let httpStatus: number | undefined;
       let retryAfterMs: number | undefined;
+      let responseData: unknown;
+      let requestHeaders: Record<string, string> = {};
       try {
         // Authoritative check immediately before every actual call
         // (including every retry) — DNS can legitimately change between a
@@ -1507,6 +1818,7 @@ async function processOneNode(
           throw new Error('This webhook URL is not allowed');
         }
         const decryptedHeaders = decryptWebhookHeadersForExecution(node.webhookHeaders ?? []);
+        requestHeaders = decryptedHeaders;
         const response = await axios.request({
           method, url: node.webhookUrl, data: payload,
           headers: { ...decryptedHeaders, 'X-LeadRyze-Idempotency-Key': idempotencyKey },
@@ -1517,6 +1829,7 @@ async function processOneNode(
           validateStatus: () => true, // classify below ourselves, don't let axios throw on non-2xx
         });
         httpStatus = response.status;
+        responseData = response.data;
         if (httpStatus >= 200 && httpStatus < 300) {
           ok = true;
           sendResult = `HTTP ${httpStatus} from ${node.webhookUrl}`;
@@ -1535,11 +1848,15 @@ async function processOneNode(
       }
 
       const finishedAt = new Date();
+      const webhookLogFields = forLog(
+        { method, url: node.webhookUrl, headers: requestHeaders, body: payload },
+        httpStatus !== undefined ? { status: httpStatus, body: responseData } : undefined,
+      );
       if (ok) {
-        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), result: sendResult, ...(stampAttempt ? { attempt } : {}) });
+        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), result: sendResult, ...(stampAttempt ? { attempt } : {}), ...webhookLogFields });
         break;
       }
-      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), error: sendResult, ...(stampAttempt ? { attempt } : {}) });
+      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(), error: sendResult, ...(stampAttempt ? { attempt } : {}), ...webhookLogFields });
 
       // Retry classification — the one action type that doesn't just
       // always retry: a permanent client error (4xx other than 408/429)
@@ -1571,23 +1888,52 @@ async function processOneNode(
   } else {
     const channel: 'email' | 'sms' | 'whatsapp' =
       node.actionType === 'send_email' ? 'email' : node.actionType === 'send_whatsapp' ? 'whatsapp' : 'sms';
-    const template = await getTemplateById(tenantId, node.templateId!);
-    if (!template) {
-      // Terminal — a missing template can't fix itself mid-run, so this
-      // never consumes a retry attempt, exactly as before Retry existed.
-      // Error Branch: still a genuine failure of this node, so it follows
-      // failure edge(s) if any exist, same as an exhausted-retry failure.
-      await writeLog({ tenantId, channel, kind: 'automation', sourceModule: currentModule, sourceId, status: 'skipped', errorMessage: `Flow "${flow.name}" node "${node.id}": template not found` });
-      hadSkip = true;
-      const finishedAt = new Date();
-      await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'skipped', startedAt: stepStart, finishedAt, durationMs: finishedAt.getTime() - stepStart.getTime(), result: 'skipped: template not found' });
-      const failIds = failureIds();
-      if (failIds.length > 0) {
-        return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip }, nextIds: failIds };
+    // Inline Subject/Body composition (automation-flow.model.ts's own
+    // comment on emailBody/whatsappBody/smsBody) takes precedence over a
+    // saved Template when both are present — a saved template stays the
+    // simpler default path, unchanged, for every node that doesn't set
+    // one of these new fields. Zod already guarantees at least one of
+    // {templateId, the matching inline body} is present (lockstep check).
+    const inlineBody =
+      node.actionType === 'send_email' ? node.emailBody :
+      node.actionType === 'send_whatsapp' ? node.whatsappBody : node.smsBody;
+    let template: { body: string; subject?: string } | null = null;
+    if (!inlineBody) {
+      template = await getTemplateById(tenantId, node.templateId!);
+      if (!template) {
+        // Terminal — a missing template can't fix itself mid-run, so this
+        // never consumes a retry attempt, exactly as before Retry existed.
+        // Error Branch: still a genuine failure of this node, so it follows
+        // failure edge(s) if any exist, same as an exhausted-retry failure.
+        await writeLog({ tenantId, channel, kind: 'automation', sourceModule: currentModule, sourceId, status: 'skipped', errorMessage: `Flow "${flow.name}" node "${node.id}": template not found` });
+        hadSkip = true;
+        const finishedAt = new Date();
+        await log({ nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node), status: 'skipped', startedAt: stepStart, finishedAt, durationMs: finishedAt.getTime() - stepStart.getTime(), result: 'skipped: template not found' });
+        const failIds = failureIds();
+        if (failIds.length > 0) {
+          return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip }, nextIds: failIds };
+        }
+        outcome = 'failure';
       }
-      outcome = 'failure';
-    } else {
-      const recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.recipientStrategy ?? 'record_contact');
+    }
+    if (template !== null || inlineBody) {
+      // Recipient: an explicit emailTo/whatsappTo/smsTo mapping (any
+      // field, static or record-sourced) overrides the fixed
+      // recipientStrategy list when set — same single-mapping shape
+      // assign_record/change_status already use. Falls back to the
+      // existing strategy-based resolution exactly as before this field
+      // existed when absent.
+      const overrideMapping =
+        node.actionType === 'send_email' ? node.emailTo :
+        node.actionType === 'send_whatsapp' ? node.whatsappTo : node.smsTo;
+      let recipient: Recipient | null;
+      if (overrideMapping) {
+        const raw = overrideMapping.sourceType === 'static' ? overrideMapping.staticValue : readSourceField(currentRecord, overrideMapping.sourceField!);
+        const value = raw ? String(raw) : '';
+        recipient = value ? { email: channel === 'email' ? value : undefined, phone: channel !== 'email' ? value : undefined, name: '' } : null;
+      } else {
+        recipient = await resolveAutomationRecipient(tenantId, currentModule, currentRecord, node.recipientStrategy ?? 'record_contact');
+      }
       if (!recipient || (channel === 'email' && !recipient.email) || ((channel === 'sms' || channel === 'whatsapp') && !recipient.phone)) {
         // Terminal, same reasoning as a missing template — also eligible
         // for failure edge(s).
@@ -1603,33 +1949,57 @@ async function processOneNode(
       } else {
         const sendCatalog = await getFieldCatalog(tenantId, currentModule);
         const variables = buildVariables(currentRecord, recipient.name, toStage, sendCatalog);
-        const body = renderTemplate(template.body, variables);
+        const body = renderTemplate(inlineBody || template!.body, variables);
 
         let ok = false;
+        let ambiguous = false;
         let sendResult = '';
+        let sendInput: Record<string, unknown> = {};
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptStart = new Date();
           try {
             if (node.actionType === 'send_email') {
-              const subject = renderTemplate(template.subject || `Update: ${variables.title || variables.id}`, variables);
-              const messageId = await withTimeout(sendEmailNow({ to: recipient.email!, toName: recipient.name, subject, htmlContent: body }), ACTION_TIMEOUT_MS, 'send_email');
+              const subject = renderTemplate(node.emailSubject || template?.subject || `Update: ${variables.title || variables.id}`, variables);
+              const cc = node.emailCc ? node.emailCc.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+              const bcc = node.emailBcc ? node.emailBcc.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+              let attachment: { name: string; content: string }[] | undefined;
+              if (node.emailAttachPdf) {
+                const pdf = await generateRecordPdfBuffer(currentModule, sourceId, tenantId).catch(() => null);
+                if (pdf) attachment = [{ name: pdf.filename, content: pdf.buffer.toString('base64') }];
+              }
+              sendInput = { to: recipient.email, cc, bcc, replyTo: node.emailReplyTo, subject, body };
+              // No withTimeout race here (unlike other action types above) —
+              // sendEmailNow/sendWhatsAppNowDetailed/sendSmsNowDetailed each
+              // already carry their own axios-level timeout (15s), shorter
+              // than ACTION_TIMEOUT_MS, so an outer race would never be the
+              // one to fire first — it would only add a second, independent
+              // timer that (unlike the real call) doesn't abort anything,
+              // meaning a retry could start while the original request is
+              // still genuinely in flight. Awaiting the real call directly
+              // guarantees this attempt's own request always fully settles
+              // (resolves or rejects) before any next attempt can begin.
+              const messageId = await sendEmailNow({ to: recipient.email!, toName: recipient.name, subject, htmlContent: body, cc, bcc, replyTo: node.emailReplyTo, attachment });
               ok = !!messageId;
               sendResult = ok ? `sent to ${recipient.email}` : 'email channel not configured';
               if (ok) await writeLog({ tenantId, channel: 'email', kind: 'automation', sourceModule: currentModule, sourceId, recipientName: recipient.name, recipientEmail: recipient.email, subject, bodyPreview: body.replace(/<[^>]+>/g, ' '), status: 'sent', providerMessageId: messageId ?? undefined });
             } else if (node.actionType === 'send_whatsapp') {
-              const messageId = await withTimeout(sendWhatsAppNow(recipient.phone!, body), ACTION_TIMEOUT_MS, 'send_whatsapp');
+              sendInput = { to: recipient.phone, body };
+              const messageId = await sendWhatsAppNowDetailed(recipient.phone!, body);
               ok = !!messageId;
               sendResult = ok ? `sent to ${recipient.phone}` : 'WhatsApp not configured';
               if (ok) await writeLog({ tenantId, channel: 'whatsapp', kind: 'automation', sourceModule: currentModule, sourceId, recipientName: recipient.name, recipientPhone: recipient.phone, bodyPreview: body, status: 'sent', providerMessageId: messageId ?? undefined });
             } else {
-              const sid = await withTimeout(sendSmsNow({ to: recipient.phone!, body }), ACTION_TIMEOUT_MS, 'send_sms');
+              sendInput = { to: recipient.phone, body };
+              const sid = await sendSmsNowDetailed({ to: recipient.phone!, body });
               ok = !!sid;
               sendResult = ok ? `sent to ${recipient.phone}` : 'SMS send failed or not configured';
               if (ok) await writeLog({ tenantId, channel: 'sms', kind: 'automation', sourceModule: currentModule, sourceId, recipientName: recipient.name, recipientPhone: recipient.phone, bodyPreview: body, status: 'sent', providerMessageId: sid ?? undefined });
             }
           } catch (err) {
             ok = false;
-            sendResult = (err as Error).message;
+            const classified = classifySendError(err);
+            sendResult = classified.message;
+            ambiguous = classified.ambiguous;
           }
 
           const finishedAt = new Date();
@@ -1638,6 +2008,23 @@ async function processOneNode(
               nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
               status: 'success', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(),
               result: sendResult, variables, ...(stampAttempt ? { attempt } : {}),
+              ...forLog(sendInput, { result: sendResult }),
+            });
+            break;
+          }
+          if (ambiguous) {
+            // Not safe to auto-retry — none of Brevo/Meta/Twilio are known
+            // to support a client-supplied idempotency key for this kind of
+            // send, so a second attempt here risks genuinely duplicating a
+            // message the provider may have already sent. Recorded as its
+            // own status rather than forced into success or failure, and
+            // the loop stops here regardless of retryCount/maxAttempts.
+            await log({
+              nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
+              status: 'unknown', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(),
+              error: `Delivery outcome unknown — ${sendResult}. The provider's response was lost or timed out; LeadRyze cannot confirm whether this message was actually sent. Check your ${channel} provider's own dashboard/logs before manually resending.`,
+              ...(stampAttempt ? { attempt } : {}),
+              ...forLog(sendInput, undefined),
             });
             break;
           }
@@ -1645,8 +2032,21 @@ async function processOneNode(
             nodeId: node.id, nodeType: 'action', label: describeNodeForLog(node),
             status: 'failed', startedAt: attemptStart, finishedAt, durationMs: finishedAt.getTime() - attemptStart.getTime(),
             error: sendResult, ...(stampAttempt ? { attempt } : {}),
+            ...forLog(sendInput, undefined),
           });
           if (attempt < maxAttempts && backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
+        }
+
+        if (ambiguous) {
+          // Per product decision: don't follow the success edge (would
+          // falsely imply confirmed-sent) or the failure edge (would falsely
+          // imply confirmed-not-sent) when the outcome can't be confirmed —
+          // dead-end this branch, same "nextIds: []" mechanism an orphaned
+          // node already uses, with hadSkip so the run still correctly ends
+          // 'partial' rather than 'completed'.
+          hadSkip = true;
+          await writeLog({ tenantId, channel, kind: 'automation', sourceModule: currentModule, sourceId, status: 'skipped', errorMessage: sendResult, recipientName: recipient.name, recipientEmail: channel === 'email' ? recipient.email : undefined, recipientPhone: channel !== 'email' ? recipient.phone : undefined }).catch(() => {});
+          return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip }, nextIds: [] };
         }
 
         if (!ok) {

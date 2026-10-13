@@ -9,6 +9,8 @@ import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { runAutomations } from '../automation-rules/automation-rule.service';
 
+import { indexNativeSearchRecord } from '../shared/search-index';
+
 const CONTACT_SOURCE_MAP: Record<string, string> = {
   website: 'website', referral: 'referral', social: 'social',
   email: 'email', landing_page: 'website', google: 'website',
@@ -33,6 +35,8 @@ export async function convertLeadToContact(
   // so the information survives the conversion. Lead's PII fields are
   // encrypted at rest (see pii.service.ts) — getLeadRaw() returns the raw
   // document, so decrypt before embedding as plain text.
+  // LR-CONTACT-004: email/phone must also be decrypted so contactSchema.pre('save')
+  // encrypts them fresh and derives the blind-index search fields (emailSearch/phoneSearch).
   const plain = (v?: string | null) => (v && isEncrypted(v)) ? decrypt(v) : (v ?? '');
   const extra: string[] = [];
   const mobilePlain = plain(lead.mobile);
@@ -46,8 +50,8 @@ export async function convertLeadToContact(
     tenantId,
     firstName:      lead.firstName,
     lastName:       lead.lastName || '',
-    email:          lead.email || '',
-    phone:          lead.phone || lead.mobile || '',
+    email:          plain(lead.email) || '',
+    phone:          plain(lead.phone || lead.mobile) || '',
     company:        lead.company,
     jobTitle:       lead.designation,
     source:         CONTACT_SOURCE_MAP[lead.source] ?? 'other',
@@ -56,10 +60,14 @@ export async function convertLeadToContact(
     notes,
     tags:           lead.tags ?? [],
     leadId:         lead._id.toString(),
+    // LR-CONVERT-003: Auto-carries the Lead's own owner forward to the converted
+    // Contact so the owner is preserved and the contact appears in their My Contacts tab.
+    contactOwner:   lead.leadOwnerStaffId || '',
     createdBy:      performedBy,
   });
 
   const name = [lead.firstName, lead.lastName].filter(Boolean).join(' ');
+  indexNativeSearchRecord(tenantId.toString(), 'native', 'contacts', contact.toObject(), name);
   lead.contactId      = contact._id.toString();
   lead.lastActivityAt = new Date();
   (lead.conversionHistory as any[]).push({ type: 'contact', entityId: contact._id.toString(), name, createdAt: new Date(), createdBy: performedBy });
@@ -69,12 +77,12 @@ export async function convertLeadToContact(
   // was created with no Contact to point to yet (contactId: '') — link it
   // up now rather than leaving the two permanently disconnected.
   if (lead.opportunityId) {
-    await Deal.updateOne({ _id: lead.opportunityId, tenantId }, { $set: { contactId: contact._id.toString() } });
+    await Deal.updateOne({ _id: lead.opportunityId, tenantId }, { $set: { contactId: contact._id.toString(), contactName: name } });
   }
 
   logTimeline(tenantId, 'leads', lead._id.toString(), 'status_changed',
-    `Converted to Contact: ${name}`, performedBy,
-    { type: 'contact', entityId: contact._id.toString() },
+    `Contact ${name} created`, performedBy,
+    { type: 'contact', name },
   ).catch(() => {});
 
   return { lead, contact };
@@ -119,8 +127,8 @@ export async function convertLeadToOpportunity(
   await lead.save();
 
   logTimeline(tenantId, 'leads', lead._id.toString(), 'status_changed',
-    `Converted to Opportunity: ${title}`, performedBy,
-    { type: 'opportunity', entityId: deal._id.toString() },
+    `Opportunity ${title} created`, performedBy,
+    { type: 'opportunity', title },
   ).catch(() => {});
 
   return { lead, deal };
@@ -188,9 +196,10 @@ export async function convertLeadToCustomer(
   // Assignment/Activity History reads as a clear, final "Lead converted ->
   // Customer" step (per the requested AI Widget -> Team -> Staff ->
   // ... -> Converted trail), not lumped in with an ordinary stage move.
+  const custId = (customer.customerId || '').toUpperCase();
   logTimeline(tenantId, 'leads', lead._id.toString(), 'converted',
-    `Lead converted → Customer: ${customer.customerId}`, performedBy,
-    { type: 'customer', entityId: customer._id.toString(), customerId: customer.customerId },
+    `Customer ${custId} created`, performedBy,
+    { type: 'customer', customerId: custId },
   ).catch(() => {});
 
   return { lead, customer };

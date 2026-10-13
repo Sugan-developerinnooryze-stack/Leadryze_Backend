@@ -2,7 +2,7 @@
   "watch": ["src", ".env"],
   "ext": "ts,json,env",
   "ignore": ["src/**/*.spec.ts", "src/seed.ts"],
-  "exec": "ts-node src/server.ts",
+  "exec": "ts-node --transpile-only src/server.ts",
   "signal": "SIGTERM",
   "delay": 500,
   "env": {

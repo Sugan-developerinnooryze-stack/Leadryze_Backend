@@ -92,7 +92,7 @@ const schema = new Schema<IFSSettingsDoc>(
     country:            { type: String, trim: true },
     postalCode:         { type: String, trim: true },
     timezone:           { type: String, trim: true, default: 'UTC' },
-    currency:           { type: String, trim: true, default: 'AUD' },
+    currency:           { type: String, trim: true, default: 'INR' },
     taxPercentage:      { type: Number, default: 0, min: 0, max: 100 },
     discountPercentage: { type: Number, default: 0, min: 0, max: 100 },
     invoicePrefix:      { type: String, trim: true, default: 'INV' },

@@ -172,6 +172,37 @@ router.get('/users', async (_req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /admin/users/duplicates — lists any duplicate login emails across all tenants for cleanup (LR-RULE-002)
+router.get('/users/duplicates', async (_req, res, next) => {
+  try {
+    const duplicates = await User.aggregate([
+      { $match: { role: { $ne: 'SUPER_ADMIN' } } },
+      {
+        $group: {
+          _id: { $toLower: '$email' },
+          count: { $sum: 1 },
+          users: {
+            $push: {
+              _id: '$_id',
+              email: '$email',
+              firstName: '$firstName',
+              lastName: '$lastName',
+              role: '$role',
+              tenantId: '$tenantId',
+              loginId: '$loginId',
+              isActive: '$isActive',
+              createdAt: '$createdAt',
+            },
+          },
+        },
+      },
+      { $match: { count: { $gt: 1 } } },
+      { $sort: { count: -1 } },
+    ]);
+    sendSuccess(res, duplicates, 'Duplicate users fetched');
+  } catch (err) { next(err); }
+});
+
 // Reused by createUserForTenant() below — TENANT_ADMIN maps to the
 // tenant's seeded "Admin" system role; matches the map already used by
 // user.routes.ts's own POST / (a Tenant Admin inviting their own team).
@@ -203,8 +234,9 @@ router.post('/users', async (req: AuthRequest, res, next) => {
     if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
 
     const normalizedEmail = email.toLowerCase().trim();
-    const exists = await User.findOne({ email: normalizedEmail, tenantId });
-    if (exists) { sendError(res, 'A user with this email already exists in this tenant', 409); return; }
+    // LR-RULE-002: Login email must be globally unique across all tenants
+    const exists = await User.findOne({ email: normalizedEmail });
+    if (exists) { sendError(res, 'This email is already used by another user', 409); return; }
 
     let password = suppliedPassword;
     if (password) {
@@ -410,7 +442,7 @@ router.post('/tenants', async (req: AuthRequest, res, next) => {
     }
 
     const existing = await User.findOne({ email: adminEmail.toLowerCase().trim() });
-    if (existing) { sendError(res, 'A user with this email already exists', 409); return; }
+    if (existing) { sendError(res, 'This email is already used by another user', 409); return; }
 
     const result = await provisionTenant({
       name: name.trim(), plan, domain, contactEmail, contactPhone,

@@ -89,7 +89,10 @@ export async function deleteCustomer(id: string, tenantId: string, scope?: DataS
   if (receipts)   linked.push(`${receipts} receipt${receipts > 1 ? 's' : ''}`);
   if (contracts)  linked.push(`${contracts} contract${contracts > 1 ? 's' : ''}`);
   if (linked.length) {
-    throw new Error(`Cannot delete — this customer has ${linked.join(', ')}. Remove or reassign them first.`);
+    throw Object.assign(
+      new Error(`Cannot delete — this customer has ${linked.join(', ')}. Remove or reassign them first.`),
+      { statusCode: 409 }
+    );
   }
 
   const deleted = await NativeCustomer.findOneAndDelete(filter);

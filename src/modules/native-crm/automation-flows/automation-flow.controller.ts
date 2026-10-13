@@ -3,9 +3,31 @@ import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../utils/response';
 import {
   listFlows, getFlowById, createFlow, updateFlow, deleteFlow, listFlowRuns, getFlowRunById, getFlowRunStats, decideApproval,
-  publishFlow, discardDraft, dryRunFlow,
+  publishFlow, discardDraft, dryRunFlow, FlowValidationError,
 } from './automation-flow.service';
 import { logAuditEvent } from '../../logs/audit-log.model';
+
+// Shared by every endpoint that runs validateFlowOrThrow (create/update/
+// publish/dryRun) — a FlowValidationError carries the FULL accumulated
+// issue list. Sent as both `errors` (sendError's own param — kept so
+// anything already reading that field, same as validate.middleware.ts's
+// own `errors`, keeps working) and `issues` (the same array under the
+// name validate.middleware.ts also now uses for its own per-field detail —
+// one consistent field for the frontend to read regardless of whether a
+// Zod schema or this service-level validator was what actually rejected
+// the request). The summary verb is context-specific — "Cannot publish"
+// only for the actual Publish action, "Cannot run test" for Dry Run,
+// "Cannot save" for create/update — since these are different user actions
+// with different stakes, not interchangeable copy. Any other thrown error
+// keeps today's exact single-message behavior.
+function sendFlowError(res: Response, err: any, action: 'save' | 'publish' | 'test' = 'save'): Response {
+  if (err instanceof FlowValidationError) {
+    const verb = action === 'publish' ? 'Cannot publish' : action === 'test' ? 'Cannot run test' : 'Cannot save';
+    const summary = err.issues.length > 1 ? `${verb} — ${err.issues.length} issues found` : err.issues[0];
+    return res.status(400).json({ success: false, message: summary, errors: err.issues, issues: err.issues });
+  }
+  return sendError(res, err.message, 400);
+}
 
 // Everyone Error Branch's own 'tenant_admin' recipient already covers, PLUS
 // 'manager' — a Manager deciding their own Approval gate is the whole point
@@ -37,7 +59,7 @@ export async function create(req: AuthRequest, res: Response) {
     const item = await createFlow(req.tenantId!, { ...req.body, createdBy: req.user?.userId });
     sendCreated(res, item);
   } catch (err: any) {
-    sendError(res, err.message, 400);
+    sendFlowError(res, err);
   }
 }
 
@@ -53,7 +75,7 @@ export async function update(req: AuthRequest, res: Response) {
     }
     sendSuccess(res, item);
   } catch (err: any) {
-    sendError(res, err.message, 400);
+    sendFlowError(res, err);
   }
 }
 
@@ -112,7 +134,7 @@ export async function publish(req: AuthRequest, res: Response) {
     );
     sendSuccess(res, item, 'Flow published');
   } catch (err: any) {
-    sendError(res, err.message, 400);
+    sendFlowError(res, err, 'publish');
   }
 }
 
@@ -135,7 +157,7 @@ export async function dryRun(req: AuthRequest, res: Response) {
     const result = await dryRunFlow(req.tenantId!, req.params.id, req.body.sampleModule, req.body.sampleRecordId);
     sendSuccess(res, result);
   } catch (err: any) {
-    sendError(res, err.message, 400);
+    sendFlowError(res, err, 'test');
   }
 }
 

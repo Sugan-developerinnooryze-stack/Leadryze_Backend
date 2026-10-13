@@ -13,7 +13,13 @@ import { IFlowNode, IFlowEdge } from './automation-flow.model';
  * actually reads and clears it. Every other status is terminal or transient. */
 
 export type FlowRunStatus = 'running' | 'completed' | 'partial' | 'failed' | 'paused';
-export type FlowRunStepStatus = 'success' | 'failed' | 'skipped';
+/** 'unknown' — a send's outcome could not be determined (the provider's
+ * response was lost or timed out after possibly already accepting the
+ * request) — distinct from 'failed' (a definite provider rejection) because
+ * conflating the two would either falsely claim the message was never sent,
+ * or (if auto-retried) risk actually sending it twice. See
+ * classifySendError()/awaitSendOutcome() in automation-flow.service.ts. */
+export type FlowRunStepStatus = 'success' | 'failed' | 'skipped' | 'unknown';
 
 export interface IFlowRunStep {
   nodeId:    string;
@@ -35,6 +41,15 @@ export interface IFlowRunStep {
    * present for send_* steps) — lets you see exactly what values a
    * template was rendered with, without needing to re-derive them. */
   variables?: Record<string, string>;
+  /** Structured view of what this node actually saw/produced — additive,
+   * optional, populated at the same log() call site as result/variables
+   * above for every node type (previously only send_* captured anything
+   * structured). Redacted (known-sensitive keys masked) and size-capped
+   * before being written — see redactAndCapForLog() in
+   * automation-flow.service.ts, the single place this gets built. Absent
+   * on every run recorded before this field existed. */
+  input?:  Record<string, unknown>;
+  output?: Record<string, unknown>;
   createdRecordModule?: string;
   createdRecordId?:     string;
   /** 1-based attempt index — present only for a node whose retryCount > 0.
@@ -163,13 +178,15 @@ const stepSchema = new Schema<IFlowRunStep>(
     nodeId:    { type: String, required: true },
     nodeType:  { type: String, enum: ['trigger', 'action', 'condition', 'delay', 'merge', 'subFlow', 'loop', 'approval'], required: true },
     label:     { type: String, required: true },
-    status:    { type: String, enum: ['success', 'failed', 'skipped'], required: true },
+    status:    { type: String, enum: ['success', 'failed', 'skipped', 'unknown'], required: true },
     startedAt:  { type: Date, required: true },
     finishedAt: { type: Date },
     durationMs: { type: Number },
     error:      { type: String },
     result:     { type: String },
     variables:  { type: Schema.Types.Mixed },
+    input:      { type: Schema.Types.Mixed },
+    output:     { type: Schema.Types.Mixed },
     createdRecordModule: { type: String },
     createdRecordId:     { type: String },
     attempt:             { type: Number },

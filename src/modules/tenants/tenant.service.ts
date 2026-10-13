@@ -165,6 +165,11 @@ export interface ProvisionTenantResult {
  * ever returned here — never persisted, never returned by any other
  * endpoint afterward. */
 export async function provisionTenant(input: ProvisionTenantInput): Promise<ProvisionTenantResult> {
+  const existingUser = await User.findOne({ email: input.adminEmail.toLowerCase().trim() });
+  if (existingUser) {
+    throw Object.assign(new Error('This email is already used by another user'), { statusCode: 409 });
+  }
+
   const slug = input.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
     + '-' + crypto.randomBytes(3).toString('hex');
 

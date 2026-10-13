@@ -23,10 +23,15 @@ export const optionalObjectId = z
   .transform((v) => (v === '' ? undefined : v));
 
 export const serviceLine = z.object({
-  name:        z.string().trim().min(1),
-  description: z.string().optional(),
-  amount:      z.number().min(0).optional(),
-  count:       z.number().int().min(1).optional(),
+  name:            z.string().trim().min(1),
+  description:     z.string().optional(),
+  amount:          z.number().min(0).optional(),
+  count:           z.number().int().min(1).optional(),
+  taxPercent:      z.number().min(0).max(100).optional(),
+  discountPercent: z.number().min(0).max(100).optional(),
+  durationHours:   z.number().min(0).optional(),
+  serviceId:       z.string().optional(),
+  frequency:       z.string().optional(),
 });
 
 export const partLine = z.object({

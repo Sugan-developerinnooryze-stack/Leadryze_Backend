@@ -2,6 +2,7 @@ import { Router } from 'express';
 import * as controller from './analytics.controller';
 import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
+import { resolveBranch } from '../../middlewares/branch.middleware';
 
 const router = Router();
 
@@ -9,39 +10,25 @@ const router = Router();
  * @swagger
  * tags:
  *   name: Analytics
- *   description: Analytics and reporting
+ *   description: Platform-wide analytics and business intelligence
  */
 
-router.use(authenticate, requireTenant);
+router.use(authenticate, requireTenant, resolveBranch);
 
-/**
- * @swagger
- * /analytics/dashboard:
- *   get:
- *     tags: [Analytics]
- *     summary: Get dashboard KPI stats
- *     responses:
- *       200: { description: Stats aggregation }
- */
+// Executive Dashboard & Overview
 router.get('/dashboard', requirePermission('analytics.view'), controller.getDashboard);
 
-/**
- * @swagger
- * /analytics:
- *   get:
- *     tags: [Analytics]
- *     summary: Get analytics by date range
- *     parameters:
- *       - in: query
- *         name: startDate
- *         schema: { type: string, format: date }
- *       - in: query
- *         name: endDate
- *         schema: { type: string, format: date }
- *       - in: query
- *         name: channel
- *         schema: { type: string }
- */
+// Domain-specific Business Intelligence
+router.get('/leads-sales', requirePermission('analytics.view'), controller.getLeadsSales);
+router.get('/crm', requirePermission('analytics.view'), controller.getCrm);
+router.get('/support', requirePermission('analytics.view'), controller.getSupport);
+router.get('/field-service', requirePermission('analytics.view'), controller.getFieldService);
+router.get('/automation', requirePermission('analytics.view'), controller.getAutomation);
+
+// Export CSV
+router.get('/export', requirePermission('analytics.view'), controller.exportAnalytics);
+
+// Legacy range query
 router.get('/', requirePermission('analytics.view'), controller.getAnalytics);
 
 export default router;

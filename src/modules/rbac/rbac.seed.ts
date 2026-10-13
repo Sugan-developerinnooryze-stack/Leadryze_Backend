@@ -161,6 +161,11 @@ const SYSTEM_PERMISSIONS: PermDef[] = [
   // below, falls to Admin-only via the '*' wildcard) rather than Manager access.
   { key: 'automation.manage_settings', module: 'automation', resource: 'settings',   action: 'manage',          label: 'Automation — Manage Settings (Kill Switch)' },
 
+  // Connector Data section (Calendar, Management, Automation)
+  { key: 'connector_data.calendar.view',   module: 'connector_data', resource: 'calendar',   action: 'view', label: 'Connector Data — Calendar View' },
+  { key: 'connector_data.management.view', module: 'connector_data', resource: 'management', action: 'view', label: 'Connector Data — Management View' },
+  { key: 'connector_data.automation.view', module: 'connector_data', resource: 'automation', action: 'view', label: 'Connector Data — Automation View' },
+
   // Tenant-wide configuration surfaces found with ZERO requirePermission()
   // coverage in the Phase 4 RBAC audit (any authenticated user of any role
   // previously had full access) — admin/manager-only, same posture as
@@ -217,6 +222,7 @@ const MANAGER_PERMISSIONS = [
   // one outright.
   'automation.view', 'automation.create', 'automation.edit',
   'automation.execute', 'automation.view_executions',
+  'connector_data.*',
   'pipeline_config.*', 'doc_templates.*', 'notification_settings.*',
   'form_templates.*', 'workflow_templates.*',
   'activity_feed.view', 'timeline.view',
@@ -318,6 +324,8 @@ const AGENT_PERMISSIONS = [
   // the tenant configured, even though Agent already has create/edit on
   // both of those modules above.
   'fs.custom_fields.view',
+  'connector_data.calendar.view',
+  'connector_data.management.view',
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────

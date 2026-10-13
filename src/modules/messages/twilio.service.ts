@@ -57,6 +57,50 @@ export async function sendSmsNow(opts: SmsOptions): Promise<string | null> {
   }
 }
 
+/** Used only by the automation-flow engine, which needs to tell a definite
+ * Twilio rejection apart from an ambiguous one (timeout/lost response) to
+ * decide whether a retry is safe — something sendSmsNow's `string | null`
+ * return can't express. Every other caller (the campaign dispatcher) keeps
+ * using sendSmsNow above unchanged; this does not replace it. Still returns
+ * `null` for "not configured" specifically — a legitimate, already-correct
+ * dormant state, not a failure to classify. On a real send failure,
+ * re-throws the RAW caught axios error (not wrapped) so the engine's
+ * classifySendError() can read `.response` off it, exactly as sendEmailNow
+ * (brevo.service.ts) already does — unlike sendSmsNow above, which logs the
+ * real Twilio error body and then discards it. */
+export async function sendSmsNowDetailed(opts: SmsOptions): Promise<string | null> {
+  if (!config.twilio.accountSid || !config.twilio.authToken) {
+    logger.warn('Twilio credentials not configured — SMS skipped', { to: opts.to });
+    return null;
+  }
+  const from = opts.from || config.twilio.phoneNumber;
+  const params = new URLSearchParams({ To: opts.to, From: from, Body: opts.body });
+  if (opts.statusCallbackUrl) params.set('StatusCallback', opts.statusCallbackUrl);
+
+  try {
+    const response = await axios.post(
+      `${TWILIO_API}/Accounts/${config.twilio.accountSid}/Messages.json`,
+      params.toString(),
+      { headers: authHeader(), timeout: 15000 },
+    );
+    const sid: string = response.data?.sid || '';
+    logger.info('SMS sent via Twilio', { to: opts.to, sid });
+    void trackServiceUsage('twilio', true);
+    return sid;
+  } catch (err) {
+    // Same real-error logging sendSmsNow already does above — just re-throws
+    // the raw error afterward instead of swallowing it to null.
+    const axiosErr = err as import('axios').AxiosError;
+    const twilioBody = axiosErr.response?.data as Record<string, unknown> | undefined;
+    logger.error('Twilio SMS failed', {
+      to: opts.to, from, status: axiosErr.response?.status,
+      code: twilioBody?.code, message: twilioBody?.message, moreInfo: twilioBody?.more_info,
+    });
+    void trackServiceUsage('twilio', false);
+    throw err;
+  }
+}
+
 // ─── Pre-built SMS templates ──────────────────────────────────────────────────
 
 export function buildFollowupSms(customerName: string, daysSince: number): string {

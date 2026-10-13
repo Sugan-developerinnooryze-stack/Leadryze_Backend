@@ -20,7 +20,7 @@ export async function getSettings(tenantId: string, branchId?: string | null) {
   const base = settings ? settings.toObject() : {};
   // Strip _id/branchId/__v so a subsequent save creates a new branch-specific doc
   const { _id, branchId: _bid, __v, ...rest } = base as any;
-  return { ...rest, clientId: tenant?.clientId ?? null, isInherited };
+  return { currency: 'INR', ...rest, clientId: tenant?.clientId ?? null, isInherited };
 }
 
 export async function upsertSettings(tenantId: string, data: any, branchId?: string | null) {

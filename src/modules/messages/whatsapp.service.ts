@@ -27,7 +27,8 @@ export class WhatsAppService {
         headers: {
           'Authorization': `Bearer ${this.token}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 15000,
       });
 
       const messageId = response.data.messages[0].id;
@@ -68,7 +69,8 @@ export class WhatsAppService {
         headers: {
           'Authorization': `Bearer ${this.token}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 15000,
       });
 
       const messageId = response.data.messages[0].id;
@@ -117,6 +119,26 @@ export async function sendWhatsAppNow(to: string, body: string): Promise<string 
     logger.error('sendWhatsAppNow failed', { to, error: (err as Error).message });
     return null;
   }
+}
+
+/** Used only by the automation-flow engine (automation-flow.service.ts),
+ * which needs to tell a definite provider rejection apart from an ambiguous
+ * one (timeout/lost response) to decide whether a retry is safe — something
+ * sendWhatsAppNow's `string | null` return can't express. Every other
+ * caller (reminder cron, bulk-send) keeps using sendWhatsAppNow above
+ * unchanged; this does not replace it. Still returns `null` for "not
+ * configured" specifically — a legitimate, already-correct dormant state,
+ * not a failure to classify. On a real send failure, re-throws the RAW
+ * caught error (not wrapped into a new Error) so the engine's
+ * classifySendError() can read `.response` off it, exactly as
+ * sendEmailNow (brevo.service.ts) already does. */
+export async function sendWhatsAppNowDetailed(to: string, body: string): Promise<string | null> {
+  const svc = getWhatsAppService();
+  if (!svc) {
+    logger.warn('WhatsApp not configured (no Meta credentials) — message skipped', { to });
+    return null;
+  }
+  return svc.sendMessage(to, body);
 }
 
 export function isWhatsAppConfigured(): boolean {

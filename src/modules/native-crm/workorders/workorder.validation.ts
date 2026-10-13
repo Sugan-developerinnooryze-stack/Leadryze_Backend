@@ -8,7 +8,10 @@ export const createWorkorderSchema = z.object({
   siteId:        z.string().trim().optional(),
   teamId:        z.string().trim().optional(),
   staffId:       z.string().trim().optional(),
-  staffIds:      z.array(z.string().trim()).optional(),
+  staffIds:      z.preprocess(
+    (val) => (val === '' || val === null || val === undefined ? [] : Array.isArray(val) ? val : [val]),
+    z.array(z.string().trim())
+  ).optional(),
   quotationId:   z.string().trim().optional(),
   contractId:    z.string().trim().optional(),
   contractVisitNumber: z.coerce.number().min(1).optional(),

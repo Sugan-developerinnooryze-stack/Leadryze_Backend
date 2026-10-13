@@ -31,6 +31,8 @@ export interface ICampaign extends Document {
   completedAt?: Date;
   cancelledAt?: Date;
   lastError?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
 }
 
 const campaignSchema = new Schema<ICampaign>(

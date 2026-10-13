@@ -49,7 +49,7 @@ const CUR_SYMBOL: Record<string, string> = {
 };
 
 export function currencySymbol(currency?: string): string {
-  return CUR_SYMBOL[currency ?? 'AUD'] ?? '$';
+  return CUR_SYMBOL[currency ?? 'INR'] ?? '₹';
 }
 
 export function esc(s: any): string {

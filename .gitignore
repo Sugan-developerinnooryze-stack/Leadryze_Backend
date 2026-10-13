@@ -35,3 +35,10 @@ Thumbs.db
 # instead (already tracked there — see backfill-client-ids.ts etc.).
 /backfill-*.js
 /scratch-*.js
+
+# QA test runner scripts and Excel updater scripts
+_investigate-stats.mjs
+src/scripts/test_lr_*.ts
+src/scripts/update_excel_*.py
+src/scripts/update_row_*.py
+src/scripts/check_converted_contacts.ts

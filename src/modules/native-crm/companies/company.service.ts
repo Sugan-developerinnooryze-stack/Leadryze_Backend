@@ -41,8 +41,31 @@ export async function updateCompany(tenantId: string, id: string, dto: UpdateCom
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const updated = await Company.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
-  if (updated) indexNativeSearchRecord(tenantId, 'native', 'companies', updated, updated.name);
+  const doc = await Company.findOne(filter);
+  if (!doc) return null;
+
+  // LR-NEG-001: Detect stale concurrent save (lost update prevention)
+  const clientUpdatedAt = (dto as any).updatedAt ? new Date((dto as any).updatedAt).getTime() : null;
+  const clientVersion = (dto as any).__v !== undefined ? Number((dto as any).__v) : ((dto as any).version !== undefined ? Number((dto as any).version) : null);
+  if (clientVersion !== null && doc.__v !== undefined && doc.__v !== clientVersion) {
+    const err: any = new Error('This company was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
+  if (clientUpdatedAt && (doc as any).updatedAt) {
+    const docTime = new Date((doc as any).updatedAt).getTime();
+    if (docTime - clientUpdatedAt > 500) {
+      const err: any = new Error('This company was changed by someone else — please reload and try again.');
+      err.name = 'VersionError';
+      throw err;
+    }
+  }
+
+  const { updatedAt: _u, __v: _v, version: _ver, ...cleanDto } = dto as any;
+  doc.set(cleanDto);
+  await doc.save();
+  const updated = doc.toObject();
+  indexNativeSearchRecord(tenantId, 'native', 'companies', updated, updated.name);
   return updated;
 }
 

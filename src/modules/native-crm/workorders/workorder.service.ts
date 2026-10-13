@@ -4,6 +4,7 @@ import { WorkorderListOptions } from './workorder.types';
 import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeContract }  from '../contracts/contract.model';
+import { NativeCustomer }  from '../customers/customer.model';
 import { NativeStaff }     from '../staffs/staff.model';
 import { NativeTeam }      from '../teams/team.model';
 import { getSettings }     from '../fs-settings/fs-settings.service';
@@ -55,7 +56,18 @@ export async function listWorkorders(tenantId: string, opts: WorkorderListOption
     { title:      new RegExp(opts.search, 'i') },
     { customerId: new RegExp(opts.search, 'i') },
   ];
-  if (opts.customerId) filter.customerId = opts.customerId;
+  if (opts.customerId) {
+    filter.customerId = opts.customerId;
+    const cust = await NativeCustomer.findOne({ tenantId: tid, customerId: opts.customerId }).select('createdAt').lean();
+    if (cust?.createdAt) {
+      if (filter.createdAt) {
+        filter.$and = [{ createdAt: filter.createdAt }, { createdAt: { $gte: cust.createdAt } }];
+        delete filter.createdAt;
+      } else {
+        filter.createdAt = { $gte: cust.createdAt };
+      }
+    }
+  }
   if (opts.contractId) filter.contractId = opts.contractId;
   if (opts.teamId) {
     const team = await NativeTeam.findOne({ _id: opts.teamId, tenantId: tid }).select('teamId').lean();

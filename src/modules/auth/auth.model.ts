@@ -99,7 +99,8 @@ const userSchema = new Schema<IUser>(
   { timestamps: true }
 );
 
-userSchema.index({ email: 1, tenantId: 1 }, { unique: true });
+// Globally unique login email across all tenants (LR-RULE-002)
+userSchema.index({ email: 1 }, { unique: true });
 userSchema.index({ tenantId: 1 });
 // Cheap insurance for Client-ID login lookups (User.findOne({tenantId,
 // clientId})) now that clientId is a real login credential for the first

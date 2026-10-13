@@ -22,4 +22,14 @@ export const createContactSchema = z.object({
   customFields,
 });
 
-export const updateContactSchema = createContactSchema.partial();
+// LR-NEG-001: stale-save/conflict detection (contact.service.ts's
+// updateContact) reads dto.updatedAt/dto.__v — without declaring them here,
+// validate.middleware.ts's req.body = schema.parse(req.body) silently
+// strips both before the service function ever runs, making the whole
+// version check unreachable over the real API (confirmed live: a prior
+// "fix" claimed this worked, but only because whatever verified it called
+// the service function directly, bypassing this exact stripping).
+export const updateContactSchema = createContactSchema.partial().extend({
+  updatedAt: z.string().optional(),
+  __v: z.number().optional(),
+});

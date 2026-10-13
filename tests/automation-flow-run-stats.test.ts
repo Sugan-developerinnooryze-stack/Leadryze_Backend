@@ -18,6 +18,13 @@
  */
 process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 
+// automation-flow.service.ts transitively pulls in pdf.controller.ts (for
+// the emailAttachPdf feature), whose dependency chain reaches sanitize-html
+// — an ESM-only package Jest can't transform. Same mock already used in
+// pdf.variable-renderer.test.ts for the same reason; this test never
+// touches PDF/HTML rendering so the real implementation isn't needed.
+jest.mock('sanitize-html', () => (html: string) => html);
+
 const aggregateMock = jest.fn();
 jest.mock('../src/modules/native-crm/automation-flows/automation-flow-run.model', () => ({
   AutomationFlowRun: { aggregate: (...args: unknown[]) => aggregateMock(...args) },
@@ -108,5 +115,37 @@ describe('getFlowRunStats — pipeline construction', () => {
     const result = await getFlowRunStats(TENANT_ID);
     expect(result.perFlow).toEqual([]);
     expect(result.summary).toEqual({ runsToday: 0, failedToday: 0, completedToday: 0 });
+  });
+
+  // Reproduced live: deleting a flow doesn't delete its run history (by
+  // design — flowSnapshot keeps a deleted flow's past runs inspectable), but
+  // that meant todaySummary kept counting those orphaned runs forever,
+  // producing exactly "Total Automations: 0, Runs Today: 20" for a tenant
+  // with zero actual flows left. The fix is a $lookup against the flows
+  // collection inside the todaySummary branch specifically — perFlow is
+  // untouched since the frontend only ever reads perFlow entries for flow
+  // ids it already has from the live flows list, so an orphaned flowId's
+  // row there is just unused, not displayed.
+  it('todaySummary branch excludes runs whose flow has been deleted, via a $lookup against the live flows collection', async () => {
+    aggregateMock.mockResolvedValue([{ perFlow: [], todaySummary: [] }]);
+    await getFlowRunStats(TENANT_ID);
+    const [, facetStage] = aggregateMock.mock.calls[0][0];
+    const todaySummary = facetStage.$facet.todaySummary;
+    const lookupStage = todaySummary.find((s: any) => '$lookup' in s);
+    expect(lookupStage).toBeDefined();
+    expect(lookupStage.$lookup.from).toBe('native_automation_flows');
+    expect(lookupStage.$lookup.localField).toBe('flowId');
+    expect(lookupStage.$lookup.foreignField).toBe('_id');
+    const lookupIndex = todaySummary.indexOf(lookupStage);
+    const filterStage = todaySummary[lookupIndex + 1];
+    expect(filterStage.$match[`${lookupStage.$lookup.as}.0`]).toEqual({ $exists: true });
+  });
+
+  it('perFlow branch is NOT filtered by the flow-existence $lookup — only todaySummary gets it', async () => {
+    aggregateMock.mockResolvedValue([{ perFlow: [], todaySummary: [] }]);
+    await getFlowRunStats(TENANT_ID);
+    const [, facetStage] = aggregateMock.mock.calls[0][0];
+    const perFlowHasLookup = facetStage.$facet.perFlow.some((s: any) => '$lookup' in s);
+    expect(perFlowHasLookup).toBe(false);
   });
 });

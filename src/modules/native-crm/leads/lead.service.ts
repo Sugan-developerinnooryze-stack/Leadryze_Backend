@@ -9,9 +9,25 @@ import { customFieldsSearchExpr } from '../shared/custom-field-query';
 import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
 import { IFlowCondition } from '../automation-rules/automation-rule.model';
 import { hashEmail } from '../../../platform/pii/pii.service';
+import { NativeStaff } from '../staffs/staff.model';
 
 function leadDisplayName(l: any): string {
   return [l.firstName, l.lastName].filter(Boolean).join(' ') || l.company || l.leadId;
+}
+
+async function assertValidOwner(tenantId: string, leadOwnerStaffId: string | undefined): Promise<void> {
+  if (!leadOwnerStaffId) return;
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const isFsStaff = await NativeStaff.exists({
+    tenantId: tid,
+    $or: [
+      { staffId: leadOwnerStaffId },
+      ...(mongoose.isValidObjectId(leadOwnerStaffId) ? [{ _id: new mongoose.Types.ObjectId(leadOwnerStaffId) }] : []),
+    ],
+  });
+  if (isFsStaff) {
+    throw new Error('Field Service staff cannot be assigned as Lead Owner. Please select a CRM user.');
+  }
 }
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
@@ -58,7 +74,13 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
     if (opts.search.includes('@')) {
       orClauses.push({ emailSearch: hashEmail(opts.search) });
     }
-    filter.$or = orClauses;
+    if (filter.$or) {
+      const existingOr = filter.$or;
+      delete filter.$or;
+      filter.$and = [...(filter.$and ?? []), { $or: existingOr }, { $or: orClauses }];
+    } else {
+      filter.$or = orClauses;
+    }
   }
 
   if (opts.customFieldFilters) {
@@ -77,7 +99,11 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
  * existing caller's behavior is unchanged. */
 function resolveLeadSort(opts: LeadListOptions): Record<string, 1 | -1> {
   if (!opts.sortBy) return { lastActivityAt: -1, createdAt: -1 };
-  return { [opts.sortBy]: opts.sortDir === 'asc' ? 1 : -1 };
+  const dir: 1 | -1 = opts.sortDir === 'desc' ? -1 : 1;
+  if (opts.sortBy === '_displayName' || opts.sortBy === 'name') {
+    return { firstName: dir, lastName: dir, company: dir };
+  }
+  return { [opts.sortBy]: dir };
 }
 
 export async function listLeads(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope) {
@@ -87,6 +113,7 @@ export async function listLeads(tenantId: string, opts: LeadListOptions, branchI
 
   const [items, total] = await Promise.all([
     Lead.find(filter)
+      .select('-emailSearch -phoneSearch -emailDomain')
       .sort(resolveLeadSort(opts))
       // LR-LEAD-007: default binary string sort put every capital letter
       // before every lowercase one ("Zed" before "adam") — a case-
@@ -104,18 +131,26 @@ export async function listLeads(tenantId: string, opts: LeadListOptions, branchI
  * return every matching record rather than one page of results. */
 export async function listLeadsForExport(tenantId: string, opts: LeadListOptions, branchId?: string | null, scope?: DataScope) {
   const filter = buildLeadFilter(tenantId, opts, branchId, scope);
-  return Lead.find(filter).sort(resolveLeadSort(opts)).lean();
+  return Lead.find(filter)
+    .select('-emailSearch -phoneSearch -emailDomain')
+    .sort(resolveLeadSort(opts))
+    .lean();
 }
 
 export async function getLeadById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { $or: [{ _id: mongoose.isValidObjectId(id) ? id : null }, { leadId: id }], tenantId: tid };
+  const idClauses: any[] = [{ leadId: id }];
+  if (mongoose.isValidObjectId(id)) {
+    idClauses.push({ _id: new mongoose.Types.ObjectId(id) });
+  }
+  const filter: any = { tenantId: tid, $or: idClauses };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
-  return Lead.findOne(filter);
+  return Lead.findOne(filter).select('-emailSearch -phoneSearch -emailDomain');
 }
 
 export async function createLead(data: any) {
   await assertValidStatus(String(data.tenantId), data.status);
+  await assertValidOwner(String(data.tenantId), data.leadOwnerStaffId);
   const doc = await Lead.create(data);
   indexNativeSearchRecord(String(doc.tenantId), 'native', 'leads', doc.toObject(), leadDisplayName(doc));
   return doc;
@@ -123,6 +158,7 @@ export async function createLead(data: any) {
 
 export async function updateLead(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
+  await assertValidOwner(tenantId, data.leadOwnerStaffId);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
@@ -132,7 +168,26 @@ export async function updateLead(id: string, tenantId: string, data: any, scope?
   // created one, instead of being written back as plaintext.
   const updated = await Lead.findOne(filter);
   if (!updated) return null;
-  updated.set({ ...data, lastActivityAt: new Date() });
+
+  // LR-NEG-001: Detect stale concurrent save (lost update prevention)
+  const clientUpdatedAt = data.updatedAt ? new Date(data.updatedAt).getTime() : null;
+  const clientVersion = data.__v !== undefined ? Number(data.__v) : (data.version !== undefined ? Number(data.version) : null);
+  if (clientVersion !== null && updated.__v !== undefined && updated.__v !== clientVersion) {
+    const err: any = new Error('This lead was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
+  if (clientUpdatedAt && (updated as any).updatedAt) {
+    const docTime = new Date((updated as any).updatedAt).getTime();
+    if (docTime - clientUpdatedAt > 500) {
+      const err: any = new Error('This lead was changed by someone else — please reload and try again.');
+      err.name = 'VersionError';
+      throw err;
+    }
+  }
+
+  const { updatedAt: _u, __v: _v, version: _ver, ...cleanData } = data;
+  updated.set({ ...cleanData, lastActivityAt: new Date() });
   await updated.save();
   indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
   return updated;

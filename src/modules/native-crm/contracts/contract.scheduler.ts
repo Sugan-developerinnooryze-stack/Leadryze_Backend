@@ -129,13 +129,19 @@ export async function runContractScheduler(): Promise<void> {
         if (!settings?.autoGenerateWorkOrders) continue;
 
         const woScheduledKey = await getOutcomeStageKey(String(contract.tenantId), 'workorder', 'scheduled', 'scheduled');
+        const contractDisc = (contract.services ?? []).find((s: any) => s.discountPercent != null)?.discountPercent ?? (contract as any).discount ?? 0;
+        const contractGst  = (contract.services ?? []).find((s: any) => s.taxPercent != null)?.taxPercent ?? (contract as any).gstPercentage ?? 0;
+
         await createWorkorder({
           tenantId:      contract.tenantId,
+          branchId:      (contract as any).branchId ?? null,
           customerId:    contract.customerId,
           contractId:    contract.contractId,
           title:         `Service Visit — ${contract.title}`,
           services:      contract.services ?? [],
           parts:         contract.parts ?? [],
+          discount:      contractDisc,
+          gstPercentage: contractGst,
           staffId:       (contract as any).staffId,
           teamId:        (contract as any).teamId,
           scheduledDate: contract.nextServiceDate,

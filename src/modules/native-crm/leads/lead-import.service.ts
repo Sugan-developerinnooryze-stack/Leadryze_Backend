@@ -4,6 +4,8 @@ import { createLead } from './lead.service';
 import { LeadImportTriage } from './lead-import-triage.model';
 import { decrypt, isEncrypted } from '../../../utils/crypto';
 
+import { findDuplicateContact } from '../shared/duplicate-check';
+
 export interface ImportRow {
   firstName?: string;
   lastName?:  string;
@@ -52,7 +54,7 @@ function normalizePhone(phone?: string): string {
   return (phone ?? '').replace(/\D/g, '');
 }
 
-/** Mandatory-field validation — a name plus at least one way to reach them. */
+/** Mandatory-field validation — a name, contact method, and valid expectedRevenue. */
 function validateRow(row: ImportRow): string[] {
   const errors: string[] = [];
   if (!row.firstName || !String(row.firstName).trim()) errors.push('firstName is required');
@@ -60,6 +62,19 @@ function validateRow(row: ImportRow): string[] {
   const phone = normalizePhone(row.phone as string | undefined);
   if (!email && !phone) errors.push('either email or phone is required');
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push('email is not a valid format');
+
+  // LR-R2-IMP-001: validate expectedRevenue (≥ 0, ≤ 1e12)
+  if (row.expectedRevenue !== undefined && row.expectedRevenue !== null && row.expectedRevenue !== '') {
+    const rev = Number(row.expectedRevenue);
+    if (isNaN(rev)) {
+      errors.push('Expected Revenue must be a number');
+    } else if (rev < 0) {
+      errors.push('Expected Revenue must be 0 or more');
+    } else if (rev > 1_000_000_000_000) {
+      errors.push('Expected Revenue cannot exceed 1,000,000,000,000');
+    }
+  }
+
   return errors;
 }
 
@@ -79,7 +94,7 @@ function toLeadPayload(tenantId: string, row: ImportRow, batchId: string, create
     state:      row.state ? String(row.state).trim() : undefined,
     country:    row.country ? String(row.country).trim() : undefined,
     leadOwner:  row.leadOwner ? String(row.leadOwner).trim() : undefined,
-    expectedRevenue: row.expectedRevenue !== undefined && row.expectedRevenue !== '' ? Number(row.expectedRevenue) : undefined,
+    expectedRevenue: row.expectedRevenue !== undefined && row.expectedRevenue !== '' && !isNaN(Number(row.expectedRevenue)) ? Number(row.expectedRevenue) : undefined,
     tags:       row.tags ? String(row.tags).split(';').map((t) => t.trim()).filter(Boolean) : [],
     importBatchId: batchId,
     createdBy,
@@ -87,18 +102,11 @@ function toLeadPayload(tenantId: string, row: ImportRow, batchId: string, create
 }
 
 /**
- * Bulk-imports Leads with real validation and duplicate detection — unlike
- * the generic File-dropdown import elsewhere (one blind POST per row), this:
- *  - rejects rows missing mandatory fields, reporting the exact reason per row
- *  - auto-skips EXACT email/phone duplicates (Lead.email is PII-encrypted at
- *    rest, so exact matching narrows by the unencrypted emailDomain index
- *    first, then decrypts just that small candidate set to compare)
- *  - routes same-domain-but-different-email rows to an Admin Triage queue
- *    instead of guessing whether they're a new contact at a known company
- *  - stamps every created Lead with a batchId for later audit/filtering
+ * Bulk-imports Leads with exact duplicate detection (email or phone).
+ * Per approved product rule: exact email or exact phone = duplicate (skip);
+ * a shared email domain alone is NOT a duplicate and imports normally.
  */
 export async function importLeadsCsv(tenantId: string, rows: ImportRow[], createdBy?: string): Promise<ImportSummary> {
-  const tid = new mongoose.Types.ObjectId(tenantId);
   const batchId = new mongoose.Types.ObjectId().toString();
   const summary: ImportSummary = { batchId, total: rows.length, created: 0, duplicates: 0, triage: 0, rejected: [] };
 
@@ -110,37 +118,15 @@ export async function importLeadsCsv(tenantId: string, rows: ImportRow[], create
       continue;
     }
 
-    const email = normalizeEmail(row.email as string | undefined);
-    const domain = emailDomainOf(row.email as string | undefined);
-    const phoneNorm = normalizePhone(row.phone as string | undefined);
+    // Exact email or phone duplicate check
+    const duplicate = await findDuplicateContact(Lead, tenantId, {
+      email: row.email as string | undefined,
+      phone: row.phone as string | undefined,
+      mobile: row.mobile as string | undefined,
+    });
 
-    let exactDuplicate = false;
-    let domainCandidates: { _id: unknown; email?: string }[] = [];
-
-    if (domain) {
-      domainCandidates = await Lead.find({ tenantId: tid, emailDomain: domain }).select('_id email').lean();
-      for (const c of domainCandidates) {
-        const plain = c.email && isEncrypted(c.email) ? decrypt(c.email) : c.email;
-        if (plain && normalizeEmail(plain) === email) { exactDuplicate = true; break; }
-      }
-    }
-    if (!exactDuplicate && phoneNorm) {
-      const phoneMatch = await Lead.findOne({ tenantId: tid, phoneSearch: phoneNorm }).select('_id').lean();
-      if (phoneMatch) exactDuplicate = true;
-    }
-
-    if (exactDuplicate) {
+    if (duplicate) {
       summary.duplicates++;
-      continue;
-    }
-
-    if (domain && domainCandidates.length > 0) {
-      await LeadImportTriage.create({
-        tenantId: tid, batchId, rawRow: row, matchType: 'domain',
-        matchedLeadIds: domainCandidates.map((c) => String(c._id)),
-        status: 'pending',
-      });
-      summary.triage++;
       continue;
     }
 
@@ -150,6 +136,7 @@ export async function importLeadsCsv(tenantId: string, rows: ImportRow[], create
 
   return summary;
 }
+
 
 export async function listTriageItems(tenantId: string, batchId?: string) {
   const filter: Record<string, unknown> = { tenantId: new mongoose.Types.ObjectId(tenantId), status: 'pending' };

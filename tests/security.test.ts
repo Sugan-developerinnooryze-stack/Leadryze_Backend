@@ -23,6 +23,13 @@ process.env.MONGODB_URI        = process.env.MONGODB_URI || 'mongodb://localhost
 process.env.JWT_EXPIRES_IN     = '15m';
 process.env.JWT_REFRESH_EXPIRES_IN = '7d';
 
+// app.ts transitively pulls in pdf.controller.ts (via the automation-flow
+// webhook routes, for the emailAttachPdf feature), whose dependency chain
+// reaches sanitize-html — an ESM-only package Jest can't transform. Same
+// mock already used in pdf.variable-renderer.test.ts for the same reason;
+// nothing in this suite touches PDF/HTML rendering.
+jest.mock('sanitize-html', () => (html: string) => html);
+
 import app from '../src/app';
 
 // ---------------------------------------------------------------------------

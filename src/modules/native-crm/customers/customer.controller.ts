@@ -83,11 +83,21 @@ export async function remove(req: AuthRequest, res: Response) {
     logTimeline(req.tenantId!, 'customer', req.params.id, 'deleted', `Customer "${(item as any).name}" deleted`, req.user?.userId).catch(() => {});
     logAuditEvent('customer.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'Customer', targetId: req.params.id, detail: { before: { name: (item as any).name } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'Customer',
+        targetId: (item as any).customerId ?? req.params.id,
+        detail: {
+          customerId: (item as any).customerId,
+          name: (item as any).name,
+          before: { customerId: (item as any).customerId, name: (item as any).name },
+        },
+      },
     );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
-    sendError(res, err.message, 500);
+    const status = err.statusCode ?? (err.message?.includes('Cannot delete') ? 409 : 500);
+    sendError(res, err.message, status);
   }
 }
 

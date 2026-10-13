@@ -117,7 +117,7 @@ export async function schedulePreview(req: AuthRequest, res: Response) {
       return sendError(res, 'services, startDate and endDate are required', 400);
     }
     const visits  = generateVisits(services, startDate, endDate);
-    const summary = summarizeVisits(visits, startDate, endDate);
+    const summary = summarizeVisits(visits, startDate, endDate, services);
     sendSuccess(res, { summary, visits });
   } catch (err: any) {
     sendError(res, err.message, 400);

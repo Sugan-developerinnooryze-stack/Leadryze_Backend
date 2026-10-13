@@ -1,6 +1,6 @@
 import mongoose, { Schema } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
-import { encryptPIIFields } from '../../../platform/pii/pii.service';
+import { encryptPIIFields, hashEmail } from '../../../platform/pii/pii.service';
 
 export const contactSchema = new Schema(
   {
@@ -49,6 +49,22 @@ export const contactSchema = new Schema(
   },
   { timestamps: true, optimisticConcurrency: true }
 );
+
+// Must run BEFORE the PII-encryption hook below — email/phone are plaintext
+// here and become ciphertext once encryptPIIFields runs, so this is the only
+// point at which a searchable domain/normalized-phone can be derived.
+contactSchema.pre('save', function (next) {
+  if (this.isModified('email')) {
+    const at = (this.email ?? '').indexOf('@');
+    this.emailDomain = at > 0 ? this.email!.slice(at + 1).toLowerCase().trim() : undefined;
+    this.emailSearch = this.email ? hashEmail(this.email) : undefined;
+  }
+  if (this.isModified('phone')) {
+    const digits = (this.phone ?? '').replace(/\D/g, '');
+    this.phoneSearch = digits || undefined;
+  }
+  next();
+});
 
 contactSchema.pre('save', function (next) {
   encryptPIIFields(this as any, 'contacts');

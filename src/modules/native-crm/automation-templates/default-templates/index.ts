@@ -4,6 +4,7 @@ import { hotLeadAlert } from './hot-lead-alert';
 import { dealWonOnboarding } from './deal-won-onboarding';
 import { quoteFollowup } from './quote-followup';
 import { ticketEscalation } from './ticket-escalation';
+import { invoiceReminder } from './invoice-reminder';
 
 export const DEFAULT_TEMPLATES: IDefaultTemplate[] = [
   newLeadFollowup,
@@ -11,4 +12,5 @@ export const DEFAULT_TEMPLATES: IDefaultTemplate[] = [
   dealWonOnboarding,
   quoteFollowup,
   ticketEscalation,
+  invoiceReminder,
 ];

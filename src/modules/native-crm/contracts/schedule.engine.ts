@@ -167,12 +167,14 @@ export function generateVisits(
         byDate.set(key, entry);
       }
       entry.services.push({
-        name:          line.name,
-        amount:        Number(line.amount) || 0,
-        count:         Number(line.count) || 1,
-        durationHours: line.durationHours,
-        serviceId:     line.serviceId,
-        frequency:     line.scheduleRule.frequency,
+        name:            line.name,
+        amount:          Number(line.amount) || 0,
+        count:           Number(line.count) || 1,
+        taxPercent:      line.taxPercent != null ? Number(line.taxPercent) : 0,
+        discountPercent: line.discountPercent != null ? Number(line.discountPercent) : 0,
+        durationHours:   line.durationHours,
+        serviceId:       line.serviceId,
+        frequency:       line.scheduleRule.frequency,
       });
       entry.amount = Math.round((entry.amount + lineNet(line)) * 100) / 100;
     }
@@ -197,12 +199,14 @@ export interface ScheduleSummary {
   perMonth:         { month: string; count: number }[];   // "2026-07" → count
   estimatedRevenue: number;
   estimatedHours:   number;
+  outOfRangeDates?: string[];
 }
 
 export function summarizeVisits(
   visits: IContractVisit[],
   startDate?: Date | string,
   endDate?: Date | string,
+  services?: IContractServiceLine[],
 ): ScheduleSummary {
   const perMonthMap = new Map<string, number>();
   let revenue = 0;
@@ -217,11 +221,24 @@ export function summarizeVisits(
   }
 
   let totalDays = 0;
+  const outOfRangeDates: string[] = [];
   if (startDate && endDate) {
     const s = dateOnly(new Date(startDate));
     const e = dateOnly(new Date(endDate));
     if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e >= s) {
       totalDays = Math.floor((e.getTime() - s.getTime()) / DAY_MS) + 1;
+    }
+    if (Array.isArray(services)) {
+      for (const svc of services) {
+        if (svc.scheduleRule?.frequency === 'custom_dates' && Array.isArray(svc.scheduleRule.dates)) {
+          for (const dStr of svc.scheduleRule.dates) {
+            const d = dateOnly(new Date(dStr));
+            if (!isNaN(d.getTime()) && !inRange(d, s, e)) {
+              if (!outOfRangeDates.includes(dStr)) outOfRangeDates.push(dStr);
+            }
+          }
+        }
+      }
     }
   }
 
@@ -231,6 +248,7 @@ export function summarizeVisits(
     perMonth:         [...perMonthMap.entries()].sort().map(([month, count]) => ({ month, count })),
     estimatedRevenue: Math.round(revenue * 100) / 100,
     estimatedHours:   Math.round(hours * 100) / 100,
+    ...(outOfRangeDates.length > 0 ? { outOfRangeDates } : {}),
   };
 }
 

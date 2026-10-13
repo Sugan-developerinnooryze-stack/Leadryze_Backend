@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node -e \"const {execSync}=require('child_process');try{const r=execSync('netstat -ano').toString();r.split('\\n').filter(l=>l.includes(':5000')).forEach(l=>{const p=l.trim().split(/\\s+/).pop();try{execSync('taskkill /F /PID '+p)}catch(e){}});}catch(e){}\" && nodemon",
     "build": "tsc",
+    "postinstall": "puppeteer browsers install chrome",
     "start": "node dist/server.js",
     "seed": "ts-node --transpile-only src/seed.ts",
     "seed:crm": "ts-node --transpile-only src/seed-native-crm.ts",
@@ -60,6 +61,7 @@
     "uuid": "^10.0.0",
     "winston": "^3.13.1",
     "winston-daily-rotate-file": "^5.0.0",
+    "xlsx": "^0.18.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {
@@ -70,6 +72,7 @@
     "@types/hpp": "^0.2.7",
     "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.6",
+    "@types/luxon": "^3.7.6",
     "@types/morgan": "^1.9.9",
     "@types/multer": "^1.4.11",
     "@types/node": "^20.14.12",

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import crypto from 'crypto';
+import { z } from 'zod';
 import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { AuthRequest } from '../../types';
@@ -78,6 +79,10 @@ router.post('/', requirePermission('users.create'), async (req: AuthRequest, res
     };
 
     if (!email?.trim())     return sendError(res, 'Email is required', 400);
+    // LR-R2-USER-001: Validate email format on tenant invite path
+    if (!z.string().email().safeParse(email.trim()).success) {
+      return sendError(res, 'A valid email address is required', 400);
+    }
     if (!firstName?.trim()) return sendError(res, 'First name is required', 400);
     if (!lastName?.trim())  return sendError(res, 'Last name is required', 400);
 
@@ -86,8 +91,9 @@ router.post('/', requirePermission('users.create'), async (req: AuthRequest, res
 
     const tenantId = req.user!.tenantId;
 
-    const exists = await User.findOne({ email: email.toLowerCase(), tenantId });
-    if (exists) return sendError(res, 'A user with this email already exists in this tenant', 409);
+    // LR-RULE-002: Login email must be globally unique across all tenants
+    const exists = await User.findOne({ email: email.toLowerCase().trim() });
+    if (exists) return sendError(res, 'This email is already used by another user', 409);
 
     // Resolve roleId — use provided, or fall back to system role matching the role string
     let resolvedRoleId: mongoose.Types.ObjectId | null = null;
@@ -183,6 +189,11 @@ router.post('/', requirePermission('users.create'), async (req: AuthRequest, res
     delete userObj.password;
     delete userObj.refreshToken;
 
+    logAuditEvent('user.invited',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
+    );
+
     return sendCreated(res, userObj);
   } catch (err) {
     next(err);
@@ -254,7 +265,13 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
     if (roleChanged) {
       logAuditEvent('user.role_reassigned',
         { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-        { tenantId, target: 'User', targetId: user._id.toString(), detail: { userEmail: user.email, before: { roleId: oldRoleIdForAudit ?? null }, after: { roleId: user.roleId?.toString() ?? null } } },
+        { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, before: { roleId: oldRoleIdForAudit ?? null }, after: { roleId: user.roleId?.toString() ?? null } } },
+      );
+    }
+    if (activating || deactivating) {
+      logAuditEvent(activating ? 'user.activated' : 'user.deactivated',
+        { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+        { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
       );
     }
 
@@ -292,6 +309,11 @@ router.delete('/:id', requirePermission('users.delete'), async (req: AuthRequest
     await user.save();
     if (wasActive) await releaseUserSeat(tenantId); // frees the seat; no-op if already inactive
 
+    logAuditEvent('user.deactivated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
+    );
+
     return sendSuccess(res, null, 'User deactivated');
   } catch (err) {
     next(err);
@@ -322,6 +344,11 @@ router.post('/:id/reset-password', requirePermission('users.edit'), async (req: 
     user.password = password;
     user.set('refreshToken', undefined); // invalidate existing sessions
     await user.save();
+
+    logAuditEvent('user.password_reset',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}` } },
+    );
 
     return sendSuccess(res, null, 'Password reset successfully');
   } catch (err) {

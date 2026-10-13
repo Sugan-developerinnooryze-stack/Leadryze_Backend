@@ -158,10 +158,17 @@ export function applyDataScopeToFilter(
 
   if (!scope || scope.kind === 'all') return;
   if (alsoMatchCreatedBy) {
-    filter.$or = [
+    const scopeOr = [
       { [ownerField]: { $in: scope.staffIds } },
       { [alsoMatchCreatedBy]: { $in: scope.createdByUserIds } },
     ];
+    if (filter.$or) {
+      const existingOr = filter.$or;
+      delete filter.$or;
+      filter.$and = [...((filter.$and as any[]) || []), { $or: existingOr }, { $or: scopeOr }];
+    } else {
+      filter.$or = scopeOr;
+    }
     return;
   }
   filter[ownerField] = { $in: scope.staffIds };

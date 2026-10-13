@@ -1,11 +1,16 @@
-﻿import mongoose, { Schema, Document } from 'mongoose';
+import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 
 export interface IServiceLine {
-  name:         string;
-  description?: string;
-  amount:       number;
-  count:        number;
+  name:             string;
+  description?:     string;
+  amount:           number;
+  count:            number;
+  taxPercent?:      number;
+  discountPercent?: number;
+  durationHours?:   number;
+  serviceId?:       string;
+  frequency?:       string;
 }
 
 export interface IPartLine {
@@ -66,10 +71,15 @@ export interface IWorkorderDoc extends Document {
 
 const serviceLineSchema = new Schema<IServiceLine>(
   {
-    name:        { type: String, required: true, trim: true },
-    description: { type: String, trim: true },
-    amount:      { type: Number, min: 0, default: 0 },
-    count:       { type: Number, min: 1, default: 1 },
+    name:            { type: String, required: true, trim: true },
+    description:     { type: String, trim: true },
+    amount:          { type: Number, min: 0, default: 0 },
+    count:           { type: Number, min: 1, default: 1 },
+    taxPercent:      { type: Number, min: 0, default: 0 },
+    discountPercent: { type: Number, min: 0, default: 0 },
+    durationHours:   { type: Number },
+    serviceId:       { type: String, trim: true },
+    frequency:       { type: String, trim: true },
   },
   { _id: false }
 );

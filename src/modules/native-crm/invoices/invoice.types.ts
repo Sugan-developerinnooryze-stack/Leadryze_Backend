@@ -11,4 +11,5 @@ export interface InvoiceListOptions {
   // today's exact 'createdAt' behavior. The Calendar sends 'dueDate' so
   // events place on when the invoice is actually due, not when created.
   dateField?: 'dueDate' | 'createdAt';
+  customerId?: string;
 }

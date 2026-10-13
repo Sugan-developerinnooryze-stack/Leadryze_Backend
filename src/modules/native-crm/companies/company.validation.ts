@@ -18,4 +18,8 @@ export const createCompanySchema = z.object({
   customFields,
 });
 
-export const updateCompanySchema = createCompanySchema.partial();
+// LR-NEG-001: same reasoning as contact.validation.ts's updateContactSchema.
+export const updateCompanySchema = createCompanySchema.partial().extend({
+  updatedAt: z.string().optional(),
+  __v: z.number().optional(),
+});

@@ -5,6 +5,8 @@ import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeWorkorder } from '../workorders/workorder.model';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeContract }  from '../contracts/contract.model';
+import { NativeCustomer }  from '../customers/customer.model';
+import { NativeReceipt }   from '../receipts/receipt.model';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
@@ -35,6 +37,18 @@ export async function listInvoices(tenantId: string, opts: InvoiceListOptions, b
     { invoiceId:  new RegExp(opts.search, 'i') },
     { customerId: new RegExp(opts.search, 'i') },
   ];
+  if (opts.customerId) {
+    filter.customerId = opts.customerId;
+    const cust = await NativeCustomer.findOne({ tenantId: tid, customerId: opts.customerId }).select('createdAt').lean();
+    if (cust?.createdAt) {
+      if (filter.createdAt) {
+        filter.$and = [{ createdAt: filter.createdAt }, { createdAt: { $gte: cust.createdAt } }];
+        delete filter.createdAt;
+      } else {
+        filter.createdAt = { $gte: cust.createdAt };
+      }
+    }
+  }
   const dateField = opts.dateField && INVOICE_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
   applyDateRangeToFilter(filter, dateField, resolveDateRange(opts.range, opts.dateFrom, opts.dateTo));
   if (opts.filters) {
@@ -53,7 +67,27 @@ export async function getInvoiceById(id: string, tenantId: string, scope?: DataS
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  return NativeInvoice.findOne(filter);
+  const invoice = await NativeInvoice.findOne(filter);
+  if (invoice) {
+    const receipts = await NativeReceipt.find({
+      tenantId: tid,
+      $or: [{ invoiceId: invoice.invoiceId }, { invoiceId: String(invoice._id) }],
+      status: { $ne: 'refunded' },
+    });
+    const totalPaid = Math.round(receipts.reduce((sum, r) => sum + (Number(r.amount) || 0), 0) * 100) / 100;
+    if (invoice.paidAmount !== totalPaid) {
+      invoice.paidAmount = totalPaid;
+      const totalDue = Number(invoice.servicesAmountWithTax) || 0;
+      invoice.paid = totalDue > 0 && totalPaid >= totalDue;
+      if (invoice.paid && invoice.status !== 'paid') {
+        invoice.status = 'paid';
+      } else if (!invoice.paid && invoice.status === 'paid') {
+        invoice.status = 'sent';
+      }
+      await invoice.save();
+    }
+  }
+  return invoice;
 }
 
 export async function createInvoice(data: any) {
@@ -62,16 +96,46 @@ export async function createInvoice(data: any) {
   const parts: any[]     = data.parts ?? [];
   const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
   const prtTotal = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-  const discount = Number(data.discount ?? 0);
-  const gst      = Number(data.gstPercentage ?? 0);
-  // discount is a percentage (0-100), not a flat amount — matches quotation.service.ts.
-  const subtotal = svcTotal + prtTotal;
-  const after    = subtotal - (subtotal * discount) / 100;
+  let discount = Number(data.discount ?? 0);
+  let gst      = Number(data.gstPercentage ?? 0);
+
+  const hasLineTaxOrDisc = services.some((s: any) => (Number(s.taxPercent) > 0 || Number(s.discountPercent) > 0));
+  let servicesAmount: number;
+  let servicesAmountWithTax: number;
+
+  if (discount === 0 && gst === 0 && hasLineTaxOrDisc) {
+    let lineAfter = 0;
+    let lineWithTax = 0;
+    for (const s of services) {
+      const gross = (Number(s.amount) || 0) * (Number(s.count) || 1);
+      const afterD = gross * (1 - (Number(s.discountPercent) || 0) / 100);
+      const withT = afterD * (1 + (Number(s.taxPercent) || 0) / 100);
+      lineAfter += afterD;
+      lineWithTax += withT;
+    }
+    servicesAmount = Math.round((lineAfter + prtTotal) * 100) / 100;
+    servicesAmountWithTax = Math.round((lineWithTax + prtTotal) * 100) / 100;
+    const firstDisc = Number(services[0]?.discountPercent || 0);
+    const firstTax  = Number(services[0]?.taxPercent || 0);
+    if (services.every((s: any) => Number(s.discountPercent || 0) === firstDisc)) {
+      data.discount = firstDisc;
+    }
+    if (services.every((s: any) => Number(s.taxPercent || 0) === firstTax)) {
+      data.gstPercentage = firstTax;
+    }
+  } else {
+    // discount is a percentage (0-100), not a flat amount — matches quotation.service.ts.
+    const subtotal = svcTotal + prtTotal;
+    const after    = subtotal - (subtotal * discount) / 100;
+    servicesAmount = Math.round(after * 100) / 100;
+    servicesAmountWithTax = Math.round((after + (after * gst) / 100) * 100) / 100;
+  }
+
   const doc = await NativeInvoice.create({
     ...data,
     partsAmount:           prtTotal,
-    servicesAmount:        after,
-    servicesAmountWithTax: after + (after * gst) / 100,
+    servicesAmount,
+    servicesAmountWithTax,
   });
   const mongoId = (doc._id as any).toString();
   // Independent checks, not if/else-if — same fix and same reason as
@@ -105,16 +169,41 @@ export async function updateInvoice(id: string, tenantId: string, data: any, sco
     const existing = await NativeInvoice.findOne(filter).lean();
     const services  = data.services        ?? (existing as any)?.services        ?? [];
     const parts     = data.parts           ?? (existing as any)?.parts           ?? [];
-    const discount  = Number(data.discount      ?? (existing as any)?.discount      ?? 0);
-    const gst       = Number(data.gstPercentage ?? (existing as any)?.gstPercentage ?? 0);
+    let discount    = Number(data.discount      ?? (existing as any)?.discount      ?? 0);
+    let gst         = Number(data.gstPercentage ?? (existing as any)?.gstPercentage ?? 0);
     const svcTotal  = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
     const prtTotal  = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-    // discount is a percentage (0-100), not a flat amount — matches createInvoice.
-    const subtotal  = svcTotal + prtTotal;
-    const after     = subtotal - (subtotal * discount) / 100;
-    data.partsAmount           = prtTotal;
-    data.servicesAmount        = after;
-    data.servicesAmountWithTax = after + (after * gst) / 100;
+
+    const hasLineTaxOrDisc = services.some((s: any) => (Number(s.taxPercent) > 0 || Number(s.discountPercent) > 0));
+    if (discount === 0 && gst === 0 && hasLineTaxOrDisc) {
+      let lineAfter = 0;
+      let lineWithTax = 0;
+      for (const s of services) {
+        const gross = (Number(s.amount) || 0) * (Number(s.count) || 1);
+        const afterD = gross * (1 - (Number(s.discountPercent) || 0) / 100);
+        const withT = afterD * (1 + (Number(s.taxPercent) || 0) / 100);
+        lineAfter += afterD;
+        lineWithTax += withT;
+      }
+      data.partsAmount           = prtTotal;
+      data.servicesAmount        = Math.round((lineAfter + prtTotal) * 100) / 100;
+      data.servicesAmountWithTax = Math.round((lineWithTax + prtTotal) * 100) / 100;
+      const firstDisc = Number(services[0]?.discountPercent || 0);
+      const firstTax  = Number(services[0]?.taxPercent || 0);
+      if (services.every((s: any) => Number(s.discountPercent || 0) === firstDisc)) {
+        data.discount = firstDisc;
+      }
+      if (services.every((s: any) => Number(s.taxPercent || 0) === firstTax)) {
+        data.gstPercentage = firstTax;
+      }
+    } else {
+      // discount is a percentage (0-100), not a flat amount — matches createInvoice.
+      const subtotal  = svcTotal + prtTotal;
+      const after     = subtotal - (subtotal * discount) / 100;
+      data.partsAmount           = prtTotal;
+      data.servicesAmount        = Math.round(after * 100) / 100;
+      data.servicesAmountWithTax = Math.round((after + (after * gst) / 100) * 100) / 100;
+    }
   }
   const updated = await NativeInvoice.findOneAndUpdate(
     filter,

@@ -35,7 +35,7 @@ const PAGE_H = 1123;
 // leaving a dead gap; real content auto-sizes without clipping, same as
 // tables. 'gridtable' stays out — manually-authored static content has no
 // "empty" state to collapse.
-const FLOW_TYPES = new Set(['table', 'richtext']);
+export const FLOW_TYPES = new Set(['table', 'richtext']);
 
 // ─── Rich text sanitizer (tenant-authored HTML → Puppeteer/iframe) ───────────
 
@@ -314,6 +314,11 @@ export function renderCustomTemplateFull(
   page?: ITemplatePage,
   header?: ITemplateRegion,
   footer?: ITemplateRegion,
+  // Real browser-measured height per flow element id (keyed by IDesignElement.id),
+  // substituted for a flow element's design-time `h` when advancing the band
+  // cursor below — see pdf.service.ts's two-pass render/measure/re-render.
+  // Omitted (every existing caller) → byte-identical to pre-fix behavior.
+  flowHeightOverrides?: Record<string, number>,
 ): RenderedTemplate {
   const vars = buildVarMap(ctx);
   // The header/footer band is reserved page margin — Puppeteer's page.pdf()
@@ -383,7 +388,7 @@ export function renderCustomTemplateFull(
     parts.push(
       `<div data-el-id="${esc(f.id)}" style="margin-left:${f.x}px;width:${f.w}px;">${renderElementContent(f, vars, ctx)}</div>`
     );
-    cursor = f.y + f.h;
+    cursor = f.y + (flowHeightOverrides?.[f.id] ?? f.h);
   }
   parts.push(bandFor(cursor, null));
 
@@ -403,7 +408,7 @@ export function renderCustomTemplate(
   const ctx: RenderCtx = {
     doc, settings, customer,
     docType: docType as RenderCtx['docType'],
-    cur: (settings?.currency && ({ AUD:'$',USD:'$',GBP:'£',EUR:'€',INR:'₹',CAD:'$',NZD:'$',SGD:'$' } as Record<string,string>)[settings.currency]) || '$',
+    cur: (settings?.currency && ({ AUD:'A$',USD:'$',GBP:'£',EUR:'€',INR:'₹',CAD:'C$',NZD:'NZ$',SGD:'S$' } as Record<string,string>)[settings.currency]) || '₹',
     customFieldDefs: [],
   };
   return renderCustomTemplateFull(elements, ctx).html;

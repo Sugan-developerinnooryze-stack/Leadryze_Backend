@@ -18,4 +18,5 @@ export interface ContractListOptions {
    * to the stored business teamId before filtering. */
   teamId?: string;
   staffId?: string;
+  customerId?: string;
 }

@@ -1,11 +1,16 @@
-﻿import mongoose, { Schema, Document } from 'mongoose';
+import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 
 export interface IServiceLine {
-  name:         string;
-  description?: string;
-  amount:       number;
-  count:        number;
+  name:             string;
+  description?:     string;
+  amount:           number;
+  count:            number;
+  taxPercent?:      number;
+  discountPercent?: number;
+  durationHours?:   number;
+  serviceId?:       string;
+  frequency?:       string;
 }
 
 export interface IPartLine {
@@ -39,6 +44,7 @@ export interface IInvoiceDoc extends Document {
   // How much of servicesAmountWithTax has been collected via Receipts —
   // see receipt.service.ts's createReceipt, the only writer of this field.
   paidAmount:            number;
+  balanceDue?:           number;
   status:                string;
   notes?:                string;
   termsAndConditions?:   string;
@@ -56,10 +62,15 @@ export interface IInvoiceDoc extends Document {
 
 const serviceLineSchema = new Schema<IServiceLine>(
   {
-    name:        { type: String, required: true, trim: true },
-    description: { type: String, trim: true },
-    amount:      { type: Number, min: 0, default: 0 },
-    count:       { type: Number, min: 1, default: 1 },
+    name:            { type: String, required: true, trim: true },
+    description:     { type: String, trim: true },
+    amount:          { type: Number, min: 0, default: 0 },
+    count:           { type: Number, min: 1, default: 1 },
+    taxPercent:      { type: Number, min: 0, default: 0 },
+    discountPercent: { type: Number, min: 0, default: 0 },
+    durationHours:   { type: Number },
+    serviceId:       { type: String, trim: true },
+    frequency:       { type: String, trim: true },
   },
   { _id: false }
 );
@@ -114,8 +125,14 @@ const schema = new Schema<IInvoiceDoc>(
     lockedBy:   { type: String },
     lockReason: { type: String },
   },
-  { timestamps: true }
+  { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } }
 );
+
+schema.virtual('balanceDue').get(function () {
+  const total = Number(this.servicesAmountWithTax) || 0;
+  const paid = Number(this.paidAmount) || 0;
+  return Math.max(0, Math.round((total - paid) * 100) / 100);
+});
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();

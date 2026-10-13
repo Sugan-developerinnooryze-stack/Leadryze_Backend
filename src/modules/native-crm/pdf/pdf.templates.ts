@@ -14,10 +14,10 @@ function fmtDate(d: string | Date | null | undefined): string {
 
 function currencySymbol(currency?: string): string {
   const map: Record<string, string> = {
-    AUD: '$', USD: '$', CAD: '$', NZD: '$', SGD: '$',
+    AUD: 'A$', USD: '$', CAD: 'C$', NZD: 'NZ$', SGD: 'S$',
     GBP: '£', EUR: '€', INR: '₹',
   };
-  return map[currency ?? 'AUD'] ?? '$';
+  return map[currency ?? 'INR'] ?? '₹';
 }
 
 function companyFullAddress(s: any): string {

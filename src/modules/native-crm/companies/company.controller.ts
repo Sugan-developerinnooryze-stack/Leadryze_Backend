@@ -35,7 +35,12 @@ export async function update(req: AuthRequest, res: Response) {
     const record = await svc.updateCompany(req.tenantId!, req.params.id, req.body, resolveEffectiveScope(req, 'companies'));
     if (!record) return void sendError(res, 'Company not found', 404);
     sendSuccess(res, record, 'Company updated');
-  } catch { sendError(res, 'Failed to update company', 500); }
+  } catch (err: any) {
+    if (err?.name === 'VersionError') {
+      return void sendError(res, 'This company was changed by someone else — please reload and try again.', 409);
+    }
+    sendError(res, 'Failed to update company', 500);
+  }
 }
 
 export async function remove(req: AuthRequest, res: Response) {

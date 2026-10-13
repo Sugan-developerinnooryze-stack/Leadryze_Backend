@@ -99,8 +99,8 @@ function generateTokens(payload: Omit<JwtPayload, 'iat' | 'exp'>) {
 }
 
 export async function registerUser(input: RegisterInput): Promise<{ message: string }> {
-  const existing = await User.findOne({ email: input.email.toLowerCase() });
-  if (existing) throw Object.assign(new Error('Email already registered'), { statusCode: 409 });
+  const existing = await User.findOne({ email: input.email.toLowerCase().trim() });
+  if (existing) throw Object.assign(new Error('This email is already used by another user'), { statusCode: 409 });
 
   // Auto-create a tenant for this client
   const companyName = input.companyName || `${input.firstName}'s Workspace`;

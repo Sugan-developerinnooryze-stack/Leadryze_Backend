@@ -10,6 +10,7 @@ import { connectRedis } from './config/redis';
 import { initQueues } from './modules/scheduler/scheduler.service';
 import { ensureMeiliIndex } from './services/meilisearch.service';
 import { logger } from './utils/logger';
+// Campaigns module reloaded
 import { logSecurityEvent } from './modules/logs/security-event.model';
 import { hasPermission } from './modules/rbac/permission.service';
 
@@ -95,6 +96,16 @@ async function bootstrap(): Promise<void> {
 
   // Meilisearch index setup — non-blocking, falls back to MongoDB if not configured
   ensureMeiliIndex().catch((err) => logger.warn('Meilisearch init skipped', { err: (err as Error).message }));
+
+  // LR-CONTACT-004: Backfill missing contact blind-index search fields (idempotent, fire-and-forget)
+  import('./modules/native-crm/contacts/contact.service')
+    .then(({ backfillContactSearchIndices }) => backfillContactSearchIndices())
+    .then((res) => {
+      if (res && res.backfilled > 0) {
+        logger.info(`Contact search indices backfill complete: ${res.backfilled} contact(s) updated`);
+      }
+    })
+    .catch((err) => logger.warn('Contact search indices backfill skipped on startup', { error: (err as Error).message }));
 
   // initQueues starts cron jobs regardless of Redis availability
   initQueues();

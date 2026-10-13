@@ -10,6 +10,82 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { customFieldsSearchExpr } from '../shared/custom-field-query';
 import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
 import { IFlowCondition } from '../automation-rules/automation-rule.model';
+import { NativeStaff } from '../staffs/staff.model';
+import { Contact } from '../contacts/contact.model';
+import { Company } from '../companies/company.model';
+
+async function enrichDealsWithContactAndCompany(tenantId: mongoose.Types.ObjectId, deals: any[]): Promise<any[]> {
+  if (!deals || deals.length === 0) return deals;
+
+  const contactIdsToFetch = new Set<string>();
+  const companyIdsToFetch = new Set<string>();
+
+  for (const d of deals) {
+    if (d.contactId && !d.contactName) contactIdsToFetch.add(String(d.contactId));
+    if (d.companyId && !d.companyName) companyIdsToFetch.add(String(d.companyId));
+  }
+
+  const contactMap = new Map<string, string>();
+  const companyMap = new Map<string, string>();
+
+  if (contactIdsToFetch.size > 0) {
+    const validContactOids = Array.from(contactIdsToFetch).filter((id) => mongoose.isValidObjectId(id)).map((id) => new mongoose.Types.ObjectId(id));
+    const contacts = await Contact.find({
+      tenantId,
+      $or: [
+        { _id: { $in: validContactOids } },
+        { clientId: { $in: Array.from(contactIdsToFetch) } },
+      ],
+    }).select('_id clientId firstName lastName email').lean();
+    for (const c of contacts) {
+      const name = `${c.firstName ?? ''} ${c.lastName ?? ''}`.trim() || c.email || '';
+      contactMap.set(String(c._id), name);
+      if (c.clientId) contactMap.set(c.clientId, name);
+    }
+  }
+
+  if (companyIdsToFetch.size > 0) {
+    const validCompanyOids = Array.from(companyIdsToFetch).filter((id) => mongoose.isValidObjectId(id)).map((id) => new mongoose.Types.ObjectId(id));
+    const companies = await Company.find({
+      tenantId,
+      $or: [
+        { _id: { $in: validCompanyOids } },
+        { clientId: { $in: Array.from(companyIdsToFetch) } },
+      ],
+    }).select('_id clientId name').lean();
+    for (const c of companies) {
+      const name = c.name || '';
+      companyMap.set(String(c._id), name);
+      if (c.clientId) companyMap.set(c.clientId, name);
+    }
+  }
+
+  for (const d of deals) {
+    if (d.contactId && !d.contactName && contactMap.has(String(d.contactId))) {
+      d.contactName = contactMap.get(String(d.contactId));
+    }
+    if (d.companyId && !d.companyName && companyMap.has(String(d.companyId))) {
+      d.companyName = companyMap.get(String(d.companyId));
+    }
+  }
+
+  return deals;
+}
+
+async function assertValidOwner(tenantId: string, assignedStaffId: string | undefined): Promise<void> {
+  if (!assignedStaffId) return;
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const isFsStaff = await NativeStaff.exists({
+    tenantId: tid,
+    $or: [
+      { staffId: assignedStaffId },
+      ...(mongoose.isValidObjectId(assignedStaffId) ? [{ _id: new mongoose.Types.ObjectId(assignedStaffId) }] : []),
+    ],
+  });
+  if (isFsStaff) {
+    throw new Error('Field Service staff cannot be assigned as Deal Owner. Please select a CRM user.');
+  }
+}
 
 async function assertValidStage(tenantId: string, stage: string | undefined): Promise<void> {
   if (!stage) return;
@@ -42,11 +118,15 @@ export async function listDeals(tenantId: string, opts: ListOptions = {}, branch
       if (Object.keys(cfFilter).length > 0) filter.$and = [...((filter.$and as any[]) ?? []), cfFilter];
     } catch { /* malformed filter payload from the client — ignored, not a 500 */ }
   }
-  const sort: Record<string, 1 | -1> = sortBy ? { [sortBy]: sortDir === 'asc' ? 1 : -1 } : { createdAt: -1 };
-  const [items, total] = await Promise.all([
+  const sortDirVal: 1 | -1 = sortDir === 'desc' ? -1 : 1;
+  const sort: Record<string, 1 | -1> = sortBy
+    ? (sortBy === '_displayName' || sortBy === 'name' ? { title: sortDirVal } : { [sortBy]: sortDirVal })
+    : { createdAt: -1 };
+  const [rawItems, total] = await Promise.all([
     Deal.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
     Deal.countDocuments(filter),
   ]);
+  const items = await enrichDealsWithContactAndCompany(tid, rawItems);
   return { items, total, page, pages: Math.ceil(total / limit) };
 }
 
@@ -54,12 +134,36 @@ export async function getDealById(tenantId: string, id: string, scope?: DataScop
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
-  return Deal.findOne(filter).lean();
+  const deal = await Deal.findOne(filter).lean();
+  if (!deal) return null;
+  const enriched = await enrichDealsWithContactAndCompany(tid, [deal]);
+  return enriched[0];
 }
 
 export async function createDeal(tenantId: string, dto: CreateDealDTO) {
   await assertValidStage(tenantId, dto.stage);
+  await assertValidOwner(tenantId, dto.assignedStaffId);
   const tid = new mongoose.Types.ObjectId(tenantId);
+  if (dto.contactId && !dto.contactName) {
+    const contact = await Contact.findOne({
+      tenantId: tid,
+      $or: [
+        ...(mongoose.isValidObjectId(dto.contactId) ? [{ _id: new mongoose.Types.ObjectId(dto.contactId) }] : []),
+        { clientId: dto.contactId },
+      ],
+    }).select('firstName lastName email').lean();
+    if (contact) dto.contactName = `${contact.firstName ?? ''} ${contact.lastName ?? ''}`.trim() || contact.email || '';
+  }
+  if (dto.companyId && !dto.companyName) {
+    const company = await Company.findOne({
+      tenantId: tid,
+      $or: [
+        ...(mongoose.isValidObjectId(dto.companyId) ? [{ _id: new mongoose.Types.ObjectId(dto.companyId) }] : []),
+        { clientId: dto.companyId },
+      ],
+    }).select('name').lean();
+    if (company) dto.companyName = company.name || '';
+  }
   const created = await Deal.create({ tenantId: tid, ...dto });
   indexNativeSearchRecord(tenantId, 'native', 'deals', created.toObject(), created.title);
   return created;
@@ -67,6 +171,7 @@ export async function createDeal(tenantId: string, dto: CreateDealDTO) {
 
 export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDTO, scope?: DataScope) {
   await assertValidStage(tenantId, dto.stage);
+  await assertValidOwner(tenantId, dto.assignedStaffId);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
@@ -75,7 +180,47 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   // edits no longer silently overwrite each other.
   const doc = await Deal.findOne(filter);
   if (!doc) return null;
-  doc.set(dto);
+
+  // LR-NEG-001: Detect stale concurrent save (lost update prevention)
+  const clientUpdatedAt = (dto as any).updatedAt ? new Date((dto as any).updatedAt).getTime() : null;
+  const clientVersion = (dto as any).__v !== undefined ? Number((dto as any).__v) : ((dto as any).version !== undefined ? Number((dto as any).version) : null);
+  if (clientVersion !== null && doc.__v !== undefined && doc.__v !== clientVersion) {
+    const err: any = new Error('This deal was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
+  if (clientUpdatedAt && (doc as any).updatedAt) {
+    const docTime = new Date((doc as any).updatedAt).getTime();
+    if (docTime - clientUpdatedAt > 500) {
+      const err: any = new Error('This deal was changed by someone else — please reload and try again.');
+      err.name = 'VersionError';
+      throw err;
+    }
+  }
+
+  if (dto.contactId && !dto.contactName) {
+    const contact = await Contact.findOne({
+      tenantId: tid,
+      $or: [
+        ...(mongoose.isValidObjectId(dto.contactId) ? [{ _id: new mongoose.Types.ObjectId(dto.contactId) }] : []),
+        { clientId: dto.contactId },
+      ],
+    }).select('firstName lastName email').lean();
+    if (contact) (dto as any).contactName = `${contact.firstName ?? ''} ${contact.lastName ?? ''}`.trim() || contact.email || '';
+  }
+  if (dto.companyId && !dto.companyName) {
+    const company = await Company.findOne({
+      tenantId: tid,
+      $or: [
+        ...(mongoose.isValidObjectId(dto.companyId) ? [{ _id: new mongoose.Types.ObjectId(dto.companyId) }] : []),
+        { clientId: dto.companyId },
+      ],
+    }).select('name').lean();
+    if (company) (dto as any).companyName = company.name || '';
+  }
+
+  const { updatedAt: _u, __v: _v, version: _ver, ...cleanDto } = dto as any;
+  doc.set(cleanDto);
   await doc.save();
   const updated = doc.toObject();
   indexNativeSearchRecord(tenantId, 'native', 'deals', updated, updated.title);

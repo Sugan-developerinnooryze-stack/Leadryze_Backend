@@ -21,6 +21,7 @@ const router = Router();
 // API kept answering 200.
 router.use(authenticate, requireTenant, requireModuleEnabled('nav_campaigns'));
 router.get('/', requirePermission('campaigns.view'), controller.getCampaigns);
+router.post('/seed', requirePermission('campaigns.create'), controller.seedCampaigns);
 router.post('/', requirePermission('campaigns.create'), validate({ body: createCampaignSchema }), controller.createCampaign);
 router.get('/:id', requirePermission('campaigns.view'), validate({ params: idParam }), controller.getCampaign);
 router.put('/:id', requirePermission('campaigns.edit'), validate({ params: idParam, body: updateCampaignSchema }), controller.updateCampaign);

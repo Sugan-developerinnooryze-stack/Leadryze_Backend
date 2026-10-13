@@ -172,3 +172,10 @@ export async function getCampaignRecipients(req: AuthRequest, res: Response, nex
     sendPaginated(res, recipients, total, page, limit);
   } catch (err) { next(err); }
 }
+
+export async function seedCampaigns(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const result = await campaignService.seedDefaultCampaigns(req.tenantId!, req.user?.userId);
+    sendSuccess(res, result, `Seeded ${result.created} default campaigns`);
+  } catch (err) { next(err); }
+}

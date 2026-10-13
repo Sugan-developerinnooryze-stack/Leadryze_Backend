@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { NativeQuotation } from './quotation.model';
 import { NativeContract } from '../contracts/contract.model';
+import { NativeCustomer } from '../customers/customer.model';
 import { QuotationListOptions } from './quotation.types';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
@@ -39,6 +40,18 @@ export async function listQuotations(tenantId: string, opts: QuotationListOption
     filter.teamId = team?.teamId ?? '__no_match__';
   }
   if (opts.staffId) filter.staffId = opts.staffId;
+  if (opts.customerId) {
+    filter.customerId = opts.customerId;
+    const cust = await NativeCustomer.findOne({ tenantId: tid, customerId: opts.customerId }).select('createdAt').lean();
+    if (cust?.createdAt) {
+      if (filter.createdAt) {
+        filter.$and = [{ createdAt: filter.createdAt }, { createdAt: { $gte: cust.createdAt } }];
+        delete filter.createdAt;
+      } else {
+        filter.createdAt = { $gte: cust.createdAt };
+      }
+    }
+  }
   const dateField = opts.dateField && QUOTATION_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
   applyDateRangeToFilter(filter, dateField, resolveDateRange(opts.range, opts.dateFrom, opts.dateTo));
   if (opts.filters) {

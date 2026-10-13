@@ -6,7 +6,7 @@ import { getQuotationById } from '../quotations/quotation.service';
 import { getWorkorderById } from '../workorders/workorder.service';
 import { getContractById }  from '../contracts/contract.service';
 import { getInvoiceById }   from '../invoices/invoice.service';
-import { generatePdfFromHtml, PdfOptions } from './pdf.service';
+import { generatePdfFromHtml, generateDesignerPdf, renderDesignerHtml, PdfOptions } from './pdf.service';
 import {
   quotationTemplate,
   workorderTemplate,
@@ -21,7 +21,6 @@ import { NativeTeam }            from '../teams/team.model';
 import { DocTemplatePreference, ITemplateSections, DEFAULT_TEMPLATE_SECTIONS } from '../fs-settings/doc-template-preference.model';
 import { CustomTemplate, IDesignElement, ITemplatePage, ITemplateRegion, TemplateDocType } from '../custom-templates/custom-template.model';
 import { NativeCustomField }     from '../custom-fields/custom-field.model';
-import { renderCustomTemplateFull } from './pdf.variable-renderer';
 import {
   RenderCtx, MODULE_FOR_DOCTYPE, currencySymbol,
   buildVarMap, cellValue, totalsValue,
@@ -59,11 +58,55 @@ interface BuildHtmlOptions {
   draftFooter?:   ITemplateRegion;
 }
 
-interface BuiltHtml {
-  html:        string;
-  pdfOptions:  PdfOptions;
-  docObj:      any;
-  filename:    string;
+// Discriminated union so each caller can pick the right Puppeteer lifecycle:
+// 'designer' templates need real measurement (see pdf.service.ts's two-pass
+// render/measure/re-render) before either a PDF or a preview HTML string can
+// be produced, so rendering is deferred rather than eagerly done here.
+// 'legacy' (hardcoded variant, no flow elements) HTML is already final.
+type BuiltHtml =
+  | {
+      kind:     'designer';
+      elements: IDesignElement[];
+      ctx:      RenderCtx;
+      pageCfg?: ITemplatePage;
+      header?:  ITemplateRegion;
+      footer?:  ITemplateRegion;
+      docObj:   any;
+      filename: string;
+    }
+  | {
+      kind:     'legacy';
+      html:     string;
+      docObj:   any;
+      filename: string;
+    };
+
+async function toPdfBuffer(built: BuiltHtml): Promise<{ buffer: Buffer; pdfOptions: PdfOptions }> {
+  if (built.kind === 'legacy') return { buffer: await generatePdfFromHtml(built.html, {}), pdfOptions: {} };
+  const { buffer, pageOptions } = await generateDesignerPdf(built.elements, built.ctx, built.pageCfg, built.header, built.footer);
+  return { buffer, pdfOptions: pageOptions };
+}
+
+/** Reusable entry point for anything that needs a real record's generated
+ * PDF outside the HTTP layer — e.g. the automation engine's
+ * emailAttachPdf (automation-flow.service.ts). Thin wrapper over the exact
+ * same buildDocumentHtml()/toPdfBuffer() pair the download/share-email
+ * routes already use, so it can never drift from what a user would get by
+ * clicking "Download PDF" themselves. Returns null on any resolution
+ * error (record not found, etc.) rather than throwing — callers treat a
+ * missing attachment as "skip it," not a reason to fail the whole action. */
+export async function generateRecordPdfBuffer(
+  module: string, id: string, tenantId: string, branchId?: string,
+): Promise<{ buffer: Buffer; filename: string } | null> {
+  const result = await buildDocumentHtml(module, id, tenantId, branchId, {});
+  if ('error' in result) return null;
+  const { buffer } = await toPdfBuffer(result);
+  return { buffer, filename: result.filename };
+}
+
+async function toPreviewHtml(built: BuiltHtml): Promise<string> {
+  if (built.kind === 'legacy') return built.html;
+  return (await renderDesignerHtml(built.elements, built.ctx, built.pageCfg, built.header, built.footer)).html;
 }
 
 interface ResolvedDoc {
@@ -186,10 +229,13 @@ async function buildDocumentHtml(
       site, staff, team,
       invoicePaidKey: await resolveInvoicePaidKey(docType, tenantId),
     };
-    const rendered = renderCustomTemplateFull(designerElements, ctx, designerPage, designerHeader, designerFooter);
     return {
-      html: rendered.html,
-      pdfOptions: { marginTopPx: rendered.pageOptions.marginTopPx, marginBottomPx: rendered.pageOptions.marginBottomPx },
+      kind:     'designer',
+      elements: designerElements,
+      ctx,
+      pageCfg:  designerPage,
+      header:   designerHeader,
+      footer:   designerFooter,
       docObj,
       filename,
     };
@@ -220,7 +266,7 @@ async function buildDocumentHtml(
   };
 
   const html = entry.template(enrichedDoc, settings, customer, variant, sections);
-  return { html, pdfOptions: {}, docObj, filename };
+  return { kind: 'legacy', html, docObj, filename };
 }
 
 export async function generatePdf(req: AuthRequest, res: Response) {
@@ -232,7 +278,7 @@ export async function generatePdf(req: AuthRequest, res: Response) {
     });
     if ('error' in result) return sendError(res, result.error, result.status);
 
-    const buffer = await generatePdfFromHtml(result.html, result.pdfOptions);
+    const { buffer } = await toPdfBuffer(result);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
     res.setHeader('Content-Length', buffer.length);
@@ -252,7 +298,7 @@ export async function previewHtml(req: AuthRequest, res: Response) {
     });
     if ('error' in result) return sendError(res, result.error, result.status);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(result.html);
+    res.send(await toPreviewHtml(result));
   } catch (err: any) {
     sendError(res, err.message ?? 'Preview failed', 500);
   }
@@ -273,7 +319,7 @@ export async function previewDraftHtml(req: AuthRequest, res: Response) {
     });
     if ('error' in result) return sendError(res, result.error, result.status);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(result.html);
+    res.send(await toPreviewHtml(result));
   } catch (err: any) {
     sendError(res, err.message ?? 'Preview failed', 500);
   }
@@ -294,7 +340,7 @@ export async function downloadDraftPdf(req: AuthRequest, res: Response) {
     });
     if ('error' in result) return sendError(res, result.error, result.status);
 
-    const buffer = await generatePdfFromHtml(result.html, result.pdfOptions);
+    const { buffer } = await toPdfBuffer(result);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
     res.setHeader('Content-Length', buffer.length);
@@ -388,7 +434,7 @@ export async function shareDocumentEmail(req: AuthRequest, res: Response) {
     });
     if ('error' in result) return sendError(res, result.error, result.status);
 
-    const buffer = await generatePdfFromHtml(result.html, result.pdfOptions);
+    const { buffer } = await toPdfBuffer(result);
 
     const bodyHtml = `
       <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
@@ -437,7 +483,7 @@ export async function shareDocumentWhatsApp(req: AuthRequest, res: Response) {
     });
     if ('error' in result) return sendError(res, result.error, result.status);
 
-    const buffer = await generatePdfFromHtml(result.html, result.pdfOptions);
+    const { buffer } = await toPdfBuffer(result);
     const documentUrl = await uploadToS3({
       tenantId: req.tenantId!,
       folder:   'shared-documents',

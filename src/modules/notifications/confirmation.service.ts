@@ -48,6 +48,26 @@ function whenFmt(sourceModule: ConfirmationSourceModule, r: SourceRecord, timeZo
   return d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short', ...(timeZone ? { timeZone } : {}) });
 }
 
+export function isPastOrInactiveStatus(sourceModule: ConfirmationSourceModule, record: SourceRecord): boolean {
+  if (sourceModule === 'call') {
+    const status = String(record.callStatus ?? 'planned').toLowerCase();
+    return status === 'completed' || status === 'missed' || status === 'cancelled';
+  }
+  if (sourceModule === 'meeting') {
+    const status = String(record.meetingStatus ?? 'scheduled').toLowerCase();
+    return status === 'completed' || status === 'cancelled';
+  }
+  if (sourceModule === 'task') {
+    const status = String(record.taskStatus ?? 'todo').toLowerCase();
+    return status === 'done' || status === 'cancelled';
+  }
+  if (sourceModule === 'ticket') {
+    const status = String(record.ticketStatus ?? 'open').toLowerCase();
+    return status === 'resolved' || status === 'closed';
+  }
+  return false;
+}
+
 /**
  * Fires an immediate "you have a new X scheduled" confirmation when a
  * Call/Meeting/Task/Ticket is created linked to a resolvable Customer/
@@ -63,6 +83,9 @@ export async function sendOnCreateConfirmation(
   try {
     const settings = await getOrCreateSettings(tenantId);
     if (!settings.sendOnCreateConfirmation) return;
+    // LR-R2-NOTIF-001: Logging a completed/missed/cancelled call or past activity
+    // must not send the "new ... scheduled / we'll follow up" confirmation.
+    if (isPastOrInactiveStatus(sourceModule, record)) return;
     if (!record.relatedModule || !record.relatedId) return;
     const relatedModule = record.relatedModule;
     const relatedId = record.relatedId;
@@ -82,10 +105,13 @@ export async function sendOnCreateConfirmation(
       return;
     }
 
-    const meetingTimezone = sourceModule === 'meeting'
-      ? (await Tenant.findById(tenantId).select('widget.booking.timezone').lean())?.widget?.booking?.timezone || 'UTC'
-      : undefined;
-    const when = whenFmt(sourceModule, record, meetingTimezone);
+    // LR-R2-ACT-001: Resolve timezone from record, tenant settings, or booking config
+    let effectiveTimezone: string | undefined = undefined;
+    if (sourceModule === 'meeting') {
+      const tenantDoc = await Tenant.findById(tenantId).select('settings.timezone widget.booking.timezone').lean();
+      effectiveTimezone = (record.timezone as string) || tenantDoc?.settings?.timezone || tenantDoc?.widget?.booking?.timezone || 'Asia/Kolkata';
+    }
+    const when = whenFmt(sourceModule, record, effectiveTimezone);
     const whenLine = when ? ` scheduled for <strong>${when}</strong>` : '';
     const subject = `Confirmed: ${title} — new ${noun}`;
 
@@ -100,7 +126,7 @@ export async function sendOnCreateConfirmation(
       if (record.assignedStaffName) details.push(`<strong>With:</strong> ${record.assignedStaffName}`);
       const topicMatch = typeof record.notes === 'string' ? record.notes.match(/Topic:\s*(.+)$/) : null;
       if (topicMatch) details.push(`<strong>Reason:</strong> ${topicMatch[1]}`);
-      if (meetingTimezone) details.push(`<strong>Timezone:</strong> ${meetingTimezone}`);
+      if (effectiveTimezone) details.push(`<strong>Timezone:</strong> ${effectiveTimezone}`);
       if (details.length) meetingDetailLines = `<p>${details.join('<br/>')}</p>`;
     }
 

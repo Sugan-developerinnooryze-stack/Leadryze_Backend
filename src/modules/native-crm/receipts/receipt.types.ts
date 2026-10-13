@@ -3,4 +3,5 @@ export interface ReceiptListOptions {
   limit?:  number | string;
   search?: string;
   status?: string;
+  customerId?: string;
 }

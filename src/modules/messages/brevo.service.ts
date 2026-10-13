@@ -22,6 +22,8 @@ export interface EmailOptions {
   to: string;
   toName?: string;
   cc?: string[];
+  bcc?: string[];
+  replyTo?: string;
   subject: string;
   htmlContent: string;
   textContent?: string;
@@ -44,6 +46,8 @@ export async function sendEmailNow(opts: EmailOptions): Promise<string | null> {
         htmlContent: opts.htmlContent,
         ...(opts.textContent ? { textContent: opts.textContent } : {}),
         ...(opts.cc?.length ? { cc: opts.cc.map((email) => ({ email })) } : {}),
+        ...(opts.bcc?.length ? { bcc: opts.bcc.map((email) => ({ email })) } : {}),
+        ...(opts.replyTo ? { replyTo: { email: opts.replyTo } } : {}),
         ...(opts.attachment?.length ? { attachment: opts.attachment } : {}),
       },
       { headers: headers(), timeout: 15000 }

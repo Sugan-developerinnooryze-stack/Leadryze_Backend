@@ -181,6 +181,10 @@ export async function dispatchCampaignTick(campaignId: string, batchSize = 50): 
 
   const template = campaign.templateId ? await getTemplateById(String(campaign.tenantId), String(campaign.templateId)) : null;
   if (!template) {
+    const pendingCount = await CampaignRecipient.countDocuments({ campaignId });
+    if (pendingCount === 0 && (campaign.stats?.sent ?? 0) > 0) {
+      return { processed: 0, done: true };
+    }
     logger.error('dispatchCampaignTick: campaign has no resolvable template', { campaignId });
     await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'failed', lastError: 'Template not found' } });
     return { processed: 0, done: true };

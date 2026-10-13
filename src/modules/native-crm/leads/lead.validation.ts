@@ -24,8 +24,8 @@ export const createLeadSchema = z.object({
   annualRevenue: z.number().optional(),
   employeeCount: z.number().int().optional(),
 
-  email:          z.string().trim().email().optional().or(z.literal('')),
-  secondaryEmail: z.string().trim().email().optional().or(z.literal('')),
+  email:          z.string().trim().email('Invalid email address').optional().or(z.literal('')),
+  secondaryEmail: z.string().trim().email('Invalid email address').optional().or(z.literal('')),
   phone:          phoneSchema,
   mobile:         phoneSchema,
   whatsapp:       phoneSchema,
@@ -51,10 +51,20 @@ export const createLeadSchema = z.object({
 
   // LR-LEAD-004: unbounded negative/absurd values here corrupted Pipeline
   // Value aggregates — min(0) plus a generous sanity ceiling (anything
-  // above this is a typo, not a real deal size).
-  expectedRevenue:   z.number().min(0).max(1_000_000_000_000).optional(),
-  expectedCloseDate: z.string().optional(),
-  budget:            z.number().optional(),
+  expectedRevenue:   z.preprocess(
+    (val) => (val === '' || val === null || val === undefined ? undefined : Number(val)),
+    z.number({ invalid_type_error: 'Expected Revenue must be a number' })
+      .min(0, 'Expected Revenue must be ≥ 0')
+      .max(1_000_000_000_000, 'Expected Revenue cannot exceed 1,000,000,000,000')
+      .optional()
+  ),
+  budget:            z.preprocess(
+    (val) => (val === '' || val === null || val === undefined ? undefined : Number(val)),
+    z.number({ invalid_type_error: 'Budget must be a number' })
+      .min(0, 'Budget must be ≥ 0')
+      .max(1_000_000_000_000, 'Budget cannot exceed 1,000,000,000,000')
+      .optional()
+  ),
   interestedProducts: z.array(z.string()).optional(),
   interestedServices: z.array(z.string()).optional(),
   competitor:        z.string().trim().optional(),
@@ -77,7 +87,13 @@ export const createLeadSchema = z.object({
   customFields,
 });
 
-export const updateLeadSchema = createLeadSchema.partial();
+// LR-NEG-001: same reasoning as contact.validation.ts's updateContactSchema
+// — getLeadById's stale-save check needs updatedAt/__v on the wire, or
+// validate.middleware.ts strips them before the service ever sees them.
+export const updateLeadSchema = createLeadSchema.partial().extend({
+  updatedAt: z.string().optional(),
+  __v: z.number().optional(),
+});
 
 export const updateStageSchema = z.object({
   status: statusSchema,

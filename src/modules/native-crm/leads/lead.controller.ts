@@ -132,10 +132,11 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
-    // LR-LEAD-001: flag (never block, per LR-IMP-001's exact-match-only
-    // rule) an exact email/phone match against an existing lead, so the
-    // creator at least sees a warning instead of a silent duplicate.
+    // LR-LEAD-001 / LR-IMP-001: exact email/phone match against an existing lead
     const duplicate = await findDuplicateContact(Lead, req.tenantId!, req.body);
+    if (req.query.skipDuplicates === 'true' && duplicate) {
+      return sendSuccess(res, { duplicate: true, duplicateWarning: duplicate, skipped: true });
+    }
     const item = await createLead({
       ...req.body,
       tenantId:  req.tenantId!,
@@ -202,7 +203,31 @@ export async function update(req: AuthRequest, res: Response) {
         metadata:     { from: prev.status, to: req.body.status },
       });
       runAutomations(req.tenantId!, 'lead', item.toObject(), req.body.status).catch(() => {});
-    } else {
+    }
+
+    // LR-UI-002: Enumerate specifically updated fields instead of a generic "Lead details updated"
+    const IGNORE_FIELDS = new Set(['_id', 'tenantId', '__v', 'updatedAt', 'createdAt', 'status']);
+    const changedFields: string[] = [];
+    if (prev) {
+      const prevObj = (prev as any).toObject ? (prev as any).toObject() : prev;
+      for (const [k, v] of Object.entries(req.body)) {
+        if (!IGNORE_FIELDS.has(k) && v !== undefined && String(v) !== String((prevObj as any)[k] ?? '')) {
+          changedFields.push(k);
+        }
+      }
+    }
+    if (changedFields.length > 0) {
+      const formattedFields = changedFields.map((f) => f.replace(/([A-Z])/g, ' $1').toLowerCase().trim());
+      await NativeTimeline.create({
+        tenantId:     tid,
+        entityModule: 'leads',
+        entityId:     item._id.toString(),
+        action:       'updated',
+        description:  `Updated: ${formattedFields.join(', ')}`,
+        performedBy:  req.user?.userId,
+        metadata:     { changedFields: formattedFields },
+      });
+    } else if (!isReassignment && (!req.body.status || req.body.status === prev?.status)) {
       await NativeTimeline.create({
         tenantId:     tid,
         entityModule: 'leads',
@@ -263,7 +288,16 @@ export async function remove(req: AuthRequest, res: Response) {
     runAutomationsOnDelete(req.tenantId!, 'lead', item.toObject()).catch(() => {});
     logAuditEvent('lead.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'Lead', targetId: String(item._id), detail: { before: { leadId: item.leadId, name: `${item.firstName} ${item.lastName}`, status: item.status } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'Lead',
+        targetId: item.leadId ?? String(item._id),
+        detail: {
+          leadId: item.leadId,
+          name: `${item.firstName} ${item.lastName}`,
+          before: { leadId: item.leadId, name: `${item.firstName} ${item.lastName}`, status: item.status },
+        },
+      },
     );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

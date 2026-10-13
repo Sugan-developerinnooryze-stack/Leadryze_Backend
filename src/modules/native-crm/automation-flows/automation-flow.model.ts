@@ -114,6 +114,44 @@ export interface IFlowNode {
   targetModule?: string;
   fieldMappings?: IFieldMapping[];
   backReferenceField?: string;
+  /** Inert today — there is exactly one global Brevo/Meta/Twilio provider
+   * for the whole platform (see brevo.service.ts/whatsapp.service.ts/
+   * twilio.service.ts), not a per-tenant or multi-account concept. Present
+   * now purely so a future per-tenant Connections system is an additive
+   * "start reading this field" change rather than a schema migration —
+   * the engine never reads it yet. */
+  connectionId?: string;
+
+  // ── Send Email fields (actionType === 'send_email' only) ────────────────
+  /** Overrides recipientStrategy when set — same single-mapping shape
+   * assign_record/change_status already use (fieldMappings[0]), lets the
+   * recipient be any mapped field, not just the 4 fixed strategies. Absent
+   * = fall back to recipientStrategy exactly as before this field existed. */
+  emailTo?: IFieldMapping;
+  /** Inline subject/body — when emailBody is set it's used (template-
+   * rendered via the same {{token}} mechanism templates already use);
+   * absent falls back to the existing templateId path unchanged. */
+  emailSubject?: string;
+  emailBody?: string;
+  /** Comma-separated when multiple, same free-text convention used
+   * elsewhere in this schema (e.g. webhookHeaders' key/value pairs). */
+  emailCc?: string;
+  emailBcc?: string;
+  emailReplyTo?: string;
+  /** When true, attaches this record's own generated PDF (reusing the
+   * existing per-module PDF pipeline) — not a general file-upload system. */
+  emailAttachPdf?: boolean;
+
+  // ── Send WhatsApp / Send SMS fields (actionType === 'send_whatsapp'/'send_sms') ──
+  whatsappTo?: IFieldMapping;
+  whatsappBody?: string;
+  /** Only 'text' is actually sendable today (sendWhatsAppNow has no
+   * template/media send path) — 'template'/'image'/'document' are named
+   * now so real support later widens this enum instead of redesigning the
+   * node; the UI shows them disabled. */
+  whatsappMessageType?: 'text' | 'template' | 'image' | 'document';
+  smsTo?: IFieldMapping;
+  smsBody?: string;
   /** Retry — only meaningful on action nodes (enforced in assertValidNodes).
    * Number of retries AFTER the first attempt, so `3` means up to 4 total
    * attempts; `0`/absent is today's exact pre-Retry behavior (fail/skip on
@@ -333,6 +371,21 @@ export const flowNodeSchema = new Schema<IFlowNode>(
     backReferenceField: { type: String, trim: true },
     retryCount:         { type: Number, enum: [0, 1, 2, 3] },
     retryBackoffMs:     { type: Number, enum: [1000, 5000, 30000, 60000] },
+    connectionId:       { type: String, trim: true },
+
+    emailTo:        { type: fieldMappingSchema },
+    emailSubject:   { type: String },
+    emailBody:      { type: String },
+    emailCc:        { type: String, trim: true },
+    emailBcc:       { type: String, trim: true },
+    emailReplyTo:   { type: String, trim: true },
+    emailAttachPdf: { type: Boolean },
+
+    whatsappTo:          { type: fieldMappingSchema },
+    whatsappBody:        { type: String },
+    whatsappMessageType: { type: String, enum: ['text', 'template', 'image', 'document'] },
+    smsTo:               { type: fieldMappingSchema },
+    smsBody:             { type: String },
 
     noteSubject:     { type: String, trim: true },
     noteBody:        { type: String },

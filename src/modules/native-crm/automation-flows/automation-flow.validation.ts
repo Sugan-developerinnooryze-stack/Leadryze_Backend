@@ -131,6 +131,25 @@ const flowNodeSchema = z.object({
   backReferenceField: z.string().trim().min(1).optional(),
   retryCount:         retryCountSchema.optional(),
   retryBackoffMs:     retryBackoffMsSchema.optional(),
+  // Inert today (see the model file's own comment) — accepted and stored,
+  // never read by the engine until a real Connections system exists.
+  connectionId:       z.string().trim().min(1).optional(),
+
+  // Send Email (actionType === 'send_email' only)
+  emailTo:        fieldMappingSchema.optional(),
+  emailSubject:   z.string().trim().min(1).optional(),
+  emailBody:      z.string().min(1).optional(),
+  emailCc:        z.string().trim().min(1).optional(),
+  emailBcc:       z.string().trim().min(1).optional(),
+  emailReplyTo:   z.string().trim().min(1).optional(),
+  emailAttachPdf: z.boolean().optional(),
+
+  // Send WhatsApp / Send SMS (actionType === 'send_whatsapp'/'send_sms' only)
+  whatsappTo:          fieldMappingSchema.optional(),
+  whatsappBody:        z.string().min(1).optional(),
+  whatsappMessageType: z.enum(['text', 'template', 'image', 'document']).optional(),
+  smsTo:               fieldMappingSchema.optional(),
+  smsBody:             z.string().min(1).optional(),
 
   // Add Note (actionType === 'add_note' only)
   noteSubject:    z.string().trim().min(1).optional(),
@@ -187,8 +206,17 @@ const flowNodeSchema = z.object({
     }
   } else if (node.type === 'action') {
     if (!node.actionType) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['actionType'], message: 'Action node requires an actionType' });
-    if ((node.actionType === 'send_email' || node.actionType === 'send_sms' || node.actionType === 'send_whatsapp') && !node.templateId) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['templateId'], message: 'templateId is required for send_email/send_sms/send_whatsapp' });
+    // A saved Template or inline content — either is a complete message,
+    // templateId is no longer the only valid source now that inline
+    // Subject/Body composition exists (see the model file's own comment).
+    if (node.actionType === 'send_email' && !node.templateId && !node.emailBody) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['emailBody'], message: 'send_email requires either a templateId or inline emailBody' });
+    }
+    if (node.actionType === 'send_whatsapp' && !node.templateId && !node.whatsappBody) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['whatsappBody'], message: 'send_whatsapp requires either a templateId or inline whatsappBody' });
+    }
+    if (node.actionType === 'send_sms' && !node.templateId && !node.smsBody) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['smsBody'], message: 'send_sms requires either a templateId or inline smsBody' });
     }
     if (node.actionType === 'create_linked_record') {
       if (!node.targetModule) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['targetModule'], message: 'targetModule is required for create_linked_record' });

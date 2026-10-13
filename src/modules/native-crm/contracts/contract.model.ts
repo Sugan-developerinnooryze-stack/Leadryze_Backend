@@ -1,4 +1,4 @@
-﻿import mongoose, { Schema, Document } from 'mongoose';
+import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 
 export interface IServiceLine {
@@ -33,7 +33,16 @@ export interface IContractServiceLine extends IServiceLine {
 export interface IContractVisit {
   visitNumber: number;
   serviceDate: Date;
-  services: { name: string; amount: number; count: number; durationHours?: number; serviceId?: string; frequency?: string }[];
+  services: {
+    name:             string;
+    amount:           number;
+    count:            number;
+    taxPercent?:      number;
+    discountPercent?: number;
+    durationHours?:   number;
+    serviceId?:       string;
+    frequency?:       string;
+  }[];
   amount:      number;
   status:      'planned' | 'scheduled' | 'completed' | 'cancelled';
   workOrderId?: string;   // human code e.g. BADE2FF4-WO-0001
@@ -136,12 +145,14 @@ const serviceLineSchema = new Schema<IContractServiceLine>(
 
 const visitServiceSchema = new Schema(
   {
-    name:          { type: String, required: true, trim: true },
-    amount:        { type: Number, default: 0 },
-    count:         { type: Number, default: 1 },
-    durationHours: { type: Number },
-    serviceId:     { type: String, trim: true },
-    frequency:     { type: String, trim: true },   // schedule rule frequency — used for grouped display
+    name:            { type: String, required: true, trim: true },
+    amount:          { type: Number, default: 0 },
+    count:           { type: Number, default: 1 },
+    taxPercent:      { type: Number, default: 0 },
+    discountPercent: { type: Number, default: 0 },
+    durationHours:   { type: Number },
+    serviceId:       { type: String, trim: true },
+    frequency:       { type: String, trim: true },   // schedule rule frequency — used for grouped display
   },
   { _id: false }
 );

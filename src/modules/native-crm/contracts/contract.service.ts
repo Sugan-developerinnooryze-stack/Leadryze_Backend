@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { NativeContract } from './contract.model';
+import { NativeCustomer } from '../customers/customer.model';
 import { ContractListOptions } from './contract.types';
 import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
@@ -51,6 +52,18 @@ export async function listContracts(tenantId: string, opts: ContractListOptions,
       delete filter.$or;
     } else {
       filter.$or = staffOr;
+    }
+  }
+  if (opts.customerId) {
+    filter.customerId = opts.customerId;
+    const cust = await NativeCustomer.findOne({ tenantId: tid, customerId: opts.customerId }).select('createdAt').lean();
+    if (cust?.createdAt) {
+      if (filter.createdAt) {
+        filter.$and = [{ createdAt: filter.createdAt }, { createdAt: { $gte: cust.createdAt } }];
+        delete filter.createdAt;
+      } else {
+        filter.createdAt = { $gte: cust.createdAt };
+      }
     }
   }
   const dateField = opts.dateField && CONTRACT_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
@@ -235,6 +248,23 @@ export async function generateWorkordersForVisits(
   let created = 0;
   for (const visit of targets) {
     try {
+      const visitServices = (visit.services ?? []).map((vs: any) => {
+        const matched = (contract.services ?? []).find((cs: any) => cs.name === vs.name || (cs.serviceId && cs.serviceId === vs.serviceId));
+        return {
+          name:            vs.name,
+          description:     vs.description ?? matched?.description,
+          amount:          vs.amount,
+          count:           vs.count,
+          taxPercent:      vs.taxPercent ?? matched?.taxPercent ?? (contract.gstPercentage || 0),
+          discountPercent: vs.discountPercent ?? matched?.discountPercent ?? (contract.discount || 0),
+          durationHours:   vs.durationHours,
+          serviceId:       vs.serviceId,
+          frequency:       vs.frequency,
+        };
+      });
+      const disc = visitServices.find((s: any) => s.discountPercent != null)?.discountPercent ?? contract.discount ?? 0;
+      const gst  = visitServices.find((s: any) => s.taxPercent != null)?.taxPercent ?? contract.gstPercentage ?? 0;
+
       const wo: any = await createWorkorder({
         tenantId:              contract.tenantId,
         branchId:              contract.branchId ?? null,
@@ -242,7 +272,9 @@ export async function generateWorkordersForVisits(
         contractId:            contract.contractId,
         contractVisitNumber:   visit.visitNumber,
         title:                 `${contract.title} — Visit ${visit.visitNumber}`,
-        services:              visit.services ?? [],
+        services:              visitServices,
+        discount:              disc,
+        gstPercentage:         gst,
         teamId:                contract.teamId,
         staffId:               contract.staffId,
         staffIds:              contract.staffIds ?? [],

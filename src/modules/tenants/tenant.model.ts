@@ -31,8 +31,13 @@ export interface IFeatureFlags {
   nav_connectors:  boolean;
   nav_settings:    boolean;
   nav_crmData:     boolean;
+  nav_myCrm:       boolean;
   nav_fieldService: boolean;
   nav_configuration: boolean;
+  // Connector Data sub-items
+  connector_data_calendar:   boolean;
+  connector_data_management: boolean;
+  connector_data_automation: boolean;
   // Customers page tabs
   customers_tabLeads:    boolean;
   customers_tabContacts: boolean;
@@ -110,8 +115,12 @@ export const DEFAULT_FEATURE_FLAGS: IFeatureFlags = {
   nav_connectors:  true,
   nav_settings:    true,
   nav_crmData:     true,
+  nav_myCrm:       true,
   nav_fieldService: true,
   nav_configuration: true,
+  connector_data_calendar:   true,
+  connector_data_management: true,
+  connector_data_automation: true,
   customers_tabLeads:    true,
   customers_tabContacts: true,
   customers_tabDirect:   true,
@@ -474,8 +483,12 @@ export const featureFlagsSchemaFields = {
       nav_connectors:        { type: Boolean, default: true },
       nav_settings:          { type: Boolean, default: true },
       nav_crmData:           { type: Boolean, default: true },
+      nav_myCrm:             { type: Boolean, default: true },
       nav_fieldService:      { type: Boolean, default: true },
       nav_configuration:     { type: Boolean, default: true },
+      connector_data_calendar:   { type: Boolean, default: true },
+      connector_data_management: { type: Boolean, default: true },
+      connector_data_automation: { type: Boolean, default: true },
       customers_tabLeads:    { type: Boolean, default: true },
       customers_tabContacts: { type: Boolean, default: true },
       customers_tabDirect:   { type: Boolean, default: true },
