@@ -107,8 +107,9 @@ const retryCountSchema     = z.union([z.literal(0), z.literal(1), z.literal(2), 
 const retryBackoffMsSchema = z.union([z.literal(1000), z.literal(5000), z.literal(30000), z.literal(60000)]);
 
 const flowNodeSchema = z.object({
-  id:   z.string().trim().min(1),
-  type: z.enum(['trigger', 'action', 'condition', 'delay', 'merge', 'subFlow', 'loop', 'approval']),
+  id:       z.string().trim().min(1),
+  type:     z.enum(['trigger', 'action', 'condition', 'delay', 'merge', 'subFlow', 'loop', 'approval']),
+  disabled: z.boolean().optional(),
 
   module:       moduleSchema.optional(),
   triggerType:  triggerTypeSchema.optional(),
@@ -184,6 +185,11 @@ const flowNodeSchema = z.object({
   // that (defaults to 'manager' at the service layer if omitted).
   approvalRecipientStrategy: z.enum(['record_contact', 'assigned_user', 'tenant_admin', 'manager']).optional(),
 }).superRefine((node, ctx) => {
+  // Deactivated — exempt from every per-node content check below, same
+  // reasoning as assertValidNodes' own identical exemption (automation-flow.
+  // service.ts): the whole point of turning a node off instead of deleting
+  // it is not having to finish configuring it yet. Never true for a trigger.
+  if (node.disabled) return;
   if (node.type === 'trigger') {
     if (!node.module) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['module'], message: 'Trigger node requires a module' });
     if ((node.triggerType ?? 'status_changed') === 'status_changed' && !node.triggerStage) {

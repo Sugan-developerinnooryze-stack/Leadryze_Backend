@@ -76,6 +76,11 @@ export interface IFlowNode {
    * sub-collection, so re-ordering/editing never needs a stable Mongo id. */
   id: string;
   type: FlowNodeType;
+  /** When true, this node's own effect never runs — the engine logs a
+   * 'skipped' step and advances down whatever edge the node's own success
+   * path would normally take (see passThroughEdges() in automation-flow.
+   * service.ts). Never meaningful on the trigger node itself. */
+  disabled?: boolean;
 
   // ── Trigger node fields (present only when type === 'trigger') ──────────
   /** The module this flow listens to — same PipelineModule/`custom:<slug>`
@@ -345,8 +350,9 @@ const flowConditionSchema = new Schema<IFlowCondition>(
 // change for anything already using this file.
 export const flowNodeSchema = new Schema<IFlowNode>(
   {
-    id:   { type: String, required: true, trim: true },
-    type: { type: String, enum: ['trigger', 'action', 'condition', 'delay', 'merge', 'subFlow', 'loop', 'approval'], required: true },
+    id:       { type: String, required: true, trim: true },
+    type:     { type: String, enum: ['trigger', 'action', 'condition', 'delay', 'merge', 'subFlow', 'loop', 'approval'], required: true },
+    disabled: { type: Boolean, default: false },
 
     module:      { type: String, trim: true },
     triggerType: { type: String, enum: ['status_changed', 'record_created', 'record_updated', 'record_deleted', 'scheduled', 'webhook'] },

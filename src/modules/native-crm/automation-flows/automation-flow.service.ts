@@ -431,6 +431,13 @@ async function assertValidNodes(tenantId: string, nodes: IFlowNode[], issues: st
   };
 
   for (const node of nodes) {
+    // Deactivated — exempt from every deep content check below (stale field
+    // references, missing recipient mapping, etc.). It still has to be a
+    // structurally valid node (assertValidFlowShape, called separately,
+    // still applies) — it just doesn't have to be fully CONFIGURED to
+    // publish, which is the whole point of turning it off instead of
+    // deleting it. Never true for a trigger (can't be disabled).
+    if (node.disabled) continue;
     if (node.type === 'trigger') {
       if (!node.module) {
         issues.push('Trigger node is missing its module');
@@ -881,6 +888,22 @@ export async function dryRunFlow(
     const node = nodes.find((n) => n.id === cursorId);
     if (!node) break;
 
+    // Dry-run is a fully independent simulation from processOneNode (see
+    // this function's own top comment) and must mirror its disabled-node
+    // behavior exactly, or "Test" would preview the WRONG thing for any
+    // flow containing a deactivated node — same passThroughEdges() used by
+    // the real engine, not a second rule.
+    if (node.disabled) {
+      const nextIds = passThroughEdges(node, edges);
+      steps.push({
+        nodeId: node.id, nodeType: node.type, label: describeNodeForLog(node),
+        result: 'deactivated — would be skipped, flow would continue down its default path',
+        status: 'would-skip',
+      });
+      cursorId = nextIds[0];
+      continue;
+    }
+
     if (node.type === 'merge') {
       steps.push({ nodeId: node.id, nodeType: 'merge', label: 'Merge', result: 'reached (branches not simulated independently in dry-run)', status: 'ok' });
       cursorId = edges.find((e) => e.from === node.id)?.to;
@@ -1308,6 +1331,28 @@ async function invokeFlowInline(
  * execution-order-interleaved steps[] array can be regrouped into per-branch
  * timelines later — absent for the ordinary non-parallel case, so every
  * existing flow's step log stays byte-identical to before this feature. */
+/** Which outgoing edge(s) a DISABLED node advances down — mirrors exactly
+ * what that node type's own real success path already uses below, rather
+ * than inventing a separate rule. Condition defaults to 'true': a live
+ * condition node that evaluates true with no 'true' edge wired already
+ * dead-ends today (nextIds: [], no error) — this doesn't introduce a new
+ * failure mode, it's the same outcome a live node can already reach. Action
+ * accepts both the untagged (pre-Error-Branch) and 'success'/'failure'-
+ * tagged edge shapes, same as the real dispatch at this function's own
+ * `outcome === 'success'` filter further down. Approval takes 'approve' —
+ * see this node type's own doc comment above for why, and the extra
+ * confirmation gate the frontend puts in front of toggling it. Delay/
+ * subFlow/loop fall through to "every outgoing edge", which
+ * assertValidFlowShape guarantees is at most one, untagged, for all three.
+ * Never called for a merge node — see processOneNode's own disabled guard. */
+function passThroughEdges(node: IFlowNode, edges: IFlowEdge[]): string[] {
+  const outs = edges.filter((e) => e.from === node.id);
+  if (node.type === 'condition') return outs.filter((e) => e.fromPort === 'true').map((e) => e.to);
+  if (node.type === 'action')    return outs.filter((e) => e.fromPort === undefined || e.fromPort === 'success').map((e) => e.to);
+  if (node.type === 'approval')  return outs.filter((e) => e.fromPort === 'approve').map((e) => e.to);
+  return outs.map((e) => e.to);
+}
+
 async function processOneNode(
   tenantId: string,
   flow: IAutomationFlow,
@@ -1328,6 +1373,23 @@ async function processOneNode(
     ...(subFlowNodeId ? { subFlowNodeId } : {}),
     ...(loopIterationIndex !== undefined ? { loopIterationIndex } : {}),
   });
+
+  if (node.disabled) {
+    // The node's own effect never runs — advance down exactly the edge(s)
+    // its real success path would take (reusing the same port semantics as
+    // each type's own dispatch below, not a separate guess). Never reached
+    // for a merge node — merge has no effect of its own to skip and is
+    // intercepted before processOneNode is ever called for it (see the
+    // 'merge' type-guards in runBranch/runLoop above this function).
+    const nextIds = passThroughEdges(node, flow.edges);
+    const finishedAt = new Date();
+    await log({
+      nodeId: node.id, nodeType: node.type, label: describeNodeForLog(node),
+      status: 'skipped', startedAt: stepStart, finishedAt, durationMs: 0,
+      result: 'Deactivated — skipped, flow continued down its default path',
+    });
+    return { kind: 'advance', ctx: { currentRecord, currentModule, hadSkip: true }, nextIds };
+  }
 
   if (node.type === 'delay') {
     // Pauses the run entirely — this invocation ends here; pollPausedFlows()/
