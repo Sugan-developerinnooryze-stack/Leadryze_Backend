@@ -1142,8 +1142,15 @@ router.post('/crm-write/:tenantId/:module', async (req: Request, res: Response, 
       // statusCode: 409) instead of flattening every failure to a generic
       // 400 — found during Stage B review; a correct 409 lets the chatbot
       // explain "can't delete, it's still linked to other records" instead
-      // of a generic "bad request."
-      const statusCode = (opErr as any).statusCode ?? 400;
+      // of a generic "bad request." Company's updateCompany throws a named
+      // VersionError (no statusCode set, only .name) on a lost-update
+      // conflict — its own message is already human-readable ("changed by
+      // someone else — please reload"), just needs the right status code.
+      // In practice this gateway's own expectedSnapshot stale-check above
+      // should already catch the same race before ever reaching
+      // updateCompany, but this stays as a second line of defense.
+      const isVersionConflict = (opErr as any).name === 'VersionError';
+      const statusCode = isVersionConflict ? 409 : ((opErr as any).statusCode ?? 400);
       await writeNativeCrmLog({
         tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
         action: 'error', module: moduleDef.logModule, resourceId: recordId ?? '',

@@ -8,10 +8,10 @@ import { listProducts, createProduct, updateProduct, deleteProduct, getProductBy
 import { listAssets, createAsset, updateAsset, deleteAsset, getAssetById } from '../native-crm/assets/asset.service';
 import { listVehicles, createVehicle, updateVehicle, deleteVehicle, getVehicleById } from '../native-crm/vehicles/vehicle.service';
 import { listExpenses, createExpense, updateExpense, deleteExpense, getExpenseById } from '../native-crm/expenses/expense.service';
-import { listCompanies } from '../native-crm/companies/company.service';
-import { listTasks } from '../native-crm/tasks/task.service';
-import { listTickets } from '../native-crm/tickets/ticket.service';
-import { listCalls } from '../native-crm/calls/call.service';
+import { listCompanies, createCompany, updateCompany, deleteCompany, getCompanyById } from '../native-crm/companies/company.service';
+import { listTasks, createTask, updateTask, deleteTask, getTaskById } from '../native-crm/tasks/task.service';
+import { listTickets, createTicket, updateTicket, deleteTicket, getTicketById } from '../native-crm/tickets/ticket.service';
+import { listCalls, createCall, updateCall, deleteCall, getCallById } from '../native-crm/calls/call.service';
 import { listMeetings } from '../native-crm/meetings/meeting.service';
 import { listSites, createSite, updateSite, deleteSite, getSiteById } from '../native-crm/sites/site.service';
 import { listTeams } from '../native-crm/teams/team.service';
@@ -242,9 +242,20 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
       { key: 'status', label: 'Status', type: 'select', options: [{ value: 'pending', label: 'Pending' }, { value: 'approved', label: 'Approved' }, { value: 'rejected', label: 'Rejected' }] },
     ],
   },
+  // Company/Task/Ticket/Call's own service functions all put tenantId
+  // FIRST — create(tenantId, dto)/update(tenantId, id, dto, scope?)/
+  // delete(tenantId, id, scope?)/getById(tenantId, id, scope?) — the
+  // opposite order from every module above. create's own external
+  // signature here is already (tenantId, data), so it needs no reordering;
+  // update/delete/getById's external shape is (id, tenantId, ...), so
+  // those three closures swap the two arguments before calling through.
   company: {
     permissionPrefix: 'native_crm.companies', logModule: 'companies', statusField: 'companyStatus',
     list: (tenantId, opts, branchId, scope) => listCompanies(tenantId, opts as any, scope, undefined) as any,
+    create: (tenantId, data) => createCompany(tenantId, data as any),
+    update: (id, tenantId, data, scope) => updateCompany(tenantId, id, data as any, scope),
+    delete: (id, tenantId, scope) => deleteCompany(tenantId, id, scope),
+    getById: (id, tenantId, scope) => getCompanyById(tenantId, id, scope),
     schemaFields: [
       { key: 'name', label: 'Name', type: 'text' }, { key: 'domain', label: 'Domain', type: 'text' }, { key: 'industry', label: 'Industry', type: 'text' }, { key: 'employeeCount', label: 'Employee Count', type: 'number' }, { key: 'phone', label: 'Phone', type: 'text' }, { key: 'city', label: 'City', type: 'text' }, { key: 'country', label: 'Country', type: 'text' },
       { key: 'companyStatus', label: 'Status', type: 'select', options: [{ value: 'active', label: 'Active' }, { value: 'inactive', label: 'Inactive' }, { value: 'prospect', label: 'Prospect' }] },
@@ -253,20 +264,41 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
   task: {
     permissionPrefix: 'native_crm.tasks', logModule: 'tasks', statusField: 'taskStatus',
     list: (tenantId, opts, branchId, scope) => listTasks(tenantId, opts as any, branchId, scope),
+    create: (tenantId, data) => createTask(tenantId, data as any),
+    update: (id, tenantId, data, scope) => updateTask(tenantId, id, data as any, scope),
+    delete: (id, tenantId, scope) => deleteTask(tenantId, id, scope),
+    getById: (id, tenantId, scope) => getTaskById(tenantId, id, scope),
     model: Task,
     overdueConfig: { dateField: 'dueDate', scopeAnchor: 'createdBy', terminalStatuses: ['done', 'cancelled'] },
     // Schema comes from getFieldCatalog('task') (automation-rules), not schemaFields.
+    // createTask/updateTask validate taskStatus against the tenant's real
+    // pipeline stage keys (assertValidStatus) and throw a plain Error —
+    // bubbles through the gateway's existing generic catch as a clean 400,
+    // same as every other business-rule throw.
   },
   ticket: {
     permissionPrefix: 'native_crm.tickets', logModule: 'tickets', statusField: 'ticketStatus',
     list: (tenantId, opts, branchId, scope) => listTickets(tenantId, opts as any, branchId, scope),
+    create: (tenantId, data) => createTicket(tenantId, data as any),
+    update: (id, tenantId, data, scope) => updateTicket(tenantId, id, data as any, scope),
+    delete: (id, tenantId, scope) => deleteTicket(tenantId, id, scope),
+    getById: (id, tenantId, scope) => getTicketById(tenantId, id, scope),
     model: Ticket,
     overdueConfig: { dateField: 'resolutionDueAt', scopeAnchor: 'createdBy', terminalStatuses: ['resolved', 'closed'] },
-    // Schema comes from getFieldCatalog('ticket'), not schemaFields.
+    // Schema comes from getFieldCatalog('ticket'), not schemaFields. Same
+    // assertValidStatus pattern as Task. updateTicket ALSO recomputes SLA
+    // due dates when priority actually changes (reads the current
+    // priority first, only recomputes if it's genuinely different) — a
+    // real side effect the AI side discloses in the confirmation summary
+    // (see crm-write.tool.ts's SLA note).
   },
   call: {
     permissionPrefix: 'native_crm.calls', logModule: 'calls', statusField: 'callStatus',
     list: (tenantId, opts, branchId, scope) => listCalls(tenantId, opts as any, scope, undefined) as any,
+    create: (tenantId, data) => createCall(tenantId, data as any),
+    update: (id, tenantId, data, scope) => updateCall(tenantId, id, data as any, scope),
+    delete: (id, tenantId, scope) => deleteCall(tenantId, id, scope),
+    getById: (id, tenantId, scope) => getCallById(tenantId, id, scope),
     schemaFields: [
       { key: 'contactName', label: 'Contact Name', type: 'text' }, { key: 'direction', label: 'Direction', type: 'select', options: [{ value: 'inbound', label: 'Inbound' }, { value: 'outbound', label: 'Outbound' }] }, { key: 'duration', label: 'Duration (seconds)', type: 'number' }, { key: 'date', label: 'Date', type: 'date' },
       { key: 'callStatus', label: 'Status', type: 'select', options: [{ value: 'planned', label: 'Planned' }, { value: 'completed', label: 'Completed' }, { value: 'missed', label: 'Missed' }, { value: 'cancelled', label: 'Cancelled' }] },
