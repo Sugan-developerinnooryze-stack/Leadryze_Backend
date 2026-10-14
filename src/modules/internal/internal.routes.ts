@@ -81,6 +81,12 @@ import { NativeService } from '../native-crm/services/service.model';
 import { NativeStaff } from '../native-crm/staffs/staff.model';
 import { NativeCategory } from '../native-crm/categories/category.model';
 import { Lead } from '../native-crm/leads/lead.model';
+import { getFieldCatalog } from '../native-crm/automation-rules/automation-rule.service';
+import { PipelineModule } from '../native-crm/pipeline-config/pipeline-config.model';
+import { CRM_WRITE_MODULE_MAP, permissionKeyFor } from './crm-write.module-map';
+import { countCrmModule, getOverdueCrmModule, getCrmModuleSchema, projectToSchemaFields, applyPIIProtection } from './crm-read.service';
+import { writeNativeCrmLog } from '../../middlewares/native-crm-log.middleware';
+import { listCustomModules, getCustomModuleBySlug, listCustomRecords } from '../custom-modules/custom-module.service';
 
 const router = Router();
 
@@ -738,6 +744,425 @@ router.get('/crm-search/:tenantId', async (req: Request, res: Response, next: Ne
     }).slice(0, limit);
 
     sendSuccess(res, all, `Found ${all.length} record(s) for "${q}"`);
+  } catch (err) { next(err); }
+});
+
+/* ── CRM Assistant (internal, authenticated CRUD gateway) ─────────────────
+ * Phase 1 of the internal CRM chatbot's write capability — Leads, Work
+ * Orders, Invoices only (see CRM_WRITE_MODULE_MAP). Deliberately separate
+ * from every other route in this file: this is the one place a verified
+ * per-user identity (not just the shared x-internal-key) gates a MUTATION,
+ * not just a read, reusing the exact same jwt.verify+resolveDataScope+
+ * hasPermission pattern /crm-search above already proves out for reads. */
+
+interface VerifiedIdentity {
+  role?: string;
+  roleId?: string;
+  userId?: string;
+  branchId?: string | null;
+}
+
+/** Verifies a caller-supplied internalAuth JWT against this tenant — the
+ * SAME verification /crm-search performs inline above. Any failure (missing,
+ * expired, tampered, wrong secret, tenantId mismatch) is treated as "no
+ * identity" so every caller below fails closed rather than silently
+ * defaulting to an unscoped/admin identity. */
+function verifyInternalIdentity(tenantId: string, internalAuthToken: string | undefined): VerifiedIdentity {
+  if (!internalAuthToken) return {};
+  try {
+    const payload = jwt.verify(internalAuthToken, config.jwt.secret) as jwt.JwtPayload;
+    if (payload.tenantId === tenantId) {
+      return { role: payload.role, roleId: payload.roleId, userId: payload.userId, branchId: payload.branchId ?? null };
+    }
+  } catch { /* invalid/expired/tampered token — treat as no identity */ }
+  return {};
+}
+
+async function resolveScopeForIdentity(tenantId: string, identity: VerifiedIdentity): Promise<DataScope> {
+  if (!identity.userId) return { kind: 'self', staffIds: [], teamIds: [], createdByUserIds: [] };
+  return resolveDataScope(tenantId, {
+    tenantId, userId: identity.userId, role: (identity.role as any) ?? 'AGENT', roleId: identity.roleId, email: '',
+  } as JwtPayload);
+}
+
+/**
+ * GET /api/internal/crm-schema/:tenantId/:module?internalAuth=...
+ *
+ * What fields a module has — getCrmModuleSchema() (crm-read.service.ts)
+ * resolves this from getFieldCatalog() for the 5 modules it covers
+ * (lead/workorder/invoice/task/ticket) or each module's own hand-authored
+ * schemaFields allowlist otherwise, so the chatbot proposes writes/answers
+ * questions against the tenant's real field set rather than guessing, and
+ * never exposes a credential/internal-only field.
+ */
+router.get('/crm-schema/:tenantId/:module', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    if (!CRM_WRITE_MODULE_MAP[module]) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const result = await getCrmModuleSchema(module, tenantId);
+    sendSuccess(res, result, 'OK');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-count/:tenantId/:module?internalAuth=...
+ *
+ * Reuses the module's own list() function (limit:1, reads .total) — see
+ * crm-read.service.ts's own comment on why this is never a separate
+ * countDocuments reimplementation.
+ */
+router.get('/crm-count/:tenantId/:module', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    if (!CRM_WRITE_MODULE_MAP[module]) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const permKey = permissionKeyFor(module, 'view')!;
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+    const result = await countCrmModule(module, tenantId, scope, identity.branchId);
+    if (!result) { sendError(res, `Module "${module}" is not supported`, 400); return; }
+    sendSuccess(res, result, 'OK');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-overdue/:tenantId/:module?internalAuth=...
+ *
+ * Only for modules with an overdueConfig declared (workorder/task/ticket in
+ * Stage A) — a clean 400 naming which modules support it otherwise.
+ */
+router.get('/crm-overdue/:tenantId/:module', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const moduleDef = CRM_WRITE_MODULE_MAP[module];
+    if (!moduleDef) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    if (!moduleDef.overdueConfig) {
+      const supported = Object.entries(CRM_WRITE_MODULE_MAP).filter(([, d]) => d.overdueConfig).map(([k]) => k);
+      sendError(res, `"${module}" has no overdue concept. Supported: ${supported.join(', ')}`, 400); return;
+    }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const permKey = permissionKeyFor(module, 'view')!;
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+    const result = await getOverdueCrmModule(module, tenantId, scope);
+    sendSuccess(res, result, 'OK');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-custom-modules/:tenantId?internalAuth=...
+ * GET /api/internal/crm-custom-modules/:tenantId/:slug?internalAuth=...
+ *
+ * Read-only Custom Module definitions — wraps the existing
+ * listCustomModules()/getCustomModuleBySlug() (custom-module.service.ts),
+ * unchanged, gated on the real custom_modules.definitions.view permission
+ * (a different namespace from records — see custom-module.routes.ts).
+ */
+router.get('/crm-custom-modules/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, 'custom_modules.definitions.view').catch(() => false))) {
+      sendError(res, 'Not permitted: custom_modules.definitions.view', 403); return;
+    }
+    const modules = await listCustomModules(tenantId);
+    sendSuccess(res, modules, `Found ${modules.length} custom module(s)`);
+  } catch (err) { next(err); }
+});
+
+router.get('/crm-custom-modules/:tenantId/:slug', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, slug } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, 'custom_modules.definitions.view').catch(() => false))) {
+      sendError(res, 'Not permitted: custom_modules.definitions.view', 403); return;
+    }
+    const def = await getCustomModuleBySlug(tenantId, slug);
+    if (!def) { sendError(res, `Custom module "${slug}" not found`, 404); return; }
+    sendSuccess(res, def, 'OK');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-custom-records-count/:tenantId/:slug?internalAuth=...
+ *
+ * Reuses listCustomRecords(limit:1) and reads .total — same "reuse the real
+ * function, never reimplement counting" discipline as countCrmModule above.
+ */
+router.get('/crm-custom-records-count/:tenantId/:slug', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, slug } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, 'custom_modules.records.view').catch(() => false))) {
+      sendError(res, 'Not permitted: custom_modules.records.view', 403); return;
+    }
+    const result = await listCustomRecords(tenantId, slug, { limit: 1 });
+    sendSuccess(res, { slug, total: result.total }, 'OK');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-list/:tenantId/:module?q=...&limit=...&internalAuth=...
+ *
+ * Phase 1's READ path — search/list within exactly one of lead/workorder/
+ * invoice (CRM_WRITE_MODULE_MAP's own allowlist, shared with the write
+ * route below so there's one definition of "what Phase 1 can touch", not
+ * two). Deliberately narrower than /crm-search above: that route also
+ * returns connector-synced and omnichannel-Customer data, which is out of
+ * Phase 1's explicit Native-CRM-only scope (see the plan's Context section)
+ * — reusing it here would silently leak sources Phase 1 promises not to
+ * touch into the CRM assistant's answers.
+ */
+router.get('/crm-list/:tenantId/:module', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const moduleDef = CRM_WRITE_MODULE_MAP[module];
+    if (!moduleDef) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = permissionKeyFor(module, 'view')!;
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    const q = (req.query.q as string || '').trim();
+    const limit = Math.min(parseInt((req.query.limit as string) || '10', 10), 25);
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+    // categoryId passthrough — the one relationship filter Stage A supports
+    // directly, for "which services belong to category X" (Service.categoryId
+    // is a real ref, already handled by listServices' own opts). Scoped to
+    // the one module that has this relationship, not a generic filter
+    // mechanism — see the plan's own narrow §6 scope for why.
+    const opts: Record<string, unknown> = { search: q || undefined, limit, page: 1 };
+    if (module === 'service' && req.query.categoryId) opts.categoryId = req.query.categoryId as string;
+    const result = await moduleDef.list(tenantId, opts as any, identity.branchId, scope);
+    // Same decrypt-for-admins/mask-for-everyone-else step every human-facing
+    // controller already applies for a PII_FIELDS module (lead included) —
+    // calling moduleDef.list() directly here bypasses that controller, so
+    // this has to be done explicitly. No-op for non-PII-registered modules.
+    const piiSafe = await applyPIIProtection(result.items, moduleDef.logModule, tenantId, identity.branchId, identity.role ?? 'AGENT');
+    // Project down to the module's own schemaFields allowlist (where one is
+    // declared) before this ever reaches the AI service — see
+    // projectToSchemaFields's own comment for why this can't be left to the
+    // model's good behavior alone (Staff/Customer's appUsername etc. aren't
+    // Mongoose select:false, so they'd otherwise ride along unfiltered).
+    const items = moduleDef.schemaFields ? projectToSchemaFields(piiSafe, moduleDef.schemaFields) : piiSafe;
+    sendSuccess(res, items, `Found ${items.length} ${module} record(s)`);
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-get/:tenantId/:module/:recordId?internalAuth=...
+ *
+ * Single-record fetch by real _id — used by crm_propose_write (AI side) to
+ * positively identify the target record and build a real before/after diff
+ * BEFORE staging a confirmation, so the confirm card never relies solely on
+ * the model's own prose. Only works for a module with `getById` populated
+ * (Stage B's CRUD-enabled modules) — a clean 400 otherwise, not a crash.
+ */
+router.get('/crm-get/:tenantId/:module/:recordId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module, recordId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const moduleDef = CRM_WRITE_MODULE_MAP[module];
+    if (!moduleDef) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = permissionKeyFor(module, 'view')!;
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    if (!moduleDef.getById) { sendError(res, `"${module}" does not support single-record lookup`, 400); return; }
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+    const record = await moduleDef.getById(recordId, tenantId, scope);
+    if (!record) { sendError(res, 'Record not found or not in scope', 404); return; }
+
+    // Same PII decrypt/mask + schema-allowlist projection GET /crm-list
+    // already applies — reused, not reimplemented, so a confirmation diff
+    // can never show raw PII ciphertext or a credential-adjacent field.
+    const piiSafe = await applyPIIProtection([record], moduleDef.logModule, tenantId, identity.branchId, identity.role ?? 'AGENT');
+    const items = moduleDef.schemaFields ? projectToSchemaFields(piiSafe, moduleDef.schemaFields) : piiSafe;
+    sendSuccess(res, items[0], 'OK');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-customer-lookup/:tenantId?q=...&internalAuth=...
+ *
+ * Read-only NativeCustomer (Field Service customer) search by name/email/
+ * phone — needed so "create a work order for Kumar" can resolve a real
+ * customerId before proposing the write. Deliberately NOT part of
+ * CRM_WRITE_MODULE_MAP — Phase 1 exposes no general NativeCustomer CRUD,
+ * only this narrow lookup.
+ */
+router.get('/crm-customer-lookup/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const q = (req.query.q as string || '').trim();
+    if (!q) { sendSuccess(res, [], 'No query'); return; }
+    if (!identity.roleId || !(await hasPermission(tenantId, identity.roleId, 'fs.customers.view').catch(() => false))
+        && identity.role !== 'SUPER_ADMIN' && identity.role !== 'TENANT_ADMIN') {
+      sendError(res, 'Not permitted to view Field Service customers', 403); return;
+    }
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+    const result = await listNativeCustomers(tenantId, { search: q, limit: 5, page: 1 } as any, identity.branchId, scope);
+    // Same leak Stage A's own live verification found and fixed on GET
+    // /crm-list applies here too — this Phase 1 route returns raw
+    // NativeCustomer docs the same way, so it carries the exact same
+    // appUsername/raw-PII-ciphertext exposure. Reuses the 'customer'
+    // moduleDef's own schemaFields allowlist (CRM_WRITE_MODULE_MAP) rather
+    // than hand-authoring a second one for the same model.
+    const piiSafe = await applyPIIProtection(result.items, 'customers', tenantId, identity.branchId, identity.role ?? 'AGENT');
+    const items = CRM_WRITE_MODULE_MAP.customer?.schemaFields
+      ? projectToSchemaFields(piiSafe, CRM_WRITE_MODULE_MAP.customer.schemaFields)
+      : piiSafe;
+    sendSuccess(res, items, `Found ${items.length} customer(s) for "${q}"`);
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/crm-write/:tenantId/:module
+ * body: { operation: 'create'|'update'|'delete', recordId?, data?, internalAuth }
+ *
+ * The ONLY mutation path the CRM chatbot has. Every step below is in a
+ * fixed order and none can be skipped: verify identity -> check the
+ * explicit module allowlist -> check the real RBAC permission key (the
+ * SAME key the equivalent human route requires) -> resolve DataScope ->
+ * dispatch to the real, existing service function -> write an audit entry
+ * shaped identically to a human-driven one -> return the real result.
+ */
+router.post('/crm-write/:tenantId/:module', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module } = req.params;
+    const { operation, recordId, data, internalAuth, expectedSnapshot } = req.body as {
+      operation?: 'create' | 'update' | 'delete'; recordId?: string; data?: Record<string, unknown>; internalAuth?: string;
+      expectedSnapshot?: Record<string, unknown>;
+    };
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+
+    const moduleDef = CRM_WRITE_MODULE_MAP[module];
+    if (!moduleDef) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    if (operation !== 'create' && operation !== 'update' && operation !== 'delete') {
+      sendError(res, `Operation "${operation}" is not supported`, 400); return;
+    }
+    if ((operation === 'update' || operation === 'delete') && !recordId) {
+      sendError(res, 'recordId is required for update/delete', 400); return;
+    }
+    // Stage A added 15 read-only modules to the registry — create/update/
+    // delete are deliberately undefined for all of them until Stage B. A
+    // clean, explicit rejection here (not a crash) is what lets the agent
+    // tell the user "I can't do that yet" instead of silently failing
+    // partway through what looks like an attempted write.
+    if (!moduleDef[operation]) {
+      sendError(res, `"${operation}" is not yet supported for ${module} — this module is currently read-only`, 400); return;
+    }
+
+    const identity = verifyInternalIdentity(tenantId, internalAuth);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = permissionKeyFor(module, operation)!;
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+
+    // Stale-write guard: the proposal was built from a snapshot fetched at
+    // PROPOSE time, which could be minutes old by the time the user actually
+    // confirms. Re-fetch right now, immediately before the real mutation —
+    // the one point that actually matters — and refuse if anything the
+    // proposal was shown has since changed. Never trust the recordId/TTL
+    // alone to mean "still accurate."
+    if ((operation === 'update' || operation === 'delete') && expectedSnapshot && moduleDef.getById) {
+      const current = await moduleDef.getById(recordId!, tenantId, scope);
+      if (!current) { sendError(res, 'Record not found or not in scope', 404); return; }
+      const stale = Object.entries(expectedSnapshot).some(
+        ([key, expected]) => String(current[key] ?? '') !== String(expected ?? ''),
+      );
+      if (stale) {
+        sendError(res, 'This record changed since you last reviewed it — please ask again for a fresh look.', 409);
+        return;
+      }
+    }
+
+    let result: any;
+    let logAction: 'create' | 'update' | 'delete' = operation;
+    try {
+      if (operation === 'create') {
+        // tenantId/createdBy are NEVER taken from the caller-supplied `data`
+        // — only from the verified identity above, so an LLM-driven tool
+        // call can never attribute a record to a different tenant or user
+        // than the one actually making the request.
+        const safeData = { ...(data ?? {}) };
+        delete (safeData as any).tenantId;
+        delete (safeData as any).createdBy;
+        result = await moduleDef.create!(tenantId, { ...safeData, createdBy: identity.userId });
+      } else if (operation === 'update') {
+        result = await moduleDef.update!(recordId!, tenantId, data ?? {}, scope);
+        if (!result) { sendError(res, 'Record not found or not in scope', 404); return; }
+      } else {
+        result = await moduleDef.delete!(recordId!, tenantId, scope);
+        if (!result) { sendError(res, 'Record not found or not in scope', 404); return; }
+      }
+    } catch (opErr) {
+      // Respect a service-layer error's own HTTP status when it carries one
+      // (e.g. Customer's referential-integrity delete guard throws with
+      // statusCode: 409) instead of flattening every failure to a generic
+      // 400 — found during Stage B review; a correct 409 lets the chatbot
+      // explain "can't delete, it's still linked to other records" instead
+      // of a generic "bad request."
+      const statusCode = (opErr as any).statusCode ?? 400;
+      await writeNativeCrmLog({
+        tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+        action: 'error', module: moduleDef.logModule, resourceId: recordId ?? '',
+        error: (opErr as Error).message, statusCode, url: req.originalUrl,
+      }).catch(() => {});
+      sendError(res, (opErr as Error).message, statusCode);
+      return;
+    }
+
+    await writeNativeCrmLog({
+      tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+      action: logAction, module: moduleDef.logModule,
+      resourceId: String(result?._id ?? recordId ?? ''),
+      after: logAction !== 'delete' ? (result?.toObject ? result.toObject() : result) : null,
+      changes: logAction === 'update' ? (data ?? null) : null,
+      statusCode: 200, url: req.originalUrl,
+    }).catch(() => {});
+
+    sendSuccess(res, result, `${module} ${operation} succeeded`);
   } catch (err) { next(err); }
 });
 

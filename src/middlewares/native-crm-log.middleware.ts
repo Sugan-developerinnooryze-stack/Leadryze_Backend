@@ -33,7 +33,7 @@ import { NativeAsset }     from '../modules/native-crm/assets/asset.model';
 import { NativeVehicle }   from '../modules/native-crm/vehicles/vehicle.model';
 import { Branch }          from '../modules/native-crm/branches/branch.model';
 
-const MODULE_MODEL_MAP: Record<string, Model<any>> = {
+export const MODULE_MODEL_MAP: Record<string, Model<any>> = {
   customers:  NativeCustomer,
   leads:      Lead,
   deals:      Deal,
@@ -74,11 +74,58 @@ const SKIP_MODULES = new Set([
 
 const SENSITIVE_KEYS = new Set(['password', 'token', 'secret', 'apiKey', 'accessToken', 'refreshToken']);
 
-function sanitize(obj: Record<string, unknown> | null): Record<string, unknown> | null {
+export function sanitize(obj: Record<string, unknown> | null): Record<string, unknown> | null {
   if (!obj || typeof obj !== 'object') return obj;
   const copy = { ...obj };
   for (const k of SENSITIVE_KEYS) { if (k in copy) copy[k] = '[REDACTED]'; }
   return copy;
+}
+
+export interface NativeCrmLogParams {
+  tenantId: string;
+  actorId: string;
+  actorName: string;
+  actorRole: string;
+  action: 'create' | 'update' | 'delete' | 'error';
+  module: string;
+  resourceId: string;
+  before?: Record<string, unknown> | null;
+  after?: Record<string, unknown> | null;
+  changes?: Record<string, unknown> | null;
+  error?: string | null;
+  statusCode?: number;
+  ip?: string;
+  url?: string;
+}
+
+/** The single place a NativeCrmLog document actually gets written — used by
+ * this file's own Express middleware (below) for every human-driven write,
+ * and reused as-is by the internal CRM-chat gateway (internal.routes.ts) so
+ * a chatbot-driven write produces an audit entry that's byte-identical in
+ * shape to a human one, not just similar. */
+export async function writeNativeCrmLog(params: NativeCrmLogParams): Promise<void> {
+  let clientId = '';
+  if (params.tenantId && mongoose.Types.ObjectId.isValid(params.tenantId)) {
+    clientId = await resolveClientPrefix(new mongoose.Types.ObjectId(params.tenantId)).catch(() => '') as string;
+  }
+  await NativeCrmLog.create({
+    tenantId:   params.tenantId,
+    clientId,
+    actorId:    params.actorId,
+    actorName:  params.actorName,
+    actorRole:  params.actorRole,
+    action:     params.action,
+    module:     params.module,
+    resourceId: params.resourceId,
+    before:     params.action === 'error' ? null : sanitize(params.before ?? null),
+    after:      params.action === 'error' ? null : sanitize(params.after ?? null),
+    changes:    params.changes !== undefined ? sanitize(params.changes) : null,
+    error:      params.error ?? null,
+    statusCode: params.statusCode ?? 200,
+    ip:         params.ip ?? 'unknown',
+    url:        params.url ?? '',
+    timestamp:  new Date(),
+  });
 }
 
 function extractModule(path: string): string {
@@ -189,31 +236,23 @@ export async function nativeCrmLog(req: AuthRequest, res: Response, next: NextFu
         const actor = req.user;
         const actorName = actor?.email ?? actor?.userId ?? 'anonymous';
 
-        // Stamp the tenant's clientId (cached lookup — no per-request DB cost)
-        let clientId = '';
-        if (req.tenantId && mongoose.Types.ObjectId.isValid(req.tenantId)) {
-          clientId = await resolveClientPrefix(new mongoose.Types.ObjectId(req.tenantId)).catch(() => '') as string;
-        }
-
-        await NativeCrmLog.create({
+        await writeNativeCrmLog({
           tenantId:   req.tenantId ?? 'unknown',
-          clientId,
           actorId:    actor?.userId  ?? 'anonymous',
           actorName,
           actorRole:  actor?.role    ?? '',
           action,
           module,
           resourceId,
-          before:   action === 'error' ? null : sanitize(beforeState),
-          after:    action === 'error' ? null : sanitize(afterState),
+          before:   beforeState,
+          after:    afterState,
           changes:  (action === 'update' && req.body && typeof req.body === 'object')
-            ? sanitize(req.body as Record<string, unknown>)
+            ? (req.body as Record<string, unknown>)
             : null,
           error:      isError ? (responseBody?.message ?? `HTTP ${statusCode}`) : null,
           statusCode,
           ip:         req.ip || req.socket?.remoteAddress || 'unknown',
           url:        req.originalUrl,
-          timestamp:  new Date(),
         });
       } catch {
         // Logging must never crash the app

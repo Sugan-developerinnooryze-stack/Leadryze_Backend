@@ -27,6 +27,7 @@ import automationWebhookRoutes from './modules/native-crm/automation-webhooks/au
 import publicWidgetRoutes from './modules/public-widget/public-widget.routes';
 import notificationRoutes from './modules/notifications/notification.routes';
 import aiRoutes from './modules/ai/ai.routes';
+import crmChatRoutes from './modules/ai/crm-chat.routes';
 import adminRoutes from './modules/admin/admin.routes';
 import crmRoutes from './modules/crm/crm-record.routes';
 import internalRoutes from './modules/internal/internal.routes';
@@ -168,6 +169,7 @@ app.use(`${V}/automation-webhooks`, automationWebhookRoutes); // public, unauthe
 app.use(`${V}/public/widget`, publicWidgetRoutes); // public, unauthenticated — the AI chatbot widget's entry point, own dynamic per-tenant CORS (see public-widget.routes.ts's own comment)
 app.use(`${V}/notifications`, notificationRoutes);
 app.use(`${V}/ai`, aiRoutes);
+app.use(`${V}/ai`, crmChatRoutes);
 app.use(`${V}/admin`, adminRoutes);
 app.use(`${V}/crm`, crmRoutes);
 app.use(`${V}/logs`, logRoutes);

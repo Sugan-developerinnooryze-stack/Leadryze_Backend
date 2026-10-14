@@ -7,7 +7,7 @@ import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeContract }  from '../contracts/contract.model';
 import { NativeCustomer }  from '../customers/customer.model';
 import { NativeReceipt }   from '../receipts/receipt.model';
-import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
+import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
@@ -23,6 +23,22 @@ async function assertValidStatus(tenantId: string, status: string | undefined): 
 }
 
 const INVOICE_DATE_FIELDS = new Set(['dueDate', 'createdAt']);
+
+/** An invoice referencing a Work Order can only be created once that Work
+ * Order has actually reached its tenant's own "completed" stage — the stage
+ * KEY is tenant-configurable (pipeline-config.service.ts), so this resolves
+ * the real key for the semantic outcome 'completed' rather than comparing
+ * against a hardcoded string. Applies to every caller (this service's own
+ * createInvoice, used by both the chatbot and the existing Invoices UI),
+ * not a chatbot-only check. */
+async function assertWorkOrderCompleted(tenantId: string, workOrderId: string): Promise<void> {
+  const wo = await NativeWorkorder.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), workOrderId }).select('status').lean();
+  if (!wo) throw new Error(`Work Order "${workOrderId}" was not found`);
+  const completedKey = await getOutcomeStageKey(tenantId, 'workorder', 'completed', 'completed');
+  if ((wo as any).status !== completedKey) {
+    throw new Error(`Work Order "${workOrderId}" has not been completed yet (current status: "${(wo as any).status}") — an invoice can only be created once it's completed`);
+  }
+}
 
 export async function listInvoices(tenantId: string, opts: InvoiceListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -92,6 +108,7 @@ export async function getInvoiceById(id: string, tenantId: string, scope?: DataS
 
 export async function createInvoice(data: any) {
   await assertValidStatus(String(data.tenantId), data.status);
+  if (data.workOrderId) await assertWorkOrderCompleted(String(data.tenantId), data.workOrderId);
   const services: any[]  = data.services ?? [];
   const parts: any[]     = data.parts ?? [];
   const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
