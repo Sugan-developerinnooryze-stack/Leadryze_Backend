@@ -14,15 +14,18 @@ import { listTickets, createTicket, updateTicket, deleteTicket, getTicketById } 
 import { listCalls, createCall, updateCall, deleteCall, getCallById } from '../native-crm/calls/call.service';
 import { listMeetings } from '../native-crm/meetings/meeting.service';
 import { listSites, createSite, updateSite, deleteSite, getSiteById } from '../native-crm/sites/site.service';
-import { listTeams } from '../native-crm/teams/team.service';
-import { listStaffs } from '../native-crm/staffs/staff.service';
-import { listCustomers } from '../native-crm/customers/customer.service';
+import { listTeams, createTeam, updateTeam, deleteTeam } from '../native-crm/teams/team.service';
+import { NativeTeam } from '../native-crm/teams/team.model';
+import { listStaffs, createStaff, updateStaff, deleteStaff } from '../native-crm/staffs/staff.service';
+import { NativeStaff } from '../native-crm/staffs/staff.model';
+import { listCustomers, createCustomer, updateCustomer, deleteCustomer, getCustomerById } from '../native-crm/customers/customer.service';
 import { NativeCustomer } from '../native-crm/customers/customer.model';
 import { getOutcomeStageKey } from '../native-crm/pipeline-config/pipeline-config.service';
 import { NativeWorkorder } from '../native-crm/workorders/workorder.model';
 import { Task } from '../native-crm/tasks/task.model';
 import { Ticket } from '../native-crm/tickets/ticket.model';
 import { DataScope } from '../../types';
+import { applyDataScopeToFilter, applyDataScopeToTeamFilter } from '../native-crm/shared/data-scope';
 import { ITargetFieldDef } from '../native-crm/automation-rules/target-field-catalog';
 import { Model } from 'mongoose';
 import mongoose from 'mongoose';
@@ -127,6 +130,47 @@ async function resolveSiteCustomerId(tenantId: string, data: Record<string, unkn
   const customer = await NativeCustomer.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), customerId: raw }).select('_id').lean();
   if (!customer) throw new Error(`No Field Service customer found with id "${raw}" — look it up again with crm_find_customer first.`);
   return { ...data, customerId: customer._id };
+}
+
+/** Team and Staff's own getTeamById(id, tenantId)/getStaffById(id, tenantId)
+ * take NO scope parameter at all — confirmed by reading both files directly
+ * — unlike every other module's getById. Used unscoped, GET /crm-get and
+ * POST /crm-write's stale-check could let a caller read ANY team/staff
+ * record in the tenant regardless of their own DataScope, even though
+ * listTeams/listStaffs already correctly scope the equivalent list view.
+ * These wrappers add the same scoping those list functions already use
+ * (applyDataScopeToTeamFilter / applyDataScopeToFilter(..., 'staffId'))
+ * directly against the model, so `getById` is scoped everywhere it's
+ * consulted — not just at delete time. */
+async function getTeamByIdScoped(id: string, tenantId: string, scope?: DataScope): Promise<any> {
+  const filter: Record<string, unknown> = { _id: id, tenantId: new mongoose.Types.ObjectId(tenantId) };
+  applyDataScopeToTeamFilter(filter, scope);
+  return NativeTeam.findOne(filter);
+}
+
+async function getStaffByIdScoped(id: string, tenantId: string, scope?: DataScope): Promise<any> {
+  const filter: Record<string, unknown> = { _id: id, tenantId: new mongoose.Types.ObjectId(tenantId) };
+  applyDataScopeToFilter(filter, scope, 'staffId');
+  return NativeStaff.findOne(filter);
+}
+
+/** deleteTeam(id, tenantId)/deleteStaff(id, tenantId) also take no scope
+ * param — an out-of-scope caller who knows/guesses a record's real _id
+ * could otherwise delete it even though they'd never see it in their own
+ * scoped list or (now) via GET /crm-get. Re-uses the exact same scoped
+ * lookup above as an existence-and-visibility gate immediately before
+ * calling the real, unscoped delete — never silently bypassed, and never a
+ * second, divergent scoping implementation. */
+async function deleteTeamScoped(id: string, tenantId: string, scope?: DataScope): Promise<any> {
+  const existing = await getTeamByIdScoped(id, tenantId, scope);
+  if (!existing) return null;
+  return deleteTeam(id, tenantId);
+}
+
+async function deleteStaffScoped(id: string, tenantId: string, scope?: DataScope): Promise<any> {
+  const existing = await getStaffByIdScoped(id, tenantId, scope);
+  if (!existing) return null;
+  return deleteStaff(id, tenantId);
 }
 
 /** The module capability registry — the single authoritative allowlist of
@@ -324,6 +368,16 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
   team: {
     permissionPrefix: 'fs.teams', logModule: 'teams', statusField: 'status',
     list: (tenantId, opts, branchId, scope) => listTeams(tenantId, opts as any, branchId, scope),
+    create: (tenantId, data) => createTeam({ ...data, tenantId }),
+    // updateTeam already enforces its own scope check internally
+    // (scope.teamIds.includes(id)) — reused as-is, not duplicated here.
+    update: (id, tenantId, data, scope) => updateTeam(id, tenantId, data, scope),
+    // deleteTeam itself has no scope param — deleteTeamScoped gates it with
+    // the same scoped lookup getById uses below, so an out-of-scope delete
+    // is refused by this gateway even though the underlying service alone
+    // wouldn't catch it.
+    delete: (id, tenantId, scope) => deleteTeamScoped(id, tenantId, scope),
+    getById: (id, tenantId, scope) => getTeamByIdScoped(id, tenantId, scope),
     schemaFields: [...STATUS_FIELD_ALLOWLIST, { key: 'managerUserId', label: 'Manager', type: 'text' }],
   },
   // Field Service's own "Customer" (NativeCustomer, collection
@@ -337,6 +391,16 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
   customer: {
     permissionPrefix: 'fs.customers', logModule: 'customers', statusField: 'status',
     list: (tenantId, opts, branchId, scope) => listCustomers(tenantId, opts as any, branchId, scope),
+    // getCustomerById/updateCustomer/deleteCustomer are already correctly
+    // scoped internally (applyDataScopeToFilter(..., 'assignedStaffId')),
+    // confirmed by reading customer.service.ts directly — no adapter
+    // needed. deleteCustomer also already enforces real referential
+    // integrity (blocks with a 409 if the customer has linked Quotations/
+    // WorkOrders/Invoices/Receipts/Contracts) — reused as-is.
+    create: (tenantId, data) => createCustomer({ ...data, tenantId }),
+    update: (id, tenantId, data, scope) => updateCustomer(id, tenantId, data, scope),
+    delete: (id, tenantId, scope) => deleteCustomer(id, tenantId, scope),
+    getById: (id, tenantId, scope) => getCustomerById(id, tenantId, scope),
     schemaFields: [
       // customerId: the human-readable business id (e.g. "CUS-0001") — NOT
       // a credential, and required by crm-customer-lookup.tool.ts's
@@ -358,6 +422,15 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
   staff: {
     permissionPrefix: 'fs.staffs', logModule: 'staffs', statusField: 'status',
     list: (tenantId, opts, branchId, scope) => listStaffs(tenantId, opts as any, branchId, scope),
+    // createStaff auto-provisions mobile-app login credentials as a side
+    // effect (ensureCredentials) — pre-existing, never blocks/breaks
+    // creation, confirmed in staff.service.ts. updateStaff already scopes
+    // itself correctly; deleteStaff does not (same gap as Team), gated the
+    // same way via deleteStaffScoped.
+    create: (tenantId, data) => createStaff({ ...data, tenantId }),
+    update: (id, tenantId, data, scope) => updateStaff(id, tenantId, data, scope),
+    delete: (id, tenantId, scope) => deleteStaffScoped(id, tenantId, scope),
+    getById: (id, tenantId, scope) => getStaffByIdScoped(id, tenantId, scope),
     schemaFields: [
       { key: 'firstName', label: 'First Name', type: 'text' }, { key: 'lastName', label: 'Last Name', type: 'text' }, { key: 'email', label: 'Email', type: 'text' }, { key: 'phone', label: 'Phone', type: 'text' }, { key: 'teamId', label: 'Team', type: 'text' }, { key: 'role', label: 'Role', type: 'text' },
       { key: 'status', label: 'Status', type: 'select', options: [{ value: 'active', label: 'Active' }, { value: 'inactive', label: 'Inactive' }, { value: 'onleave', label: 'On Leave' }] },
