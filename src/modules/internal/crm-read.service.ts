@@ -42,7 +42,8 @@ export async function countCrmModule(
  * call — never a third, independent implementation of DataScope filtering. */
 export async function getOverdueCrmModule(
   module: string, tenantId: string, scope: DataScope,
-): Promise<{ count: number } | null> {
+  options?: { includeItems?: boolean; limit?: number; branchId?: string | null; role?: string },
+): Promise<{ count: number; items?: any[] } | null> {
   const def = CRM_WRITE_MODULE_MAP[module];
   if (!def?.overdueConfig || !def.model) return null;
 
@@ -60,8 +61,19 @@ export async function getOverdueCrmModule(
   filter[def.overdueConfig.dateField] = { $lt: new Date() };
   filter[def.statusField ?? 'status'] = { $nin: terminalStatuses };
 
-  const count = await def.model.countDocuments(filter);
-  return { count };
+  // Same filter object for both queries — never a second, divergent filter
+  // construction for "the list" vs "the count."
+  if (!options?.includeItems) {
+    const count = await def.model.countDocuments(filter);
+    return { count };
+  }
+  const [count, rawItems] = await Promise.all([
+    def.model.countDocuments(filter),
+    def.model.find(filter).sort({ [def.overdueConfig.dateField]: 1 }).limit(Math.min(options.limit ?? 10, 25)),
+  ]);
+  const piiSafe = await applyPIIProtection(rawItems, def.logModule, tenantId, options.branchId, options.role ?? 'AGENT');
+  const items = def.schemaFields ? projectToSchemaFields(piiSafe, def.schemaFields) : piiSafe;
+  return { count, items };
 }
 
 /** Applies the SAME PII decrypt/mask step every human-facing controller for

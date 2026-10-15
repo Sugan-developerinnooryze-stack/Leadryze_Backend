@@ -1,5 +1,5 @@
 import { createLead, updateLead, deleteLead, listLeads, getLeadById } from '../native-crm/leads/lead.service';
-import { createWorkorder, updateWorkorder, deleteWorkorder, listWorkorders, getWorkorderById } from '../native-crm/workorders/workorder.service';
+import { createWorkorder, updateWorkorder, deleteWorkorder, listWorkorders, getWorkorderById, getWorkorderStats } from '../native-crm/workorders/workorder.service';
 import { createInvoice, updateInvoice, deleteInvoice, listInvoices, getInvoiceById } from '../native-crm/invoices/invoice.service';
 import { listCategories, createCategory, updateCategory, deleteCategory, getCategoryById } from '../native-crm/categories/category.service';
 import { listServices, createService, updateService, deleteService, getServiceById } from '../native-crm/services/service.service';
@@ -8,17 +8,17 @@ import { listProducts, createProduct, updateProduct, deleteProduct, getProductBy
 import { listAssets, createAsset, updateAsset, deleteAsset, getAssetById } from '../native-crm/assets/asset.service';
 import { listVehicles, createVehicle, updateVehicle, deleteVehicle, getVehicleById } from '../native-crm/vehicles/vehicle.service';
 import { listExpenses, createExpense, updateExpense, deleteExpense, getExpenseById } from '../native-crm/expenses/expense.service';
-import { listCompanies, createCompany, updateCompany, deleteCompany, getCompanyById } from '../native-crm/companies/company.service';
-import { listTasks, createTask, updateTask, deleteTask, getTaskById } from '../native-crm/tasks/task.service';
-import { listTickets, createTicket, updateTicket, deleteTicket, getTicketById } from '../native-crm/tickets/ticket.service';
-import { listCalls, createCall, updateCall, deleteCall, getCallById } from '../native-crm/calls/call.service';
-import { listMeetings } from '../native-crm/meetings/meeting.service';
+import { listCompanies, createCompany, updateCompany, deleteCompany, getCompanyById, getCompanyStats } from '../native-crm/companies/company.service';
+import { listTasks, createTask, updateTask, deleteTask, getTaskById, getTaskStats } from '../native-crm/tasks/task.service';
+import { listTickets, createTicket, updateTicket, deleteTicket, getTicketById, getTicketStats } from '../native-crm/tickets/ticket.service';
+import { listCalls, createCall, updateCall, deleteCall, getCallById, getCallStats } from '../native-crm/calls/call.service';
+import { listMeetings, getMeetingStats } from '../native-crm/meetings/meeting.service';
 import { listSites, createSite, updateSite, deleteSite, getSiteById } from '../native-crm/sites/site.service';
 import { listTeams, createTeam, updateTeam, deleteTeam } from '../native-crm/teams/team.service';
 import { NativeTeam } from '../native-crm/teams/team.model';
 import { listStaffs, createStaff, updateStaff, deleteStaff } from '../native-crm/staffs/staff.service';
 import { NativeStaff } from '../native-crm/staffs/staff.model';
-import { listCustomers, createCustomer, updateCustomer, deleteCustomer, getCustomerById } from '../native-crm/customers/customer.service';
+import { listCustomers, createCustomer, updateCustomer, deleteCustomer, getCustomerById, getCustomerStats } from '../native-crm/customers/customer.service';
 import { NativeCustomer } from '../native-crm/customers/customer.model';
 import { getOutcomeStageKey } from '../native-crm/pipeline-config/pipeline-config.service';
 import { NativeWorkorder } from '../native-crm/workorders/workorder.model';
@@ -93,6 +93,12 @@ export interface CrmWriteModuleDef {
    * invoice/task/ticket get their schema from that existing catalog
    * instead, untouched by this file. */
   schemaFields?: ITargetFieldDef[];
+  /** The module's own real dashboard-stats function — only populated for
+   * the 7 modules that have one (confirmed by reading each body directly:
+   * all genuinely apply DataScope to their own Mongo filter, not merely
+   * accept an unused parameter). GET /crm-stats calls this directly,
+   * unmodified — never a second, parallel aggregation implementation. */
+  stats?: (tenantId: string, branchId?: string | null, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) => Promise<any>;
 }
 
 /** update's permission suffix is 'edit', not 'update' — confirmed against
@@ -199,6 +205,7 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
     delete: (id, tenantId, scope) => deleteWorkorder(id, tenantId, scope),
     getById: (id, tenantId, scope) => getWorkorderById(id, tenantId, scope),
     list: (tenantId, opts, branchId, scope) => listWorkorders(tenantId, opts as any, branchId, scope),
+    stats: (tenantId, branchId, scope, range, customFrom, customTo) => getWorkorderStats(tenantId, branchId, scope, range, customFrom, customTo),
     model: NativeWorkorder,
     overdueConfig: {
       dateField: 'scheduledDate',
@@ -300,6 +307,10 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
     update: (id, tenantId, data, scope) => updateCompany(tenantId, id, data as any, scope),
     delete: (id, tenantId, scope) => deleteCompany(tenantId, id, scope),
     getById: (id, tenantId, scope) => getCompanyById(tenantId, id, scope),
+    // getCompanyStats(tenantId, scope?) — no branchId/range params, unlike
+    // workorder/task/ticket's stats functions; the wrapper just drops what
+    // this one doesn't accept.
+    stats: (tenantId, _branchId, scope) => getCompanyStats(tenantId, scope),
     schemaFields: [
       { key: 'name', label: 'Name', type: 'text' }, { key: 'domain', label: 'Domain', type: 'text' }, { key: 'industry', label: 'Industry', type: 'text' }, { key: 'employeeCount', label: 'Employee Count', type: 'number' }, { key: 'phone', label: 'Phone', type: 'text' }, { key: 'city', label: 'City', type: 'text' }, { key: 'country', label: 'Country', type: 'text' },
       { key: 'companyStatus', label: 'Status', type: 'select', options: [{ value: 'active', label: 'Active' }, { value: 'inactive', label: 'Inactive' }, { value: 'prospect', label: 'Prospect' }] },
@@ -312,6 +323,7 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
     update: (id, tenantId, data, scope) => updateTask(tenantId, id, data as any, scope),
     delete: (id, tenantId, scope) => deleteTask(tenantId, id, scope),
     getById: (id, tenantId, scope) => getTaskById(tenantId, id, scope),
+    stats: (tenantId, branchId, scope, range, customFrom, customTo) => getTaskStats(tenantId, branchId, scope, range, customFrom, customTo),
     model: Task,
     overdueConfig: { dateField: 'dueDate', scopeAnchor: 'createdBy', terminalStatuses: ['done', 'cancelled'] },
     // Schema comes from getFieldCatalog('task') (automation-rules), not schemaFields.
@@ -327,6 +339,7 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
     update: (id, tenantId, data, scope) => updateTicket(tenantId, id, data as any, scope),
     delete: (id, tenantId, scope) => deleteTicket(tenantId, id, scope),
     getById: (id, tenantId, scope) => getTicketById(tenantId, id, scope),
+    stats: (tenantId, branchId, scope, range, customFrom, customTo) => getTicketStats(tenantId, branchId, scope, range, customFrom, customTo),
     model: Ticket,
     overdueConfig: { dateField: 'resolutionDueAt', scopeAnchor: 'createdBy', terminalStatuses: ['resolved', 'closed'] },
     // Schema comes from getFieldCatalog('ticket'), not schemaFields. Same
@@ -343,6 +356,7 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
     update: (id, tenantId, data, scope) => updateCall(tenantId, id, data as any, scope),
     delete: (id, tenantId, scope) => deleteCall(tenantId, id, scope),
     getById: (id, tenantId, scope) => getCallById(tenantId, id, scope),
+    stats: (tenantId, _branchId, scope) => getCallStats(tenantId, scope),
     schemaFields: [
       { key: 'contactName', label: 'Contact Name', type: 'text' }, { key: 'direction', label: 'Direction', type: 'select', options: [{ value: 'inbound', label: 'Inbound' }, { value: 'outbound', label: 'Outbound' }] }, { key: 'duration', label: 'Duration (seconds)', type: 'number' }, { key: 'date', label: 'Date', type: 'date' },
       { key: 'callStatus', label: 'Status', type: 'select', options: [{ value: 'planned', label: 'Planned' }, { value: 'completed', label: 'Completed' }, { value: 'missed', label: 'Missed' }, { value: 'cancelled', label: 'Cancelled' }] },
@@ -351,6 +365,7 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
   meeting: {
     permissionPrefix: 'native_crm.meetings', logModule: 'meetings', statusField: 'meetingStatus',
     list: (tenantId, opts, branchId, scope) => listMeetings(tenantId, opts as any, scope, undefined) as any,
+    stats: (tenantId, _branchId, scope) => getMeetingStats(tenantId, scope),
     schemaFields: [
       { key: 'title', label: 'Title', type: 'text' }, { key: 'startDate', label: 'Start Date', type: 'date' }, { key: 'endDate', label: 'End Date', type: 'date' }, { key: 'location', label: 'Location', type: 'text' }, { key: 'assignedStaffId', label: 'Assigned Staff', type: 'text' },
       { key: 'meetingStatus', label: 'Status', type: 'select', options: [{ value: 'scheduled', label: 'Scheduled' }, { value: 'completed', label: 'Completed' }, { value: 'cancelled', label: 'Cancelled' }] },
@@ -401,6 +416,9 @@ export const CRM_WRITE_MODULE_MAP: Record<string, CrmWriteModuleDef> = {
     update: (id, tenantId, data, scope) => updateCustomer(id, tenantId, data, scope),
     delete: (id, tenantId, scope) => deleteCustomer(id, tenantId, scope),
     getById: (id, tenantId, scope) => getCustomerById(id, tenantId, scope),
+    // getCustomerStats(tenantId, scope?, range?, customFrom?, customTo?) —
+    // no branchId param, unlike workorder/task/ticket's stats functions.
+    stats: (tenantId, _branchId, scope, range, customFrom, customTo) => getCustomerStats(tenantId, scope, range, customFrom, customTo),
     schemaFields: [
       // customerId: the human-readable business id (e.g. "CUS-0001") — NOT
       // a credential, and required by crm-customer-lookup.tool.ts's

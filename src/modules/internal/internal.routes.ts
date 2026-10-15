@@ -785,6 +785,51 @@ async function resolveScopeForIdentity(tenantId: string, identity: VerifiedIdent
   } as JwtPayload);
 }
 
+/** Generalizes GET /crm-list's opts passthrough from a one-off, module-
+ * specific hack (it used to forward `categoryId` only for module==='service')
+ * to every real filter field found by reading all 18 modules' own list()
+ * functions directly. Every module already ignores a key it doesn't
+ * destructure (confirmed: none of them spread the raw opts object into
+ * their Mongo filter) — so forwarding an irrelevant key to a module that
+ * doesn't use it is always a no-op, never a leak. The three keys below get
+ * explicit validation/coercion because passing them through as raw query
+ * strings would be actively wrong, not just inert:
+ *   - `upcoming`/`showInWidget`: a raw query string is always truthy in JS
+ *     ("false" included) — task/call/meeting's list() do `if (upcoming)
+ *     ...`, so an uncoerced "false" would have wrongly applied the filter.
+ *   - `teamId`: listWorkorders looks this up via
+ *     `NativeTeam.findOne({_id: opts.teamId, ...})` — a malformed ObjectId
+ *     there throws a Mongoose CastError (would surface as an unhandled
+ *     500), so it's validated here instead of inside the service.
+ * Throws a plain Error (caller translates to a 400) for an invalid
+ * ownerTab/slaStatus/teamId — `status` is deliberately NOT allowlist-
+ * checked here: for task/ticket/workorder it's tenant-configurable
+ * (resolved via isValidStageKey, not a fixed enum), so a hardcoded check
+ * would be wrong for those three; an invalid status value safely yields
+ * zero results for every module either way. */
+const LIST_STRING_FILTER_KEYS = [
+  'status', 'relatedModule', 'relatedId', 'ownerTab', 'slaStatus',
+  'range', 'dateFrom', 'dateTo', 'dateField', 'customerId', 'contractId', 'staffId', 'categoryId',
+] as const;
+const OWNER_TAB_VALUES = new Set(['my', 'unassigned', 'assigned']);
+const SLA_STATUS_VALUES = new Set(['on_track', 'warning', 'breached', 'no_sla']);
+
+function applyForwardableListFilters(opts: Record<string, unknown>, query: Request['query']): void {
+  for (const key of LIST_STRING_FILTER_KEYS) {
+    const val = query[key];
+    if (val === undefined) continue;
+    if (key === 'ownerTab' && !OWNER_TAB_VALUES.has(val as string)) throw new Error(`Invalid ownerTab "${val}"`);
+    if (key === 'slaStatus' && !SLA_STATUS_VALUES.has(val as string)) throw new Error(`Invalid slaStatus "${val}"`);
+    opts[key] = val;
+  }
+  if (query.upcoming !== undefined) opts.upcoming = query.upcoming === 'true';
+  if (query.showInWidget !== undefined) opts.showInWidget = query.showInWidget === 'true';
+  if (query.teamId !== undefined) {
+    if (!mongoose.isValidObjectId(query.teamId as string)) throw new Error('Invalid teamId');
+    opts.teamId = query.teamId;
+  }
+}
+
 /**
  * GET /api/internal/crm-schema/:tenantId/:module?internalAuth=...
  *
@@ -857,7 +902,11 @@ router.get('/crm-overdue/:tenantId/:module', async (req: Request, res: Response,
       sendError(res, `Not permitted: ${permKey}`, 403); return;
     }
     const scope = await resolveScopeForIdentity(tenantId, identity);
-    const result = await getOverdueCrmModule(module, tenantId, scope);
+    const includeItems = req.query.items === 'true';
+    const limit = Math.min(parseInt((req.query.limit as string) || '10', 10), 25);
+    const result = await getOverdueCrmModule(module, tenantId, scope, {
+      includeItems, limit, branchId: identity.branchId, role: identity.role,
+    });
     sendSuccess(res, result, 'OK');
   } catch (err) { next(err); }
 });
@@ -924,6 +973,36 @@ router.get('/crm-custom-records-count/:tenantId/:slug', async (req: Request, res
 });
 
 /**
+ * GET /api/internal/crm-custom-records/:tenantId/:slug?q=...&limit=...&internalAuth=...
+ *
+ * The actual Equipment-style records themselves (each item's `data` object
+ * holds the tenant-defined field values) — not just the schema or a bare
+ * count. Reuses the exact same `listCustomRecords` + permission gate the
+ * count route above already uses. Custom Modules have no PII_FIELDS entry
+ * and no fixed schema the way native modules do (tenant-defined, arbitrary
+ * field keys) — there's no existing allowlist mechanism to apply here,
+ * because nothing equivalent exists for any tenant-defined module today;
+ * this exposes exactly what the existing human Custom Module UI already
+ * shows anyone with this same permission, not a new or larger exposure.
+ */
+router.get('/crm-custom-records/:tenantId/:slug', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, slug } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, 'custom_modules.records.view').catch(() => false))) {
+      sendError(res, 'Not permitted: custom_modules.records.view', 403); return;
+    }
+    const q = (req.query.q as string || '').trim();
+    const limit = Math.min(parseInt((req.query.limit as string) || '10', 10), 25);
+    const result = await listCustomRecords(tenantId, slug, { search: q || undefined, limit, page: 1 });
+    sendSuccess(res, { slug, items: result.items, total: result.total }, `Found ${result.items.length} record(s)`);
+  } catch (err) { next(err); }
+});
+
+/**
  * GET /api/internal/crm-list/:tenantId/:module?q=...&limit=...&internalAuth=...
  *
  * Phase 1's READ path — search/list within exactly one of lead/workorder/
@@ -953,13 +1032,12 @@ router.get('/crm-list/:tenantId/:module', async (req: Request, res: Response, ne
     const q = (req.query.q as string || '').trim();
     const limit = Math.min(parseInt((req.query.limit as string) || '10', 10), 25);
     const scope = await resolveScopeForIdentity(tenantId, identity);
-    // categoryId passthrough — the one relationship filter Stage A supports
-    // directly, for "which services belong to category X" (Service.categoryId
-    // is a real ref, already handled by listServices' own opts). Scoped to
-    // the one module that has this relationship, not a generic filter
-    // mechanism — see the plan's own narrow §6 scope for why.
     const opts: Record<string, unknown> = { search: q || undefined, limit, page: 1 };
-    if (module === 'service' && req.query.categoryId) opts.categoryId = req.query.categoryId as string;
+    try {
+      applyForwardableListFilters(opts, req.query);
+    } catch (filterErr) {
+      sendError(res, (filterErr as Error).message, 400); return;
+    }
     const result = await moduleDef.list(tenantId, opts as any, identity.branchId, scope);
     // Same decrypt-for-admins/mask-for-everyone-else step every human-facing
     // controller already applies for a PII_FIELDS module (lead included) —
@@ -973,6 +1051,40 @@ router.get('/crm-list/:tenantId/:module', async (req: Request, res: Response, ne
     // Mongoose select:false, so they'd otherwise ride along unfiltered).
     const items = moduleDef.schemaFields ? projectToSchemaFields(piiSafe, moduleDef.schemaFields) : piiSafe;
     sendSuccess(res, items, `Found ${items.length} ${module} record(s)`);
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/crm-stats/:tenantId/:module?range=...&customFrom=...&customTo=...&internalAuth=...
+ *
+ * Exposes each module's own real dashboard-stats function (totals, byStatus
+ * breakdowns, overdue/trend data where that function already computes it)
+ * — never a second, parallel aggregation. 400 if the module has no `stats`
+ * function declared (most modules don't; only workorder/task/ticket/call/
+ * meeting/company/customer do, confirmed by reading each real file).
+ */
+router.get('/crm-stats/:tenantId/:module', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, module } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    const moduleDef = CRM_WRITE_MODULE_MAP[module];
+    if (!moduleDef) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = permissionKeyFor(module, 'view')!;
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    if (!moduleDef.stats) { sendError(res, `"${module}" has no statistics available`, 400); return; }
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+    const range = req.query.range as string | undefined;
+    const customFrom = req.query.customFrom as string | undefined;
+    const customTo = req.query.customTo as string | undefined;
+    const stats = await moduleDef.stats(tenantId, identity.branchId, scope, range, customFrom, customTo);
+    sendSuccess(res, stats, 'OK');
   } catch (err) { next(err); }
 });
 
