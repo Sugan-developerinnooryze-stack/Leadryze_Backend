@@ -1,10 +1,12 @@
 import { Router, Response, NextFunction } from 'express';
-import { authenticate, requirePermission } from '../../middlewares/auth.middleware';
+import { authenticate, authorize, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { resolveBranch } from '../../middlewares/branch.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 import { AuthRequest } from '../../types';
-import { sendSuccess } from '../../utils/response';
-import { forwardCrmChat } from './crm-chat.service';
+import { sendSuccess, sendError } from '../../utils/response';
+import { forwardCrmChat, getCrmChatbotStatus } from './crm-chat.service';
+import { Tenant } from '../tenants/tenant.model';
 
 /** Sibling to, and entirely separate from, ai.routes.ts (the public AI
  * Chatbot Widget's own proxy — untouched). This file exists only to carry
@@ -21,7 +23,7 @@ router.use(authenticate, requireTenant, resolveBranch);
  * POST /api/v1/ai/crm-chat
  * body: { sessionId, message? } | { sessionId, confirmationAction: {operationId, decision} }
  */
-router.post('/crm-chat', requirePermission('bot.use'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+router.post('/crm-chat', requirePermission('bot.use'), requireModuleEnabled('bot_enabled'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { sessionId, message, confirmationAction } = req.body as {
       sessionId?: string; message?: string; confirmationAction?: { operationId: string; decision: 'confirm' | 'cancel' };
@@ -35,6 +37,34 @@ router.post('/crm-chat', requirePermission('bot.use'), async (req: AuthRequest, 
       sessionId, message, confirmationAction,
     });
     sendSuccess(res, data, 'CRM assistant response generated');
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/v1/ai/crm-chatbot/status
+ * Backs the CRM Chatbot Settings tab — AI Provider & Model, Rate Limits &
+ * Safety, and Feature & Access Controls sections. Deliberately NOT gated by
+ * requireModuleEnabled('bot_enabled') (unlike POST /crm-chat above): a
+ * tenant admin must be able to see this tab even when the assistant is
+ * currently disabled, specifically so they can see THAT it's disabled.
+ * Admin-only (not requirePermission('bot.use')) since this is settings
+ * visibility, not assistant usage — the same isAdmin gate SettingsPage.tsx
+ * already applies to this tab on the frontend, enforced again here so a
+ * non-admin can't reach it directly via the API either.
+ */
+router.get('/crm-chatbot/status', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const tenant = await Tenant.findById(req.tenantId).select('aiConfig.toolModelPreset featureFlags.bot_enabled').lean();
+    if (!tenant) { sendError(res, 'Tenant not found', 404); return; }
+
+    const aiStatus = await getCrmChatbotStatus(req.tenantId!);
+    sendSuccess(res, {
+      botEnabled: tenant.featureFlags?.bot_enabled ?? true,
+      toolModelPreset: tenant.aiConfig?.toolModelPreset ?? null,
+      aiService: aiStatus, // null when the AI microservice itself is unreachable
+    });
   } catch (err) {
     next(err);
   }

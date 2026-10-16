@@ -48,6 +48,7 @@ router.delete('/:id/widget/logo', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requ
 router.post('/:id/widget/background-image', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, upload.single('file'), controller.uploadWidgetBackgroundImage);
 router.delete('/:id/widget/background-image', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.removeWidgetBackgroundImage);
 router.get('/:id/ai-usage', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.getAiUsage);
+router.get('/:id/ai-usage/history', authorize('SUPER_ADMIN', 'TENANT_ADMIN'), requireOwnTenant, controller.getAiUsageHistory);
 router.delete('/:id', authorize('SUPER_ADMIN'), controller.deleteTenant);
 
 export default router;

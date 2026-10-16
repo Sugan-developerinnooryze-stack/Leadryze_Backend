@@ -121,6 +121,93 @@ async function assertValidPipelineField(
   throw new Error(`"${value}" is not a valid stage for this module's pipeline`);
 }
 
+/** Validates an incoming record's `data` blob against the module's own
+ * field definitions — required-field presence plus a light type/shape check
+ * per field type. Previously this only existed client-side
+ * (CustomModuleFormDrawer.tsx); the backend accepted any `data` object
+ * unchecked, so a direct API call (or a future automated write path) could
+ * persist a record missing required fields or with wrong-shaped values.
+ * `updateCustomRecord` replaces the whole `data` object (not a partial
+ * merge — see its own `$set: { data }`), so the same full-shape check
+ * applies equally to create and update. Collects every problem into one
+ * error rather than failing on the first, so a caller gets the complete
+ * picture in one round trip. */
+async function assertValidRecordData(
+  tenantId: string, moduleSlug: string, data: Record<string, unknown>,
+): Promise<void> {
+  const def = await CustomModuleDef.findOne({ tenantId, slug: moduleSlug }).select('fields').lean();
+  if (!def) return; // Unknown module slug — let the caller's own lookup produce the real error.
+
+  const problems: string[] = [];
+  for (const field of def.fields) {
+    const value = data[field.key];
+    const isEmpty =
+      value === undefined || value === null || value === '' ||
+      (Array.isArray(value) && value.length === 0);
+
+    if (field.required && isEmpty) {
+      problems.push(`"${field.label}" is required`);
+      continue;
+    }
+    if (isEmpty) continue; // Optional and not provided — nothing further to check.
+
+    switch (field.fieldType) {
+      case 'number':
+      case 'currency':
+      case 'rating':
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          problems.push(`"${field.label}" must be a number`);
+        }
+        break;
+      case 'boolean':
+        if (typeof value !== 'boolean') {
+          problems.push(`"${field.label}" must be true or false`);
+        }
+        break;
+      case 'email':
+        if (typeof value !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+          problems.push(`"${field.label}" must be a valid email address`);
+        }
+        break;
+      case 'url':
+        if (typeof value !== 'string' || !/^https?:\/\/.+/i.test(value)) {
+          problems.push(`"${field.label}" must be a valid URL`);
+        }
+        break;
+      case 'date':
+      case 'datetime':
+        if (typeof value !== 'string' && typeof value !== 'number' || Number.isNaN(new Date(value as any).getTime())) {
+          problems.push(`"${field.label}" must be a valid date`);
+        }
+        break;
+      case 'select':
+        if (field.options?.length && !field.options.includes(String(value))) {
+          problems.push(`"${field.label}" must be one of: ${field.options.join(', ')}`);
+        }
+        break;
+      case 'multiselect':
+        if (!Array.isArray(value)) {
+          problems.push(`"${field.label}" must be a list of values`);
+        } else if (field.options?.length) {
+          const invalid = value.filter((v) => !field.options!.includes(String(v)));
+          if (invalid.length) problems.push(`"${field.label}" has invalid option(s): ${invalid.join(', ')}`);
+        }
+        break;
+      // text/textarea/phone/relationship/categoryselect/image/images/table:
+      // required-presence (already checked above) is the only universal,
+      // safely-enforceable rule — their real shape is either free-form text
+      // or validated elsewhere (relationship targets, table columns), so a
+      // stricter check here would risk rejecting legitimate values.
+      default:
+        break;
+    }
+  }
+
+  if (problems.length) {
+    throw new Error(`Invalid record data: ${problems.join('; ')}`);
+  }
+}
+
 /** Fire-and-forget hook-in point, same shape as every built-in module's
  * controller call — resolves the pipeline field's new value and, if this
  * module has one configured, runs any matching automation rules.
@@ -288,6 +375,7 @@ export async function createCustomRecord(
    * see fireCustomModuleAutomations' comment for why this exists at all. */
   depth = 0,
 ): Promise<any> {
+  await assertValidRecordData(tenantId, moduleSlug, data);
   await assertValidPipelineField(tenantId, moduleSlug, data);
 
   const last: any = await CustomRecord.findOne({ tenantId, moduleSlug }).sort({ numId: -1 }).lean();
@@ -322,24 +410,38 @@ export async function updateCustomRecord(
    * already-executing chain. */
   depth = 0,
 ): Promise<any | null> {
-  await assertValidPipelineField(tenantId, moduleSlug, data);
-
   // Fetched before the update specifically so runAutomationsOnUpdate (below)
   // can diff old vs new field values — without this there'd be no way to
   // tell "field updated" rules apart from a no-op resave.
   const prev = await CustomRecord.findOne({ tenantId, moduleSlug, _id: id }).lean();
 
+  // Merge onto the existing record rather than replacing `data` outright.
+  // The human-facing edit form always sends every field (confirmed in
+  // CustomModuleFormDrawer.tsx: it iterates the module's full field list on
+  // every save), so for that caller a merge produces an identical result to
+  // a replace. But automation flows' Assign Record/Change Status actions
+  // (automation-flow.service.ts) deliberately map only ONE field — under
+  // the old plain `$set: { data }`, that silently wiped every other field
+  // on the record on every run. Found while wiring up the new required-
+  // field validation below (which would otherwise reject those same
+  // legitimate single-field automation updates as "missing" every other
+  // required field) — merging fixes both at once.
+  const mergedData = { ...(prev?.data as Record<string, unknown> | undefined), ...data };
+
+  await assertValidRecordData(tenantId, moduleSlug, mergedData);
+  await assertValidPipelineField(tenantId, moduleSlug, mergedData);
+
   const rec = await CustomRecord.findOneAndUpdate(
     { tenantId, moduleSlug, _id: id },
-    { $set: { data } },
+    { $set: { data: mergedData } },
     { new: true },
   ).lean();
   if (rec) {
     fireCustomModuleAutomations(tenantId, moduleSlug, rec, depth);
     if (prev) runAutomationsOnUpdate(tenantId, `custom:${moduleSlug}`, prev, rec, depth).catch(() => {});
-    buildSearchIndexData(tenantId, moduleSlug, data)
+    buildSearchIndexData(tenantId, moduleSlug, mergedData)
       .then((indexData) => indexNativeSearchRecord(
-        tenantId, 'custom-module', moduleSlug, { _id: rec._id, ...indexData }, String(data.name ?? data.title ?? rec.recordId)
+        tenantId, 'custom-module', moduleSlug, { _id: rec._id, ...indexData }, String(mergedData.name ?? mergedData.title ?? rec.recordId)
       ))
       .catch(() => {});
   }

@@ -10,13 +10,28 @@ import mongoose, { Schema, Document } from 'mongoose';
  */
 export interface IAiTokenUsage extends Document {
   tenantId: mongoose.Types.ObjectId;
-  date: string; // 'YYYY-MM-DD' — one doc per tenant per day
+  date: string; // 'YYYY-MM-DD' — one doc per tenant per day (per source, see below)
+  /** Which surface produced this usage. Added after this collection already had
+   * months of real data — every pre-existing doc predates this field and is
+   * real public-widget (+ continuous-voice) usage, backfilled to
+   * 'public_widget' by a one-time migration (never inferred at read time).
+   * Default 'public_widget' so the public widget's existing, untouched call
+   * site (base.agent.ts) keeps writing to the same bucket it always has. */
+  source: 'public_widget' | 'internal_assistant';
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
   estimatedCostUsd: number;
   requestCount: number;
   moderationFallbackCount: number;
+  /** True when this row's token counts are a rough fallback estimate
+   * (content.length / 4) rather than the provider's own real
+   * usage_metadata — only ever set by the internal-assistant tracking path,
+   * for the rare turn where a provider doesn't report real usage. The
+   * public widget's pre-existing behavior (skip tracking entirely when
+   * usage is unavailable) is unchanged. Default false — every historical
+   * and every normal row is a real, provider-reported count. */
+  isEstimated: boolean;
   /** Voice (STT/TTS) usage — additive counters alongside the LLM ones above,
    * same daily bucket, same tenant. sttSeconds is real audio duration
    * (client-measured, directional not billing-grade — see ai/src/config/
@@ -43,12 +58,14 @@ const aiTokenUsageSchema = new Schema<IAiTokenUsage>(
   {
     tenantId: { type: Schema.Types.ObjectId, ref: 'Tenant', required: true },
     date: { type: String, required: true },
+    source: { type: String, enum: ['public_widget', 'internal_assistant'], default: 'public_widget' },
     promptTokens: { type: Number, default: 0 },
     completionTokens: { type: Number, default: 0 },
     totalTokens: { type: Number, default: 0 },
     estimatedCostUsd: { type: Number, default: 0 },
     requestCount: { type: Number, default: 0 },
     moderationFallbackCount: { type: Number, default: 0 },
+    isEstimated: { type: Boolean, default: false },
     sttSeconds: { type: Number, default: 0 },
     ttsCharacters: { type: Number, default: 0 },
     voiceCostUsd: { type: Number, default: 0 },
@@ -62,25 +79,34 @@ const aiTokenUsageSchema = new Schema<IAiTokenUsage>(
   { timestamps: true }
 );
 
-aiTokenUsageSchema.index({ tenantId: 1, date: 1 }, { unique: true });
+aiTokenUsageSchema.index({ tenantId: 1, date: 1, source: 1 }, { unique: true });
 aiTokenUsageSchema.index({ tenantId: 1, createdAt: -1 });
 
 export const AiTokenUsage = mongoose.model<IAiTokenUsage>('AiTokenUsage', aiTokenUsageSchema);
 
 /** Increment today's counters for a tenant. Never throws — usage tracking
- * must never be able to break a real chat response. */
+ * must never be able to break a real chat response.
+ *
+ * `source`/`isEstimated` are both optional and default to the public
+ * widget's original, unchanged behavior ('public_widget', not estimated) —
+ * every pre-existing call site (base.agent.ts's own tracking call) needs no
+ * changes to keep writing to the same bucket it always has. Only the new
+ * internal-assistant call site passes `source: 'internal_assistant'`. */
 export async function trackAiTokenUsage(
   tenantId: string,
   usage: {
     promptTokens: number; completionTokens: number; totalTokens: number; estimatedCostUsd: number;
     usedModerationFallback?: boolean;
     sttSeconds?: number; ttsCharacters?: number; voiceCostUsd?: number; isVoiceRequest?: boolean;
+    source?: 'public_widget' | 'internal_assistant';
+    isEstimated?: boolean;
   }
 ): Promise<void> {
   try {
     const date = new Date().toISOString().slice(0, 10);
+    const source = usage.source || 'public_widget';
     await AiTokenUsage.findOneAndUpdate(
-      { tenantId, date },
+      { tenantId, date, source },
       {
         $inc: {
           promptTokens: usage.promptTokens || 0,
@@ -94,6 +120,9 @@ export async function trackAiTokenUsage(
           voiceCostUsd: usage.voiceCostUsd || 0,
           voiceRequestCount: usage.isVoiceRequest ? 1 : 0,
         },
+        // isEstimated is a per-row flag, not a counter — $set alongside $inc
+        // is safe in the same findOneAndUpdate (different field paths).
+        ...(usage.isEstimated ? { $set: { isEstimated: true } } : {}),
       },
       { upsert: true }
     );
@@ -113,6 +142,28 @@ export async function getTenantTokenUsageSince(tenantId: string, sinceDate: stri
     { $group: { _id: null, totalTokens: { $sum: '$totalTokens' } } },
   ]);
   return result[0]?.totalTokens ?? 0;
+}
+
+/** Same window as getTenantTokenUsageSince(), broken down by source — used
+ * only by the new usage-breakdown UI (Super Admin's AiUsageTab + the
+ * tenant-facing CRM Chatbot Settings tab), never for enforcement. The
+ * enforcement-facing total above is deliberately left source-agnostic so
+ * the shared allowance stays authoritative regardless of how many
+ * source-buckets exist. */
+export async function getTenantTokenUsageBySourceSince(
+  tenantId: string,
+  sinceDate: string
+): Promise<{ publicWidget: number; internalAssistant: number }> {
+  const result = await AiTokenUsage.aggregate([
+    { $match: { tenantId: new mongoose.Types.ObjectId(tenantId), date: { $gte: sinceDate } } },
+    { $group: { _id: '$source', totalTokens: { $sum: '$totalTokens' } } },
+  ]);
+  const bySource: Record<string, number> = {};
+  for (const row of result) bySource[row._id || 'public_widget'] = row.totalTokens;
+  return {
+    publicWidget: bySource['public_widget'] ?? 0,
+    internalAssistant: bySource['internal_assistant'] ?? 0,
+  };
 }
 
 /** Records one COMPLETED continuous-voice session's usage — called once by

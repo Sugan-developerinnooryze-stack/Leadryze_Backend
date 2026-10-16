@@ -26,7 +26,7 @@ import { computeAvailableSlots, computeTeamAvailableSlots, isSlotFree } from '..
 import { createMeeting } from '../native-crm/meetings/meeting.service';
 import { claimWidgetSession, resolveWidgetSessionClaim, releaseWidgetSessionClaim } from './widget-session-claim.service';
 import {
-  trackAiTokenUsage, getTenantTokenUsageSince,
+  trackAiTokenUsage, getTenantTokenUsageSince, getTenantTokenUsageBySourceSince, AiTokenUsage,
   trackContinuousVoiceUsage, getTenantVoiceMinutesUsageSince,
 } from '../admin/ai-token-usage.model';
 import { getOrInitCreditsResetDate } from '../tenants/tenant.service';
@@ -2286,16 +2286,21 @@ router.post('/ai-token-usage', async (req: Request, res: Response, next: NextFun
   try {
     const {
       tenantId, promptTokens, completionTokens, totalTokens, estimatedCostUsd, usedModerationFallback,
-      sttSeconds, ttsCharacters, voiceCostUsd, isVoiceRequest,
+      sttSeconds, ttsCharacters, voiceCostUsd, isVoiceRequest, source, isEstimated,
     } = req.body as {
       tenantId: string; promptTokens?: number; completionTokens?: number;
       totalTokens?: number; estimatedCostUsd?: number; usedModerationFallback?: boolean;
       sttSeconds?: number; ttsCharacters?: number; voiceCostUsd?: number; isVoiceRequest?: boolean;
+      source?: 'public_widget' | 'internal_assistant'; isEstimated?: boolean;
     };
     if (!tenantId || !mongoose.isValidObjectId(tenantId)) {
       sendError(res, 'Valid tenantId is required', 400);
       return;
     }
+    // source is intentionally untrusted beyond this allowlist — anything else
+    // (or omitted) falls back to 'public_widget', the pre-existing, unchanged
+    // default every caller before this change already relied on.
+    const safeSource = source === 'internal_assistant' ? 'internal_assistant' : 'public_widget';
     await trackAiTokenUsage(tenantId, {
       promptTokens: promptTokens || 0,
       completionTokens: completionTokens || 0,
@@ -2303,8 +2308,59 @@ router.post('/ai-token-usage', async (req: Request, res: Response, next: NextFun
       estimatedCostUsd: estimatedCostUsd || 0,
       usedModerationFallback,
       sttSeconds, ttsCharacters, voiceCostUsd, isVoiceRequest,
+      source: safeSource, isEstimated: !!isEstimated,
     });
     sendSuccess(res, null, 'Token usage recorded');
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/ai-token-usage/:tenantId/by-source
+ * Same window as GET /ai-token-usage/:tenantId (since the tenant's own
+ * creditsLastResetAt), broken down into public-widget vs internal-assistant
+ * totals — informational only (the Super Admin breakdown UI and the
+ * tenant-facing CRM Chatbot Settings tab), never consulted for enforcement.
+ * The combined total from the sibling route above remains the one
+ * authoritative, enforced figure.
+ */
+router.get('/ai-token-usage/:tenantId/by-source', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Invalid tenantId', 400);
+      return;
+    }
+    const tenant = await Tenant.findById(tenantId).select('aiConfig.creditsLastResetAt').lean();
+    const resetAt = await getOrInitCreditsResetDate(tenantId, tenant?.aiConfig?.creditsLastResetAt);
+    const bySource = await getTenantTokenUsageBySourceSince(tenantId, resetAt.toISOString().slice(0, 10));
+    sendSuccess(res, bySource);
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/internal/ai-token-usage/:tenantId/history
+ * Day-bucketed usage rows since the tenant's own creditsLastResetAt, each
+ * tagged with its source and whether its token count is a real
+ * provider-reported figure or a rough fallback estimate — backs the CRM
+ * Chatbot Settings tab's Usage History section. Capped at 90 rows (90 days
+ * x up to 2 sources/day) — this is a settings-page display, not an export.
+ */
+router.get('/ai-token-usage/:tenantId/history', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) {
+      sendError(res, 'Invalid tenantId', 400);
+      return;
+    }
+    const tenant = await Tenant.findById(tenantId).select('aiConfig.creditsLastResetAt').lean();
+    const resetAt = await getOrInitCreditsResetDate(tenantId, tenant?.aiConfig?.creditsLastResetAt);
+    const sinceDate = resetAt.toISOString().slice(0, 10);
+    const rows = await AiTokenUsage.find({ tenantId, date: { $gte: sinceDate } })
+      .sort({ date: -1, source: 1 })
+      .limit(90)
+      .select('date source totalTokens requestCount estimatedCostUsd isEstimated')
+      .lean();
+    sendSuccess(res, { rows });
   } catch (err) { next(err); }
 });
 

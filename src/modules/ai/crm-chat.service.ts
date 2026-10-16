@@ -49,3 +49,21 @@ export async function forwardCrmChat(input: CrmChatForwardInput): Promise<any> {
   );
   return response.data.data;
 }
+
+/** Backs the CRM Chatbot Settings tab's "AI Provider & Model" and "Rate
+ * Limits & Safety" sections — forwards to the AI microservice's own
+ * read-only /crm-chatbot-status/:tenantId. Never throws: a settings page
+ * must degrade to "unavailable", never break, if the AI service is down. */
+export async function getCrmChatbotStatus(tenantId: string): Promise<{
+  provider: string; model: string; fallbackProvider: string; fallbackModel: string;
+  connected: boolean; rateLimit: { allowed: boolean; remaining: number; resetIn: number; max: number };
+} | null> {
+  try {
+    const response = await axios.get(`${AI_URL}/api/crm-chatbot-status/${tenantId}`, {
+      headers: aiHeaders, timeout: 5000,
+    });
+    return response.data.data;
+  } catch {
+    return null;
+  }
+}

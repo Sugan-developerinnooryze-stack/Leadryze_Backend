@@ -117,3 +117,11 @@ export async function getAiUsage(req: AuthRequest, res: Response, next: NextFunc
     sendSuccess(res, usage);
   } catch (err) { next(err); }
 }
+
+export async function getAiUsageHistory(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const history = await tenantService.getAiUsageHistory(req.params.id);
+    if (!history) { sendError(res, 'Tenant not found', 404); return; }
+    sendSuccess(res, history);
+  } catch (err) { next(err); }
+}

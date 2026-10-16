@@ -3,7 +3,7 @@ import { Tenant, ITenant, IFeatureFlags, DEFAULT_FEATURE_FLAGS } from './tenant.
 import { parsePagination, buildSkip } from '../../utils/pagination';
 import { uploadToS3, deleteFromS3, keyFromUrl } from '../../services/s3.service';
 import { DEFAULT_DATA_SCOPE_CONFIG } from '../native-crm/shared/data-scope';
-import { getTenantTokenUsageSince, getTenantVoiceMinutesUsageSince } from '../admin/ai-token-usage.model';
+import { getTenantTokenUsageSince, getTenantVoiceMinutesUsageSince, getTenantTokenUsageBySourceSince, AiTokenUsage } from '../admin/ai-token-usage.model';
 import { config } from '../../config';
 import { User } from '../auth/auth.model';
 import { Role } from '../rbac/role.model';
@@ -100,9 +100,10 @@ export async function getAiUsage(tenantId: string) {
   const creditsLastResetAt = await getOrInitCreditsResetDate(tenantId, tenant.aiConfig?.creditsLastResetAt);
   const sinceDate = toDateKey(creditsLastResetAt);
 
-  const [tokensUsedThisMonth, voiceMinutesUsedThisMonth] = await Promise.all([
+  const [tokensUsedThisMonth, voiceMinutesUsedThisMonth, usageBySource] = await Promise.all([
     getTenantTokenUsageSince(tenantId, sinceDate),
     getTenantVoiceMinutesUsageSince(tenantId, sinceDate),
+    getTenantTokenUsageBySourceSince(tenantId, sinceDate),
   ]);
 
   const percentUsed = monthlyTokenLimit > 0 ? (tokensUsedThisMonth / monthlyTokenLimit) * 100 : 0;
@@ -127,7 +128,31 @@ export async function getAiUsage(tenantId: string) {
     monthlyVoiceMinutesLimit,
     voiceMinutesUsedThisMonth,
     creditsLastResetAt,
+    // Informational breakdown of the same shared total above — never
+    // consulted for enforcement, which stays source-agnostic by design.
+    usageBySource,
   };
+}
+
+/** Day-bucketed usage rows since the tenant's own creditsLastResetAt, each
+ * tagged with source and whether its token count is a real provider-
+ * reported figure or a rough fallback estimate — backs the CRM Chatbot
+ * Settings tab's Usage History section. Same sinceDate reasoning as
+ * getAiUsage() above (prepaid credits, not calendar month). */
+export async function getAiUsageHistory(tenantId: string) {
+  const tenant = await Tenant.findById(tenantId).select('aiConfig.creditsLastResetAt').lean();
+  if (!tenant) return null;
+
+  const creditsLastResetAt = await getOrInitCreditsResetDate(tenantId, tenant.aiConfig?.creditsLastResetAt);
+  const sinceDate = toDateKey(creditsLastResetAt);
+
+  const rows = await AiTokenUsage.find({ tenantId, date: { $gte: sinceDate } })
+    .sort({ date: -1, source: 1 })
+    .limit(90)
+    .select('date source totalTokens requestCount estimatedCostUsd isEstimated')
+    .lean();
+
+  return { rows };
 }
 
 export async function createTenant(data: Partial<ITenant>): Promise<ITenant> {
