@@ -12,6 +12,10 @@ import { ChatSession } from '../bot/chat-session.model';
 import { requestHandoff, appendVisitorMessage } from '../bot/chat-handoff.service';
 import { emitHandoffRequested, emitHandoffMessage } from '../../realtime/emit-helpers';
 import { createHandoffNotification } from '../notifications/notification.service';
+import { assignRoundRobin } from '../native-crm/staffs/round-robin.service';
+import { captureLeadFromExternalSource, hasRecentLeadForEmail } from '../native-crm/lead-capture/lead-capture.service';
+import { PHONE_FORMAT_REGEX } from '../native-crm/leads/lead.validation';
+import { claimWidgetSession, resolveWidgetSessionClaim, releaseWidgetSessionClaim } from '../internal/widget-session-claim.service';
 
 const aiHeaders = { 'x-api-key': config.ai.internalApiKey };
 const AI_URL = config.app.aiServiceUrl;
@@ -88,6 +92,22 @@ export async function getConfig(req: Request, res: Response): Promise<void> {
     humanHandoffButtonText: tenant.widget?.humanHandoff?.buttonText || 'Connect with an expert',
     humanHandoffWaitingMessage: tenant.widget?.humanHandoff?.waitingMessage
       || "We're connecting you with a team member — someone will be with you shortly.",
+    // "Connect with Your Local Branch" — a SEPARATE feature from Human
+    // Handoff above (a deterministic lead-capture form, not a live-agent
+    // escalation). Same explicit `=== true` gate: an absent/misconfigured
+    // tenant always resolves to "button hidden," never shown by accident.
+    connectBranchEnabled: tenant.widget?.connectBranch?.enabled === true,
+    connectBranchButtonText: tenant.widget?.connectBranch?.buttonText || 'Connect with Your Local Branch',
+    connectBranchFormTitle: tenant.widget?.connectBranch?.formTitle || 'Connect with a branch',
+    connectBranchFormDescription: tenant.widget?.connectBranch?.formDescription
+      || "Leave your details and we'll be in touch shortly.",
+    connectBranchSubmitButtonText: tenant.widget?.connectBranch?.submitButtonText || 'Submit',
+    connectBranchSuccessMessage: tenant.widget?.connectBranch?.successMessage
+      || "Thanks! We've received your details and will be in touch shortly.",
+    connectBranchFields: (tenant.widget?.connectBranch?.fields ?? [])
+      .filter((f) => f.enabled)
+      .sort((a, b) => a.order - b.order)
+      .map((f) => ({ key: f.key, label: f.label, type: f.type, required: f.required, options: f.options })),
   });
 }
 
@@ -485,5 +505,165 @@ export async function getHandoffHistory(req: Request, res: Response): Promise<vo
   } catch (err) {
     logger.error('Widget handoff history fetch failed', { tenantId: String(tenant._id), error: (err as Error).message });
     sendError(res, 'Could not load conversation history', 502);
+  }
+}
+
+const EMAIL_FORMAT_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Escapes regex-special characters in visitor-typed text before it's used
+ * inside a MongoDB regex query (the City/State auto-match below) — without
+ * this, a value like "St. Louis (Downtown)" would be interpreted as regex
+ * syntax instead of literal text. */
+/** Server-side re-validation of the submitted field VALUES against the
+ * tenant's own saved field DEFINITIONS (Tenant.widget.connectBranch.fields)
+ * — the client only ever sends `{key: value}`; which fields exist, which are
+ * required, and what type each one is are never trusted from the request.
+ * Returns a field-keyed error map, empty when everything passes. */
+interface ConnectBranchFieldDef {
+  key: string;
+  label: string;
+  type: 'text' | 'email' | 'phone' | 'textarea' | 'dropdown';
+  required: boolean;
+  enabled: boolean;
+}
+
+function validateConnectBranchValues(
+  fields: ConnectBranchFieldDef[],
+  values: Record<string, string>,
+): Record<string, string> {
+  const errors: Record<string, string> = {};
+  for (const field of fields ?? []) {
+    // firstName is Lead's one hard-required field in the data model
+    // (createLead() rejects without it) — always enforced here regardless
+    // of what a saved config says, independent of the admin UI's own
+    // "firstName can't be disabled/optional" lock, which only prevents this
+    // from happening through the settings page itself.
+    const isFirstName = field.key === 'firstName';
+    if (!field.enabled && !isFirstName) continue;
+    const raw = values[field.key];
+    const value = typeof raw === 'string' ? raw.trim() : '';
+    if ((field.required || isFirstName) && !value) {
+      errors[field.key] = `${field.label} is required`;
+      continue;
+    }
+    if (!value) continue;
+    if (field.type === 'email' && !EMAIL_FORMAT_REGEX.test(value)) {
+      errors[field.key] = 'Enter a valid email address';
+    } else if (field.type === 'phone' && !PHONE_FORMAT_REGEX.test(value)) {
+      errors[field.key] = 'Enter a valid phone number';
+    }
+  }
+  return errors;
+}
+
+/** A visitor submits the Connect-with-Branch form. Deterministic — no AI,
+ * no live agent — creates a real Lead via the SAME
+ * captureLeadFromExternalSource() pipeline the AI widget's own lead capture
+ * already uses (round-robin staff assignment, PII encryption, automation
+ * rules, and — because platform stays 'chatbot' — the existing chatbot
+ * lead-confirmation + sales-alert emails, with zero new email code). City/
+ * State are stored as plain fields on the Lead exactly as typed — no branch
+ * lookup/attribution happens here. Completely independent of Human
+ * Handoff — no ChatSession/socket state is touched here. */
+export async function postConnectBranchSubmit(req: Request, res: Response): Promise<void> {
+  const widgetKey = req.query.widgetKey as string;
+  const tenant = await resolveTenantByWidgetKey(widgetKey);
+  if (!tenant) { sendError(res, 'Widget not found or disabled', 404); return; }
+  if (!applyCorsHeader(req, res, tenant)) { sendError(res, 'Origin not allowed for this widget', 403); return; }
+  if (tenant.widget?.connectBranch?.enabled !== true) {
+    sendError(res, 'Connect with Branch is not available for this widget', 403);
+    return;
+  }
+
+  const tenantId = String(tenant._id);
+  const { sessionId, visitorId, pageUrl, values } = req.body as {
+    sessionId: string; visitorId?: string; pageUrl?: string; values: Record<string, string>;
+  };
+
+  try {
+    const claim = await claimWidgetSession(tenantId, sessionId, 'connect_branch');
+    if (!claim.claimed) {
+      if (claim.outcome?.status === 'done') {
+        sendSuccess(res, { ...claim.outcome.result, alreadyCreated: true }, 'Already submitted for this session');
+      } else {
+        sendError(res, 'This form is already being submitted — please wait a moment and try again', 409);
+      }
+      return;
+    }
+
+    const fieldErrors = validateConnectBranchValues(tenant.widget!.connectBranch!.fields, values ?? {});
+    if (Object.keys(fieldErrors).length > 0) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'connect_branch');
+      sendError(res, 'Please fix the highlighted fields', 400, { fieldErrors });
+      return;
+    }
+
+    const firstName = (values.firstName || '').trim();
+    const email     = (values.email || '').trim();
+    const phone     = (values.phone || '').trim() || undefined;
+    const company   = (values.company || '').trim() || undefined;
+    const city      = (values.city || '').trim() || undefined;
+    const state     = (values.state || '').trim() || undefined;
+    const message   = (values.message || '').trim() || undefined;
+
+    // Any field beyond the 7 built-ins (firstName/company/email/phone/
+    // city/state/message) is a tenant-added custom field — its submitted
+    // value is stored directly on Lead.customFields under its own key, the
+    // exact shape the Lead edit/view screens already read customFields from
+    // (`lead.customFields?.[cf.fieldKey]`), so a custom field configured
+    // here shows up there once a matching NativeCustomField definition
+    // exists for the 'leads' module (synced from the Widget Settings page).
+    const BUILT_IN_FIELD_KEYS = new Set(['firstName', 'company', 'email', 'phone', 'city', 'state', 'message']);
+    const customFieldValues: Record<string, string> = {};
+    for (const field of tenant.widget!.connectBranch!.fields) {
+      if (BUILT_IN_FIELD_KEYS.has(field.key) || !field.enabled) continue;
+      const v = (values[field.key] || '').trim();
+      if (v) customFieldValues[field.key] = v;
+    }
+
+    if (email && await hasRecentLeadForEmail(tenantId, email)) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'connect_branch');
+      sendSuccess(res, { skipped: true, reason: 'recent_duplicate_email' }, 'A recent submission already exists for this email');
+      return;
+    }
+
+    const assigned = await assignRoundRobin(
+      tenantId,
+      tenant.widget?.defaultTeamId ? String(tenant.widget.defaultTeamId) : undefined,
+    );
+
+    const { capture, lead } = await captureLeadFromExternalSource(
+      tenantId, null, 'system:ai-widget-connect-branch', 'ai-widget@leadryze.internal',
+      {
+        platform: 'chatbot',
+        sourceUrl: pageUrl || 'widget-connect-branch',
+        raw: { firstName, email, phone, company },
+        assignedStaffId: assigned?.staffId,
+        assignedStaffName: assigned?.staffName,
+        requirement: message,
+        chatSessionId: sessionId,
+        city,
+        state,
+        extraCustomFields: {
+          _connectAction: 'branch',
+          _capturePlatform: 'chatbot_connect_branch',
+          ...customFieldValues,
+        },
+      },
+    );
+
+    if (!lead) {
+      await releaseWidgetSessionClaim(tenantId, sessionId, 'connect_branch');
+      sendError(res, capture.failureReason || 'Could not submit the form — please check your details and try again', 422);
+      return;
+    }
+
+    const result = { leadId: String(lead._id) };
+    await resolveWidgetSessionClaim(tenantId, sessionId, 'connect_branch', result);
+    sendSuccess(res, result, 'Submitted');
+  } catch (err) {
+    logger.error('Connect-with-Branch submit failed', { tenantId, sessionId, error: (err as Error).message });
+    try { await releaseWidgetSessionClaim(tenantId, sessionId, 'connect_branch'); } catch { /* best effort */ }
+    sendError(res, 'Could not submit the form right now — please try again shortly', 502);
   }
 }

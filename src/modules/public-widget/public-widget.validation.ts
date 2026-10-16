@@ -68,3 +68,24 @@ export const widgetHandoffHistoryQuerySchema = z.object({
   sessionId: z.string().trim().min(1).max(200),
   visitorId: z.string().trim().min(1).max(200),
 });
+
+// POST /public/widget/connect-branch/submit — the "Connect with Your Local
+// Branch" lead-capture form, a SEPARATE feature from Human Handoff above.
+// `values` is a generic field-key -> string map, deliberately not a fixed
+// shape: the actual field LIST is tenant-configurable
+// (Tenant.widget.connectBranch.fields), so this schema only bounds payload
+// size/shape (defense against abuse) — the real per-field required/type
+// validation happens server-side in the controller against the tenant's own
+// saved field config, never trusting field definitions from the client.
+// No `branchId` here — the visitor types City/State (plain text, matching
+// the reference design), and the controller best-effort matches a Branch
+// from those values server-side rather than the visitor picking one.
+export const widgetConnectBranchSubmitBodySchema = z.object({
+  sessionId: z.string().trim().min(1).max(200),
+  visitorId: z.string().trim().min(1).max(200).optional(),
+  pageUrl:   z.string().trim().max(2000).optional(),
+  values:    z.record(z.string().max(60), z.string().trim().max(2000)).refine(
+    (v) => Object.keys(v).length <= 30,
+    { message: 'Too many fields' },
+  ),
+});

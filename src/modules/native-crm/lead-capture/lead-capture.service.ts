@@ -7,6 +7,7 @@ import { runAutomationsOnCreate } from '../automation-rules/automation-rule.serv
 import { NativeTimeline } from '../timeline/timeline.model';
 import { resolveTeamFromStaffId } from '../shared/team-resolution';
 import { sendChatbotLeadEmails } from './chatbot-lead-email.service';
+import { decrypt, isEncrypted } from '../../../utils/crypto';
 
 function firstNonEmpty(...vals: unknown[]): string | undefined {
   for (const v of vals) {
@@ -94,7 +95,7 @@ export async function captureLeadFromExternalSource(
   // generic 'api' value, same as before this mapping existed.
   const { teamId, teamName } = await resolveTeamFromStaffId(tenantId, input.assignedStaffId);
 
-  const lead = await createLead({
+  const leadData: Record<string, unknown> = {
     tenantId,
     branchId: branchId ?? null,
     firstName:   normalized.firstName,
@@ -103,6 +104,9 @@ export async function captureLeadFromExternalSource(
     phone:       normalized.phone,
     company:     normalized.company,
     designation: normalized.title,
+    city:        input.city,
+    state:       input.state,
+    country:     input.country,
     source:      input.platform === 'chatbot' ? 'chatbot' : 'api',
     createdBy:   userId,
     lastActivityAt: new Date(),
@@ -129,8 +133,34 @@ export async function captureLeadFromExternalSource(
     customFields: {
       _leadCaptureId:   String(capture._id),
       _capturePlatform: input.platform,
+      ...input.extraCustomFields,
     },
-  });
+  };
+
+  let lead;
+  let ownerAssignmentRejected = false;
+  try {
+    lead = await createLead(leadData);
+  } catch (err) {
+    // assignRoundRobin() rotates across every ACTIVE NativeStaff — including
+    // ones with no linked CRM user account (Field-Service-only staff) —
+    // while createLead()'s own assertValidOwner() rejects exactly that
+    // combination as an invalid Lead Owner. That's a real, pre-existing
+    // mismatch between the two (not something this capture path can fix on
+    // its own — the round-robin roster and the CRM-owner rule disagree), and
+    // it must never cost the tenant a captured lead: retry once, unassigned,
+    // so a human can pick a real owner from the Leads list afterward, rather
+    // than silently losing a real visitor's submission over a staffing
+    // configuration problem. Any OTHER createLead() failure (schema
+    // validation, invalid pipeline status, etc.) still propagates normally.
+    if ((err as Error).message?.includes('cannot be assigned as Lead Owner') && input.assignedStaffId) {
+      const { leadOwnerStaffId, leadOwner, ...withoutOwner } = leadData;
+      lead = await createLead(withoutOwner);
+      ownerAssignmentRejected = true;
+    } else {
+      throw err;
+    }
+  }
 
   await NativeTimeline.create({
     tenantId:     tid,
@@ -146,8 +176,12 @@ export async function captureLeadFromExternalSource(
   // one — e.g. a browser-extension capture with no configured team) —
   // record it as its own step in the Lead's own assignment history, giving
   // the exact "AI Widget -> Team -> Staff" trail requested, distinct from
-  // the plain "created" entry above.
-  if (input.assignedStaffId) {
+  // the plain "created" entry above. Skipped when the assignment was
+  // rejected and retried unassigned above — the Lead genuinely has no
+  // owner, so a timeline entry claiming otherwise would be misleading; a
+  // distinct note is logged instead so this staffing misconfiguration stays
+  // visible without blocking capture.
+  if (input.assignedStaffId && !ownerAssignmentRejected) {
     await NativeTimeline.create({
       tenantId:     tid,
       entityModule: 'leads',
@@ -156,6 +190,16 @@ export async function captureLeadFromExternalSource(
       description:  teamName
         ? `${input.platform === 'chatbot' ? 'AI Widget' : input.platform} → ${teamName} → ${input.assignedStaffName ?? input.assignedStaffId}`
         : `${input.platform === 'chatbot' ? 'AI Widget' : input.platform} → Round Robin → ${input.assignedStaffName ?? input.assignedStaffId}`,
+      performedBy:  userId,
+      metadata:     { staffId: input.assignedStaffId, staffName: input.assignedStaffName, teamId, teamName },
+    });
+  } else if (ownerAssignmentRejected) {
+    await NativeTimeline.create({
+      tenantId:     tid,
+      entityModule: 'leads',
+      entityId:     lead._id.toString(),
+      action:       'created',
+      description:  `Round robin picked ${input.assignedStaffName ?? input.assignedStaffId} (Field Service staff, no CRM login) — left unassigned. Link a CRM user to that staff member, or assign an owner manually.`,
       performedBy:  userId,
       metadata:     { staffId: input.assignedStaffId, staffName: input.assignedStaffName, teamId, teamName },
     });
@@ -239,6 +283,36 @@ export async function enrichChatbotLead(
 
   await lead.save();
   return { notFound: false, lead };
+}
+
+const LEAD_COOLDOWN_MS = 10 * 60 * 1000;
+
+/** Widget-abuse guard: has this exact email already created a Lead for this
+ * tenant very recently, from a DIFFERENT session? Session-level idempotency
+ * (claimWidgetSession) only dedupes WITHIN one session — this closes the gap
+ * where the same visitor (or a scripted abuser) opens many sessions and
+ * resubmits the same email. `Lead.email` is PII-encrypted at rest, so this
+ * narrows candidates by `emailDomain` (an unencrypted blind-index field)
+ * before decrypting just that small set, rather than decrypting every recent
+ * Lead. Shared by the AI widget's own lead-capture call
+ * (internal.routes.ts's POST /widget-lead-capture) and the Connect-with-
+ * Branch form (public-widget.controller.ts's postConnectBranchSubmit) — both
+ * reuse this one implementation rather than each decrypting candidates
+ * independently. */
+export async function hasRecentLeadForEmail(tenantId: string, email: string): Promise<boolean> {
+  const normalized = email.trim().toLowerCase();
+  const at = normalized.indexOf('@');
+  const domain = at > 0 ? normalized.slice(at + 1) : null;
+  if (!domain) return false;
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const cutoff = new Date(Date.now() - LEAD_COOLDOWN_MS);
+  const candidates = await Lead.find({ tenantId: tid, emailDomain: domain, createdAt: { $gte: cutoff } })
+    .select('email').lean();
+  for (const c of candidates) {
+    const plain = c.email && isEncrypted(c.email) ? decrypt(c.email) : c.email;
+    if (plain && plain.trim().toLowerCase() === normalized) return true;
+  }
+  return false;
 }
 
 function buildCaptureFilter(tenantId: string, opts: LeadCaptureListOptions): Record<string, any> {

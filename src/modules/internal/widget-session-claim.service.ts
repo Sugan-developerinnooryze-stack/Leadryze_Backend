@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { WidgetSessionClaim } from './widget-session-claim.model';
+import { WidgetSessionClaim, WidgetSessionClaimKind } from './widget-session-claim.model';
 
 const POLL_INTERVAL_MS = 150;
 const POLL_MAX_ATTEMPTS = 20; // ~3s worst case for a genuinely slow concurrent winner
@@ -28,7 +28,7 @@ export interface WidgetSessionClaimOutcome {
  * of every caller giving up. Bounded by POLL_MAX_ATTEMPTS total across all
  * such re-attempts combined, not per-attempt, so this can never loop forever. */
 export async function claimWidgetSession(
-  tenantId: string, sessionId: string, kind: 'lead' | 'meeting',
+  tenantId: string, sessionId: string, kind: WidgetSessionClaimKind,
 ): Promise<{ claimed: true } | { claimed: false; outcome: WidgetSessionClaimOutcome | null }> {
   const tid = new mongoose.Types.ObjectId(tenantId);
 
@@ -53,7 +53,7 @@ export async function claimWidgetSession(
  * duplicate/retried request for the same session correctly no-op instead of
  * repeating the work. */
 export async function resolveWidgetSessionClaim(
-  tenantId: string, sessionId: string, kind: 'lead' | 'meeting', result: Record<string, unknown>,
+  tenantId: string, sessionId: string, kind: WidgetSessionClaimKind, result: Record<string, unknown>,
 ): Promise<void> {
   await WidgetSessionClaim.updateOne(
     { tenantId: new mongoose.Types.ObjectId(tenantId), sessionId, kind },
@@ -66,7 +66,7 @@ export async function resolveWidgetSessionClaim(
  * the same visitor can immediately try again within the same conversation
  * instead of being permanently locked out after one failed attempt. */
 export async function releaseWidgetSessionClaim(
-  tenantId: string, sessionId: string, kind: 'lead' | 'meeting',
+  tenantId: string, sessionId: string, kind: WidgetSessionClaimKind,
 ): Promise<void> {
   await WidgetSessionClaim.deleteOne({ tenantId: new mongoose.Types.ObjectId(tenantId), sessionId, kind });
 }

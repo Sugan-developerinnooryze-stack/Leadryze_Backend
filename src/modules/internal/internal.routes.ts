@@ -17,7 +17,7 @@ import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { Activity } from '../activities/activity.model';
 import { AutomationRun } from '../automation/automation-run.model';
-import { captureLeadFromExternalSource, enrichChatbotLead } from '../native-crm/lead-capture/lead-capture.service';
+import { captureLeadFromExternalSource, enrichChatbotLead, hasRecentLeadForEmail } from '../native-crm/lead-capture/lead-capture.service';
 import { assignRoundRobin, resolveTeamForService } from '../native-crm/staffs/round-robin.service';
 import { getActiveStaffByStaffId, listStaffs } from '../native-crm/staffs/staff.service';
 import { listTeams } from '../native-crm/teams/team.service';
@@ -52,7 +52,6 @@ import { resolveDataScope } from '../native-crm/shared/data-scope';
 import { hasPermission } from '../rbac/permission.service';
 import { transformPIIResponse } from '../../platform/pii/pii.service';
 import { getSettings as getFsSettings } from '../native-crm/fs-settings/fs-settings.service';
-import { decrypt, isEncrypted } from '../../utils/crypto';
 import { EmailLog } from '../notifications/email-log.model';
 import { Contact } from '../native-crm/contacts/contact.model';
 import { Company } from '../native-crm/companies/company.model';
@@ -1815,32 +1814,6 @@ router.post('/seed-templates/:tenantId', async (req: Request, res: Response, nex
  * (tenantId, platform:'chatbot', sessionId) stops a retried/duplicate call
  * for the same conversation from ever creating a second Lead.
  */
-
-const LEAD_COOLDOWN_MS = 10 * 60 * 1000;
-
-/** Widget-abuse guard: has this exact email already created a Lead for this
- * tenant very recently, from a DIFFERENT session? `claimWidgetSession` only
- * dedupes WITHIN one session — this closes the gap where the same visitor
- * (or a scripted abuser) opens many sessions and resubmits the same email.
- * `Lead.email` is PII-encrypted at rest, so this reuses the exact
- * narrow-by-`emailDomain`-then-decrypt-the-small-candidate-set pattern
- * already proven correct for the identical problem in
- * `leads/lead-import.service.ts`, rather than inventing a new one. */
-async function hasRecentLeadForEmail(tenantId: string, email: string): Promise<boolean> {
-  const normalized = email.trim().toLowerCase();
-  const at = normalized.indexOf('@');
-  const domain = at > 0 ? normalized.slice(at + 1) : null;
-  if (!domain) return false;
-  const tid = new mongoose.Types.ObjectId(tenantId);
-  const cutoff = new Date(Date.now() - LEAD_COOLDOWN_MS);
-  const candidates = await Lead.find({ tenantId: tid, emailDomain: domain, createdAt: { $gte: cutoff } })
-    .select('email').lean();
-  for (const c of candidates) {
-    const plain = c.email && isEncrypted(c.email) ? decrypt(c.email) : c.email;
-    if (plain && plain.trim().toLowerCase() === normalized) return true;
-  }
-  return false;
-}
 
 router.post('/widget-lead-capture', async (req: Request, res: Response, next: NextFunction) => {
   try {

@@ -457,6 +457,36 @@ export interface ITenant extends Document {
       waitingMessage: string;
       offlineMessage?: string;
     };
+    /** "Connect with Your Local Branch" — a SEPARATE, independent button from
+     * humanHandoff above: this one opens a deterministic lead-capture FORM
+     * embedded in the widget panel (no live agent, no Socket.IO), and
+     * submitting it creates a real Lead via the same
+     * captureLeadFromExternalSource() pipeline the AI's own conversational
+     * capture already uses. OFF by default for every tenant, old and new —
+     * same ground rule as humanHandoff: nothing about today's widget
+     * behavior changes until a tenant explicitly turns this on. */
+    connectBranch?: {
+      enabled: boolean;
+      buttonText: string;
+      formTitle: string;
+      formDescription: string;
+      submitButtonText: string;
+      successMessage: string;
+      /** The visitor-facing field list, in display order. `key:'branch'` is
+       * special — its dropdown is never manually populated here; the widget
+       * always fetches the tenant's live, active Branch records at runtime
+       * (GET /public/widget/branches), so this config only ever says
+       * whether that field is shown/required, never what its options are. */
+      fields: Array<{
+        key: string;
+        label: string;
+        type: 'text' | 'email' | 'phone' | 'textarea' | 'dropdown';
+        required: boolean;
+        enabled: boolean;
+        order: number;
+        options?: string[];
+      }>;
+    };
   };
   /** Per-module "is row-level Supervisor/Agent data scoping enforced, or is
    * everyone shown full tenant-wide access" toggle — read via
@@ -688,6 +718,23 @@ const tenantSchema = new Schema<ITenant>(
         buttonText:     { type: String, default: 'Connect with an expert' },
         waitingMessage: { type: String, default: "We're connecting you with a team member — someone will be with you shortly." },
         offlineMessage: String,
+      },
+      connectBranch: {
+        enabled:          { type: Boolean, default: false },
+        buttonText:       { type: String, default: 'Connect with Your Local Branch' },
+        formTitle:        { type: String, default: 'Connect with a branch' },
+        formDescription:  { type: String, default: "Leave your details and we'll be in touch shortly." },
+        submitButtonText: { type: String, default: 'Submit' },
+        successMessage:   { type: String, default: "Thanks! We've received your details and will be in touch shortly." },
+        fields: [{
+          key:      { type: String, required: true },
+          label:    { type: String, required: true },
+          type:     { type: String, enum: ['text', 'email', 'phone', 'textarea', 'dropdown'], required: true },
+          required: { type: Boolean, default: false },
+          enabled:  { type: Boolean, default: true },
+          order:    { type: Number, default: 0 },
+          options:  [String],
+        }],
       },
     },
     dataScopeConfig: { type: Schema.Types.Mixed, default: {} },

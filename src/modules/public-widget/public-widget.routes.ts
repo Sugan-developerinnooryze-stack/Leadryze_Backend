@@ -7,6 +7,7 @@ import {
   widgetConfigQuerySchema, widgetChatQuerySchema, widgetChatBodySchema, widgetVoiceChatBodySchema,
   widgetVoiceTokenBodySchema, widgetHistoryQuerySchema,
   widgetHandoffRequestBodySchema, widgetHandoffHistoryQuerySchema,
+  widgetConnectBranchSubmitBodySchema,
 } from './public-widget.validation';
 
 /** Public, unauthenticated — the website widget's entry point. Deliberately
@@ -21,12 +22,24 @@ const router = Router();
 // widgetKey/tenant resolved fresh here too (see preflight()'s own comment).
 // No rate limit on OPTIONS itself — browsers issue these automatically and
 // they do no real work (no DB write, no AI call).
-router.options(['/config', '/chat', '/voice/chat', '/voice/token', '/handoff/request', '/handoff/history'], ctrl.preflight);
+router.options(
+  ['/config', '/chat', '/voice/chat', '/voice/token', '/handoff/request', '/handoff/history', '/connect-branch/submit'],
+  ctrl.preflight,
+);
 
 router.get('/config', widgetRateLimit, validate({ query: widgetConfigQuerySchema }), ctrl.getConfig);
 router.get('/history', widgetRateLimit, validate({ query: widgetHistoryQuerySchema }), ctrl.getHistory);
 router.post('/handoff/request', widgetRateLimit, validate({ query: widgetChatQuerySchema, body: widgetHandoffRequestBodySchema }), ctrl.postHandoffRequest);
 router.get('/handoff/history', widgetRateLimit, validate({ query: widgetHandoffHistoryQuerySchema }), ctrl.getHandoffHistory);
+// "Connect with Your Local Branch" — a separate, deterministic lead-capture
+// form (no live agent), independent of the Human Handoff routes above. No
+// branch-list endpoint — the form asks for City/State as plain text (see
+// the reference design), and the controller best-effort matches a Branch
+// from those values rather than the visitor picking one from a list.
+router.post(
+  '/connect-branch/submit', widgetRateLimit,
+  validate({ query: widgetChatQuerySchema, body: widgetConnectBranchSubmitBodySchema }), ctrl.postConnectBranchSubmit,
+);
 router.post('/chat', widgetRateLimit, validate({ query: widgetChatQuerySchema, body: widgetChatBodySchema }), ctrl.postChat);
 // multer runs BEFORE validate() here — req.body only contains the text
 // fields (sessionId/visitorId/pageUrl/durationSeconds) once multer has

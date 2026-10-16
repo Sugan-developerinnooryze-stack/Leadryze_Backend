@@ -20,10 +20,12 @@ import mongoose, { Schema, Document } from 'mongoose';
  * (deletes the document) via releaseWidgetSessionClaim() rather than
  * recording a failure, so the same visitor can immediately retry within the
  * same conversation instead of being permanently locked out. */
+export type WidgetSessionClaimKind = 'lead' | 'meeting' | 'connect_branch';
+
 export interface IWidgetSessionClaimDoc extends Document {
   tenantId: mongoose.Types.ObjectId;
   sessionId: string;
-  kind: 'lead' | 'meeting';
+  kind: WidgetSessionClaimKind;
   status: 'pending' | 'done';
   result?: Record<string, unknown>;
   createdAt: Date;
@@ -34,7 +36,7 @@ const schema = new Schema<IWidgetSessionClaimDoc>(
   {
     tenantId: { type: Schema.Types.ObjectId, ref: 'Tenant', required: true },
     sessionId: { type: String, required: true },
-    kind: { type: String, enum: ['lead', 'meeting'], required: true },
+    kind: { type: String, enum: ['lead', 'meeting', 'connect_branch'], required: true },
     status: { type: String, enum: ['pending', 'done'], default: 'pending' },
     result: { type: Schema.Types.Mixed },
   },

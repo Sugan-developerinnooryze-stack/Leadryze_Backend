@@ -8,7 +8,12 @@ const statusSchema = z.string().trim().min(1);
 // LR-LEAD-003: a phone field accepted letters ("abc123") outright — digits,
 // spaces, and the usual +/-/() punctuation only. .or(literal('')) mirrors
 // email's own optional-but-not-""-isn't-a-format-error pattern below.
-const phoneSchema = z.string().trim().regex(/^[0-9+\-\s()]+$/, 'Enter a valid phone number').optional().or(z.literal(''));
+// Exported as a plain regex (not just the zod schema) so other server-side
+// validators that aren't themselves zod-object fields (e.g. the Connect-
+// with-Branch form's per-field type check) can reuse the identical rule
+// instead of redefining it.
+export const PHONE_FORMAT_REGEX = /^[0-9+\-\s()]+$/;
+const phoneSchema = z.string().trim().regex(PHONE_FORMAT_REGEX, 'Enter a valid phone number').optional().or(z.literal(''));
 const sourceEnum   = z.enum(['website','landing_page','chatbot','whatsapp','facebook','google','manual','csv','api','referral','other']);
 const ratingEnum   = z.enum(['hot','warm','cold']);
 const priorityEnum = z.enum(['high','medium','low']);

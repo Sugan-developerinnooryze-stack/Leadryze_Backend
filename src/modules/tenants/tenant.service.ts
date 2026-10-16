@@ -344,7 +344,7 @@ export async function updateTenant(
   };
   const update: Record<string, unknown> = { ...rest };
   if (widget && typeof widget === 'object') {
-    for (const key of ['enabled', 'allowedDomains', 'greeting', 'quickQuestions', 'showBookingQuickReply', 'autoSendLeadEmails', 'defaultTeamId', 'websiteUrl', 'booking', 'template', 'theme', 'voice', 'humanHandoff']) {
+    for (const key of ['enabled', 'allowedDomains', 'greeting', 'quickQuestions', 'showBookingQuickReply', 'autoSendLeadEmails', 'defaultTeamId', 'websiteUrl', 'booking', 'template', 'theme', 'voice', 'humanHandoff', 'connectBranch']) {
       if (widget[key] !== undefined) update[`widget.${key}`] = widget[key];
     }
     // lastCrawledAt/crawlPageCount are deliberately NOT in the allow-list above —

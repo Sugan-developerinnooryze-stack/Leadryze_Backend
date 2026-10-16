@@ -24,6 +24,20 @@ export interface CaptureLeadInput {
   /** The widget's own chat sessionId — distinct from `sourceUrl` above
    * (which already exists and is populated from this same caller). */
   chatSessionId?: string;
+  /** Connect-with-Branch only — derived server-side from the visitor's
+   * SELECTED Branch record (not typed by the visitor; there is no city/state
+   * input in that form), so the created Lead's address fields are populated
+   * automatically instead of left blank. */
+  city?: string;
+  state?: string;
+  country?: string;
+  /** Merged into the created Lead's own `customFields` alongside
+   * `_leadCaptureId`/`_capturePlatform` below — the existing supported
+   * extension point for attribution metadata that doesn't warrant widening
+   * Lead's `source` enum (e.g. Connect-with-Branch's `_connectAction`).
+   * Every existing caller leaves this undefined and is completely
+   * unaffected. */
+  extraCustomFields?: Record<string, unknown>;
 }
 
 export interface LeadCaptureListOptions {
