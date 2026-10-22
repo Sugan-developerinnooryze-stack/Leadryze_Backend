@@ -22,7 +22,7 @@ export function errorHandler(
 
   if (err instanceof ZodError) { sendError(res, 'Validation error', 422, err.errors); return; }
   if (err.name === 'ValidationError') { sendError(res, err.message, 422); return; }
-  if (err.name === 'CastError') { sendError(res, 'Invalid ID format', 400); return; }
+  if (err.name === 'CastError' || err.message?.includes('Cast to ObjectId failed')) { sendError(res, 'Resource not found', 404); return; }
   if (err.code === 11000) { sendError(res, 'Duplicate entry — resource already exists', 409); return; }
 
   const statusCode = err.statusCode || 500;

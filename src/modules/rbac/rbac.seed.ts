@@ -237,13 +237,6 @@ const AGENT_PERMISSIONS = [
   'customers.view', 'customers.create', 'customers.edit', 'customers.assign',
   'campaigns.view',
   'templates.view',
-  // LR-UI-002: an Agent's own Timeline/Activity views already surface
-  // another teammate's raw User._id in text (e.g. "Reassigned ... by
-  // <id>") with no way to resolve it — this was never a deliberate
-  // read-only restriction, just a gap; matches the same "enforcement
-  // catching up to already-expressed intent" reasoning used elsewhere in
-  // this list. View-only, same as every other *.view grant here.
-  'users.view',
   'analytics.view',
   'knowledge.view',
   'bot.view', 'bot.use',

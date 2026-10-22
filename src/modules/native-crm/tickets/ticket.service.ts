@@ -28,7 +28,7 @@ export async function listTickets(tenantId: string, opts: ListOptions = {}, bran
   if (relatedModule && relatedId) { filter.relatedModule = relatedModule; filter.relatedId = relatedId; }
   if (search) {
     const re = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-    filter.$or = [{ subject: re }, { contactName: re }, { description: re }];
+    filter.$or = [{ subject: re }, { contactName: re }, { description: re }, { ticketNumber: re }, { ticketId: re }];
   }
   if (slaStatus) {
     // $and, not a plain merge — slaStatusMongoFilter('on_track') returns its
@@ -46,7 +46,10 @@ export async function listTickets(tenantId: string, opts: ListOptions = {}, bran
 
 export async function getTicketById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { ticketId: id }] }
+    : { ticketId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const item = await Ticket.findOne(filter).lean();
   return item ? { ...item, slaStatus: deriveSlaStatus(item) } : item;
@@ -73,7 +76,10 @@ export async function createTicket(tenantId: string, dto: CreateTicketDTO & { cr
 export async function updateTicket(tenantId: string, id: string, dto: UpdateTicketDTO, scope?: DataScope) {
   await assertValidStatus(tenantId, dto.ticketStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { ticketId: id }] }
+    : { ticketId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
 
   const setDto: Record<string, unknown> = { ...dto };
@@ -92,7 +98,10 @@ export async function updateTicket(tenantId: string, id: string, dto: UpdateTick
 
 export async function deleteTicket(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { ticketId: id }] }
+    : { ticketId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await Ticket.findOneAndDelete(filter).lean();
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'tickets', String(deleted._id));

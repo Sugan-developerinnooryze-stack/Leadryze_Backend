@@ -3,6 +3,7 @@ import { AuthRequest } from '../../types';
 import * as customerService from './customer.service';
 import { sendSuccess, sendCreated, sendError, sendPaginated } from '../../utils/response';
 import { writeLog } from '../logs/log.service';
+import { logAuditEvent } from '../logs/audit-log.model';
 import { pushCustomerUpdate, pushCustomerDelete } from '../connectors/connector.service';
 
 function actor(req: AuthRequest) {
@@ -105,6 +106,19 @@ export async function deleteCustomer(req: AuthRequest, res: Response, next: Next
         ...actor(req),
       },
     });
+    logAuditEvent('customer.deleted',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      {
+        tenantId: req.tenantId!,
+        target: 'Customer',
+        targetId: (customer as any)?.customerId ?? req.params.id,
+        detail: {
+          customerId: (customer as any)?.customerId,
+          name: customer?.name,
+          before: { customerId: (customer as any)?.customerId, name: customer?.name },
+        },
+      },
+    );
     // Fire-and-forget delete write-back → removes record from source CRM
     if (customer) {
       pushCustomerDelete(req.tenantId!, {

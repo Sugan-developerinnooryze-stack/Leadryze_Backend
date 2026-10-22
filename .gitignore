@@ -36,9 +36,15 @@ Thumbs.db
 /backfill-*.js
 /scratch-*.js
 
-# QA test runner scripts and Excel updater scripts
+# QA test runner scripts, one-off patch/scratch scripts, and Excel updaters
 _investigate-stats.mjs
-src/scripts/test_lr_*.ts
-src/scripts/update_excel_*.py
-src/scripts/update_row_*.py
-src/scripts/check_converted_contacts.ts
+src/scripts/test_*
+src/scripts/update_excel*
+src/scripts/update_row*
+src/scripts/inspect_*
+src/scripts/patch_*
+src/scripts/scan_*
+src/scripts/check_*
+src/scripts/backfill-ticket-numbers.ts
+tests/*.test.ts
+

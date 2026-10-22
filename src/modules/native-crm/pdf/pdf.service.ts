@@ -1,5 +1,8 @@
 import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import puppeteer, { Browser, Page } from 'puppeteer';
+import { logger } from '../../../utils/logger';
 import { IDesignElement, ITemplatePage, ITemplateRegion } from '../custom-templates/custom-template.model';
 import { RenderCtx } from './variable-catalog';
 import { renderCustomTemplateFull, RenderedTemplate, FLOW_TYPES } from './pdf.variable-renderer';
@@ -9,11 +12,39 @@ export interface PdfOptions {
   marginBottomPx?: number;
 }
 
+function findChromeInCacheDir(cacheDir: string): string | undefined {
+  try {
+    if (!fs.existsSync(cacheDir)) return undefined;
+    const entries = fs.readdirSync(cacheDir, { recursive: true }) as string[];
+    for (const entry of entries) {
+      const full = path.join(cacheDir, String(entry));
+      const base = path.basename(full).toLowerCase();
+      if ((base === 'chrome.exe' || base === 'chrome') && fs.statSync(full).isFile()) {
+        return full;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
 function resolveBrowserExecutable(): string | undefined {
   if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
 
+  // 1. Search in local and global puppeteer cache directories (including Render and CI)
+  const candidateCacheDirs = [
+    path.join(process.cwd(), '.cache', 'puppeteer'),
+    path.join(__dirname, '../../../../.cache/puppeteer'),
+    path.join(os.homedir(), '.cache', 'puppeteer'),
+    '/opt/render/.cache/puppeteer',
+  ];
+  for (const cacheDir of candidateCacheDirs) {
+    const found = findChromeInCacheDir(cacheDir);
+    if (found) return found;
+  }
+
+  // 2. Search known system binary paths
   const candidatePaths = [
     process.env['PROGRAMFILES'] && `${process.env['PROGRAMFILES']}\\Google\\Chrome\\Application\\chrome.exe`,
     process.env['PROGRAMFILES(X86)'] && `${process.env['PROGRAMFILES(X86)']}\\Google\\Chrome\\Application\\chrome.exe`,
@@ -48,7 +79,7 @@ function resolveBrowserExecutable(): string | undefined {
 }
 
 export async function launchBrowser(): Promise<Browser> {
-  const baseArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
+  const baseArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--font-render-hinting=none'];
   const execPath = resolveBrowserExecutable();
   const launchOpts: any = {
     headless: true,
@@ -66,10 +97,12 @@ export async function launchBrowser(): Promise<Browser> {
         delete launchOpts.executablePath;
         return await puppeteer.launch(launchOpts);
       } catch (fallbackErr: any) {
-        throw new Error(`Failed to launch browser for PDF generation: ${fallbackErr.message || err.message}`);
+        logger.error('Puppeteer browser launch failed', { err: fallbackErr?.message || err?.message });
+        throw new Error('PDF generation service is currently unavailable. Please use the Print option or contact support.');
       }
     }
-    throw new Error(`Failed to launch browser for PDF generation: ${err.message}`);
+    logger.error('Puppeteer browser launch failed', { err: err?.message });
+    throw new Error('PDF generation service is currently unavailable. Please use the Print option or contact support.');
   }
 }
 

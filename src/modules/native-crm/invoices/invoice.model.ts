@@ -1,5 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
+import { getNextSequence } from '../shared/counter.model';
 
 export interface IServiceLine {
   name:             string;
@@ -46,6 +47,9 @@ export interface IInvoiceDoc extends Document {
   paidAmount:            number;
   balanceDue?:           number;
   status:                string;
+  /** Status of the invoice prior to becoming fully paid, so removing a payment
+   * restores its previous state (e.g. draft) instead of forcing 'sent'. */
+  priorStatus?:          string;
   notes?:                string;
   termsAndConditions?:   string;
   workflowState?: 'pending' | 'in_progress' | 'complete';
@@ -114,6 +118,7 @@ const schema = new Schema<IInvoiceDoc>(
       type:    String,
       default: 'draft',
     },
+    priorStatus: { type: String },
     notes:              { type: String },
     termsAndConditions: { type: String },
     workflowState: { type: String, enum: ['pending', 'in_progress', 'complete'], default: 'pending' },
@@ -136,14 +141,9 @@ schema.virtual('balanceDue').get(function () {
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();
-  const last = await (this.constructor as any)
-    .findOne({ tenantId: this.tenantId })
-    .sort({ numId: -1 })
-    .select('numId')
-    .lean();
-  this.numId     = (last?.numId ?? 0) + 1;
-  const pfx         = await resolveClientPrefix(this.tenantId);
-  this.clientId = pfx;
+  this.numId     = await getNextSequence(this.tenantId, 'invoices', this.constructor as any);
+  const pfx      = await resolveClientPrefix(this.tenantId);
+  this.clientId  = pfx;
   this.invoiceId = `${pfx}-INV-${String(this.numId).padStart(4, '0')}`;
   next();
 });

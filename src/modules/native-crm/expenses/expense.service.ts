@@ -29,7 +29,10 @@ export async function listExpenses(tenantId: string, opts: ExpenseListOptions, b
 
 export async function getExpenseById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { expenseId: id }] }
+    : { expenseId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativeExpense.findOne(filter);
 }
@@ -42,7 +45,10 @@ export async function createExpense(data: any) {
 
 export async function updateExpense(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { expenseId: id }] }
+    : { expenseId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeExpense.findOneAndUpdate(
     filter,
@@ -55,7 +61,10 @@ export async function updateExpense(id: string, tenantId: string, data: any, sco
 
 export async function deleteExpense(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { expenseId: id }] }
+    : { expenseId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeExpense.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'expenses', String(deleted._id));

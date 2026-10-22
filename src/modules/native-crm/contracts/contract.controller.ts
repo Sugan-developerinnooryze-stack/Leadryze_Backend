@@ -9,6 +9,7 @@ import {
   deleteContract,
   updateVisitStatus,
   generateWorkordersForVisits,
+  normalizeContractStartDate,
 } from './contract.service';
 import { generateVisits, summarizeVisits } from './schedule.engine';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
@@ -101,11 +102,21 @@ export async function remove(req: AuthRequest, res: Response) {
     runAutomationsOnDelete(req.tenantId!, 'contract', item as any).catch(() => {});
     logAuditEvent('contract.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'Contract', targetId: req.params.id, detail: { before: { title: (item as any).title, status: (item as any).status } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'Contract',
+        targetId: (item as any).contractId ?? req.params.id,
+        detail: {
+          contractId: (item as any).contractId,
+          title: (item as any).title,
+          before: { title: (item as any).title, status: (item as any).status },
+        },
+      },
     );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {
-    sendError(res, err.message, 500);
+    const status = err.statusCode ?? (err.message?.includes('Cannot delete') ? 409 : 500);
+    sendError(res, err.message, status);
   }
 }
 
@@ -116,8 +127,12 @@ export async function schedulePreview(req: AuthRequest, res: Response) {
     if (!Array.isArray(services) || !startDate || !endDate) {
       return sendError(res, 'services, startDate and endDate are required', 400);
     }
-    const visits  = generateVisits(services, startDate, endDate);
-    const summary = summarizeVisits(visits, startDate, endDate, services);
+    const normStart = (await normalizeContractStartDate(req.tenantId!, startDate)) ?? new Date(startDate);
+    const normEnd   = typeof endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(endDate)
+      ? new Date(`${endDate}T23:59:59.999Z`)
+      : new Date(endDate);
+    const visits  = generateVisits(services, normStart, normEnd);
+    const summary = summarizeVisits(visits, normStart, normEnd, services);
     sendSuccess(res, { summary, visits });
   } catch (err: any) {
     sendError(res, err.message, 400);

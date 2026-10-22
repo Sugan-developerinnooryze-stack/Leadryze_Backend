@@ -111,7 +111,16 @@ export async function remove(req: AuthRequest, res: Response) {
     runAutomationsOnDelete(req.tenantId!, 'workorder', item as any).catch(() => {});
     logAuditEvent('workorder.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'WorkOrder', targetId: req.params.id, detail: { before: { status: (item as any).status } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'WorkOrder',
+        targetId: (item as any).workOrderId ?? req.params.id,
+        detail: {
+          workOrderId: (item as any).workOrderId,
+          title: (item as any).title ?? (item as any).description,
+          before: { status: (item as any).status },
+        },
+      },
     );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

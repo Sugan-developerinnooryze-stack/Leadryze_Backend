@@ -36,6 +36,7 @@ export async function create(req: AuthRequest, res: Response) {
       tenantId:  req.tenantId!,
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
+      idempotencyKey: req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey,
     });
     sendCreated(res, item);
   } catch (err: any) {

@@ -13,7 +13,11 @@ const statusSchema = z.string().trim().min(1);
 // with-Branch form's per-field type check) can reuse the identical rule
 // instead of redefining it.
 export const PHONE_FORMAT_REGEX = /^[0-9+\-\s()]+$/;
-const phoneSchema = z.string().trim().regex(PHONE_FORMAT_REGEX, 'Enter a valid phone number').optional().or(z.literal(''));
+// LR-C4-IMP-003: Allow numeric-looking phone (e.g. 9876543210 passed as number in JSON or file import) by preprocessing to string
+const phoneSchema = z.preprocess(
+  (val) => (val != null && typeof val === 'number' ? String(val) : val),
+  z.string().trim().regex(PHONE_FORMAT_REGEX, 'Enter a valid phone number').optional().or(z.literal(''))
+);
 const sourceEnum   = z.enum(['website','landing_page','chatbot','whatsapp','facebook','google','manual','csv','api','referral','other']);
 const ratingEnum   = z.enum(['hot','warm','cold']);
 const priorityEnum = z.enum(['high','medium','low']);
@@ -89,13 +93,39 @@ export const createLeadSchema = z.object({
 
   tags:  z.array(z.string()).optional(),
   notes: z.string().optional(),
+  allowDuplicate: z.boolean().optional(),
+  skipDuplicates: z.boolean().optional(),
   customFields,
 });
+
+// LR-C4-LEAD-003: If a role with masked PII views a record, the client may submit
+// masked values (e.g. qa****@q****.com or 65XXXXXX11). On update, allow masked strings
+// so validation does not fail with 400.
+const isMaskedPiiString = (v: string) => typeof v === 'string' && (v.includes('*') || /X{2,}/.test(v));
+
+const updateEmailSchema = z.string().trim().refine(
+  (v) => !v || isMaskedPiiString(v) || z.string().email().safeParse(v).success,
+  { message: 'Invalid email address' }
+).optional().or(z.literal(''));
+
+const updatePhoneSchema = z.preprocess(
+  (val) => (val != null && typeof val === 'number' ? String(val) : val),
+  z.string().trim().refine(
+    (v) => !v || isMaskedPiiString(v) || PHONE_FORMAT_REGEX.test(v),
+    { message: 'Enter a valid phone number' }
+  ).optional().or(z.literal(''))
+);
 
 // LR-NEG-001: same reasoning as contact.validation.ts's updateContactSchema
 // — getLeadById's stale-save check needs updatedAt/__v on the wire, or
 // validate.middleware.ts strips them before the service ever sees them.
 export const updateLeadSchema = createLeadSchema.partial().extend({
+  email: updateEmailSchema,
+  secondaryEmail: updateEmailSchema,
+  phone: updatePhoneSchema,
+  mobile: updatePhoneSchema,
+  whatsapp: updatePhoneSchema,
+  alternatePhone: updatePhoneSchema,
   updatedAt: z.string().optional(),
   __v: z.number().optional(),
 });

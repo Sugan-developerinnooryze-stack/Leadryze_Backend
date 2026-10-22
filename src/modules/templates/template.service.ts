@@ -8,6 +8,8 @@ import { AutomationFlow } from '../native-crm/automation-flows/automation-flow.m
 import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { sendWhatsAppNow } from '../messages/whatsapp.service';
+import { Tenant } from '../tenants/tenant.model';
+import { config } from '../../config';
 
 function extractVariables(body: string): string[] {
   const matches = body.match(/\{\{([\w.]+)\}\}/g) || [];
@@ -142,17 +144,61 @@ export async function duplicateTemplate(tenantId: string, id: string): Promise<I
   });
 }
 
-function sampleVariablesForCustomer(customer: { name?: string; firstName?: string; lastName?: string; email?: string; phone?: string; company?: string } | null): Record<string, string> {
-  if (!customer) {
-    return { name: 'Sample Customer', firstName: 'Sample', lastName: 'Customer', email: 'sample@example.com', phone: '+10000000000', company: 'Sample Co' };
+function formatDateTime(timeZone?: string) {
+  const d = new Date();
+  const dateOpts: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short', day: 'numeric' };
+  const timeOpts: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', hour12: true };
+  if (timeZone) {
+    try {
+      return {
+        date: d.toLocaleDateString('en-US', { ...dateOpts, timeZone }),
+        time: d.toLocaleTimeString('en-US', { ...timeOpts, timeZone }),
+      };
+    } catch {
+      // invalid timezone string fallback
+    }
   }
   return {
-    name: customer.name ?? '',
-    firstName: customer.firstName ?? customer.name ?? '',
-    lastName: customer.lastName ?? '',
-    email: customer.email ?? '',
-    phone: customer.phone ?? '',
-    company: customer.company ?? '',
+    date: d.toLocaleDateString('en-US', dateOpts),
+    time: d.toLocaleTimeString('en-US', timeOpts),
+  };
+}
+
+export function sampleVariablesForCustomer(
+  customer: { name?: string; firstName?: string; lastName?: string; email?: string; phone?: string; company?: string } | null,
+  tenant?: { name?: string; branding?: { companyName?: string; contactEmail?: string }; settings?: { timezone?: string } } | null
+): Record<string, string> {
+  const tenantCompany = tenant?.branding?.companyName || tenant?.name || 'LeadRyze';
+  const { date, time } = formatDateTime(tenant?.settings?.timezone);
+  if (!customer) {
+    return {
+      name: 'Valued Customer',
+      firstName: 'Valued',
+      lastName: 'Customer',
+      email: 'customer@example.com',
+      phone: '+1 555-0199',
+      company: tenantCompany,
+      customerCompany: 'Sample Client Co',
+      recipientCompany: 'Sample Client Co',
+      tenantName: tenantCompany,
+      date,
+      time,
+      today: date,
+    };
+  }
+  return {
+    name: customer.name || 'Valued Customer',
+    firstName: customer.firstName || (customer.name ? customer.name.split(' ')[0] : 'Valued'),
+    lastName: customer.lastName || (customer.name ? customer.name.split(' ').slice(1).join(' ') : ''),
+    email: customer.email || '',
+    phone: customer.phone || '',
+    company: tenantCompany,
+    customerCompany: customer.company || '',
+    recipientCompany: customer.company || '',
+    tenantName: tenantCompany,
+    date,
+    time,
+    today: date,
   };
 }
 
@@ -166,7 +212,9 @@ export async function previewTemplate(
 ): Promise<{ subject?: string; body: string } | null> {
   const template = await getTemplateById(tenantId, id);
   if (!template) return null;
-  const variables = sampleVariables ?? sampleVariablesForCustomer(await Customer.findOne({ tenantId }).lean());
+  const tenant = await Tenant.findById(tenantId).select('name branding settings').lean();
+  const customer = await Customer.findOne({ tenantId }).lean();
+  const variables = sampleVariables ?? sampleVariablesForCustomer(customer, tenant);
   return {
     subject: template.subject ? renderTemplate(template.subject, variables) : undefined,
     body: renderTemplate(template.body, variables),
@@ -189,13 +237,43 @@ export async function testSendTemplate(tenantId: string, id: string, to: string)
   const template = await getTemplateById(tenantId, id);
   if (!template) throw new TemplateActionError('Template not found', 404);
 
-  const variables = sampleVariablesForCustomer(await Customer.findOne({ tenantId }).lean());
+  const tenant = await Tenant.findById(tenantId).select('name branding settings').lean();
+  const normalizedTo = to.toLowerCase().trim();
+  const matchedCustomer = await Customer.findOne({ tenantId, email: normalizedTo }).lean();
+
+  let recipientName = 'Test Recipient';
+  if (matchedCustomer?.name) {
+    recipientName = matchedCustomer.name;
+  } else if (normalizedTo.includes('@')) {
+    const localPart = normalizedTo.split('@')[0].replace(/[._-]/g, ' ').trim();
+    if (localPart.length > 1) {
+      recipientName = localPart.replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+  }
+
+  const customerData = matchedCustomer || {
+    name: recipientName,
+    email: to,
+    phone: '+91 98765 43210',
+    company: '',
+  };
+
+  const variables = sampleVariablesForCustomer(customerData as any, tenant);
   const body = renderTemplate(template.body, variables);
 
   if (template.type === 'email') {
     const subject = template.subject ? renderTemplate(template.subject, variables) : 'Test message';
+    const senderName = tenant?.branding?.companyName || tenant?.name || config.brevo.senderName;
+    const replyTo = tenant?.branding?.contactEmail || undefined;
     try {
-      const messageId = await sendEmailNow({ to, subject, htmlContent: body });
+      const messageId = await sendEmailNow({
+        to,
+        toName: recipientName,
+        senderName,
+        replyTo,
+        subject,
+        htmlContent: body,
+      });
       return messageId ? { sent: true } : { sent: false, reason: 'Email is not configured for this tenant.' };
     } catch (err) {
       return { sent: false, reason: (err as Error).message };

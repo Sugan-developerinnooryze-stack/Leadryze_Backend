@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { NativeCustomField } from './custom-field.model';
+import { assertValidCustomFieldDefinition } from './custom-field-definition.validator';
 
 export async function listCustomFields(tenantId: string, module?: string, branchId?: string | null) {
   const filter: Record<string, any> = { tenantId: new mongoose.Types.ObjectId(tenantId), isActive: true };
@@ -17,6 +18,9 @@ export async function getCustomFieldById(id: string, tenantId: string) {
 }
 
 export async function createCustomField(tenantId: string, data: Record<string, any>, branchId?: string | null) {
+  const existing = await listCustomFields(tenantId, data.module, branchId ?? null);
+  assertValidCustomFieldDefinition(data as any, existing.map((f: any) => f.fieldKey));
+
   return NativeCustomField.create({
     ...data,
     tenantId: new mongoose.Types.ObjectId(tenantId),
@@ -25,6 +29,17 @@ export async function createCustomField(tenantId: string, data: Record<string, a
 }
 
 export async function updateCustomField(id: string, tenantId: string, data: Record<string, any>) {
+  // Merge onto the existing field before validating — same partial-update
+  // care as Custom Module definitions/records this session: a caller
+  // changing only `required` or `label` must not be rejected just because
+  // the merged view temporarily looks incomplete without this.
+  const current = await NativeCustomField.findOne({ _id: id, tenantId: new mongoose.Types.ObjectId(tenantId) }).lean();
+  if (!current) return null;
+  const merged = { ...current, ...data };
+  const siblings = await listCustomFields(tenantId, merged.module, (current as any).branchId ?? null);
+  const existingKeys = siblings.map((f: any) => f.fieldKey).filter((k: string) => k !== (current as any).fieldKey);
+  assertValidCustomFieldDefinition(merged as any, existingKeys);
+
   return NativeCustomField.findOneAndUpdate(
     { _id: id, tenantId: new mongoose.Types.ObjectId(tenantId) },
     { $set: data },

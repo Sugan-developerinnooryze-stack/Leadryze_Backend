@@ -61,6 +61,8 @@ schema.pre('save', async function (next) {
 schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, invoiceId: 1 });
+schema.index({ tenantId: 1, receiptId: 1 }, { unique: true, sparse: true });
+schema.index({ tenantId: 1, numId: 1 }, { unique: true, sparse: true });
 
 export const NativeReceipt = mongoose.model<IReceiptDoc>(
   'NativeReceipt',

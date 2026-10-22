@@ -8,8 +8,19 @@ import { logTimeline }    from '../timeline/timeline.service';
 import { getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { autoLockIfConfigured } from '../record-lock/record-lock.service';
 import { runAutomations } from '../automation-rules/automation-rule.service';
+import { writeNativeCrmLog } from '../../../middlewares/native-crm-log.middleware';
+import { logAuditEvent } from '../../logs/audit-log.model';
 
 import { indexNativeSearchRecord } from '../shared/search-index';
+
+export interface ConversionActorContext {
+  actorId?: string;
+  actorName?: string;
+  actorRole?: string;
+  ip?: string;
+  url?: string;
+  userAgent?: string;
+}
 
 const CONTACT_SOURCE_MAP: Record<string, string> = {
   website: 'website', referral: 'referral', social: 'social',
@@ -22,6 +33,7 @@ export async function convertLeadToContact(
   tenantId: mongoose.Types.ObjectId,
   leadId:   string,
   performedBy: string,
+  actorContext?: ConversionActorContext,
 ) {
   const lead = await getLeadRaw(leadId, tenantId.toString());
   if (!lead) throw new Error('Lead not found');
@@ -85,6 +97,22 @@ export async function convertLeadToContact(
     { type: 'contact', name },
   ).catch(() => {});
 
+  // LR-PL-AUDIT-001: Contact created via conversion is audited under Contacts module
+  await writeNativeCrmLog({
+    tenantId:   tenantId.toString(),
+    actorId:    actorContext?.actorId || performedBy || 'anonymous',
+    actorName:  actorContext?.actorName || performedBy || 'anonymous',
+    actorRole:  actorContext?.actorRole || '',
+    action:     'create',
+    module:     'contacts',
+    resourceId: name || contact._id.toString(),
+    before:     null,
+    after:      contact.toObject ? contact.toObject() : (contact as any),
+    statusCode: 200,
+    ip:         actorContext?.ip || 'unknown',
+    url:        actorContext?.url || `/api/v1/native-crm/contacts/${contact._id}`,
+  }).catch(() => {});
+
   return { lead, contact };
 }
 
@@ -92,6 +120,7 @@ export async function convertLeadToOpportunity(
   tenantId: mongoose.Types.ObjectId,
   leadId:   string,
   performedBy: string,
+  actorContext?: ConversionActorContext,
 ) {
   const lead = await getLeadRaw(leadId, tenantId.toString());
   if (!lead) throw new Error('Lead not found');
@@ -131,6 +160,22 @@ export async function convertLeadToOpportunity(
     { type: 'opportunity', title },
   ).catch(() => {});
 
+  // LR-PL-AUDIT-001: Deal created via conversion is audited under Deals module
+  await writeNativeCrmLog({
+    tenantId:   tenantId.toString(),
+    actorId:    actorContext?.actorId || performedBy || 'anonymous',
+    actorName:  actorContext?.actorName || performedBy || 'anonymous',
+    actorRole:  actorContext?.actorRole || '',
+    action:     'create',
+    module:     'deals',
+    resourceId: (deal as any).dealId || title || deal._id.toString(),
+    before:     null,
+    after:      deal.toObject ? deal.toObject() : (deal as any),
+    statusCode: 200,
+    ip:         actorContext?.ip || 'unknown',
+    url:        actorContext?.url || `/api/v1/native-crm/deals/${deal._id}`,
+  }).catch(() => {});
+
   return { lead, deal };
 }
 
@@ -138,6 +183,7 @@ export async function convertLeadToCustomer(
   tenantId: mongoose.Types.ObjectId,
   leadId:   string,
   performedBy: string,
+  actorContext?: ConversionActorContext,
 ) {
   const lead = await getLeadRaw(leadId, tenantId.toString());
   if (!lead) throw new Error('Lead not found');
@@ -162,7 +208,7 @@ export async function convertLeadToCustomer(
     notes:       `Converted from Lead ${lead.leadId}`,
     tags:        lead.tags ?? [],
     status:      'active',
-    leadId:      lead._id.toString(),
+    leadId:      lead.leadId || lead._id.toString(),
     opportunityId: lead.opportunityId ?? '',
     // Auto-carries the Lead's own owner forward so the new Customer starts
     // out correctly scoped for the same Manager/Agent who already had this
@@ -201,6 +247,40 @@ export async function convertLeadToCustomer(
     `Customer ${custId} created`, performedBy,
     { type: 'customer', customerId: custId },
   ).catch(() => {});
+
+  // LR-PL-AUDIT-001: Customer created via conversion must be audited under Customers module
+  await writeNativeCrmLog({
+    tenantId:   tenantId.toString(),
+    actorId:    actorContext?.actorId || performedBy || 'anonymous',
+    actorName:  actorContext?.actorName || performedBy || 'anonymous',
+    actorRole:  actorContext?.actorRole || '',
+    action:     'create',
+    module:     'customers',
+    resourceId: customer.customerId || customer._id.toString(),
+    before:     null,
+    after:      customer.toObject ? customer.toObject() : (customer as any),
+    statusCode: 200,
+    ip:         actorContext?.ip || 'unknown',
+    url:        actorContext?.url || `/api/v1/native-crm/customers/${customer._id}`,
+  }).catch(() => {});
+
+  if (actorContext?.actorId) {
+    logAuditEvent('customer.created',
+      {
+        id:        actorContext.actorId,
+        email:     actorContext.actorName || actorContext.actorId,
+        role:      actorContext.actorRole || 'user',
+        ip:        actorContext.ip,
+        userAgent: actorContext.userAgent,
+      },
+      {
+        tenantId: tenantId.toString(),
+        target:   'Customer',
+        targetId: customer.customerId,
+        detail:   { customerId: customer.customerId, name: customer.name, source: 'lead_conversion', leadId: lead.leadId },
+      },
+    );
+  }
 
   return { lead, customer };
 }

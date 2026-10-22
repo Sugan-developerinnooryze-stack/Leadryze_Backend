@@ -43,7 +43,9 @@ export async function create(req: AuthRequest, res: Response) {
     // email/phone match against an existing contact.
     const duplicate = await findDuplicateContact(Contact, req.tenantId!, req.body);
     const record = await svc.createContact(req.tenantId!, { ...req.body, branchId: req.body.branchId ?? req.branchId ?? null, createdBy: req.user!.userId });
-    sendCreated(res, { ...record.toObject(), duplicateWarning: duplicate }, 'Contact created');
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeRecord = transformPIIResponse(record, 'contacts', req.user!.role, viewRoles);
+    sendCreated(res, { ...safeRecord, duplicateWarning: duplicate }, 'Contact created');
   } catch { sendError(res, 'Failed to create contact', 500); }
 }
 
@@ -51,7 +53,9 @@ export async function update(req: AuthRequest, res: Response) {
   try {
     const record = await svc.updateContact(req.tenantId!, req.params.id, req.body, resolveEffectiveScope(req, 'contacts'));
     if (!record) return void sendError(res, 'Contact not found', 404);
-    sendSuccess(res, record, 'Contact updated');
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeRecord = transformPIIResponse(record, 'contacts', req.user!.role, viewRoles);
+    sendSuccess(res, safeRecord, 'Contact updated');
   } catch (err: any) {
     // LR-NEG-001: see lead.controller.ts's identical comment.
     if (err?.name === 'VersionError') {
@@ -67,7 +71,10 @@ export async function remove(req: AuthRequest, res: Response) {
     const ok = await svc.deleteContact(req.tenantId!, req.params.id, resolveEffectiveScope(req, 'contacts'));
     if (!ok) return void sendError(res, 'Contact not found', 404);
     sendSuccess(res, null, 'Contact deleted');
-  } catch { sendError(res, 'Failed to delete contact', 500); }
+  } catch (err: any) {
+    const status = err.statusCode ?? (err.message?.includes('Cannot delete') ? 409 : 500);
+    sendError(res, err.message ?? 'Failed to delete contact', status);
+  }
 }
 
 export async function stats(req: AuthRequest, res: Response) {

@@ -40,26 +40,27 @@ export interface ImportSummary {
   rejected:   RejectedRow[];
 }
 
-function normalizeEmail(email?: string): string {
-  return (email ?? '').trim().toLowerCase();
+function normalizeEmail(email?: unknown): string {
+  return (email != null ? String(email) : '').trim().toLowerCase();
 }
 
-function emailDomainOf(email?: string): string | null {
+function emailDomainOf(email?: unknown): string | null {
   const e = normalizeEmail(email);
   const at = e.indexOf('@');
   return at > 0 ? e.slice(at + 1) : null;
 }
 
-function normalizePhone(phone?: string): string {
-  return (phone ?? '').replace(/\D/g, '');
+// LR-C4-IMP-003: Safely handle numeric phone from CSV/XLSX imports (e.g. 9876543210 as number)
+function normalizePhone(phone?: unknown): string {
+  return (phone != null ? String(phone) : '').replace(/\D/g, '');
 }
 
 /** Mandatory-field validation — a name, contact method, and valid expectedRevenue. */
 function validateRow(row: ImportRow): string[] {
   const errors: string[] = [];
   if (!row.firstName || !String(row.firstName).trim()) errors.push('firstName is required');
-  const email = normalizeEmail(row.email as string | undefined);
-  const phone = normalizePhone(row.phone as string | undefined);
+  const email = normalizeEmail(row.email);
+  const phone = normalizePhone(row.phone || row.mobile);
   if (!email && !phone) errors.push('either email or phone is required');
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push('email is not a valid format');
 
@@ -69,7 +70,7 @@ function validateRow(row: ImportRow): string[] {
     if (isNaN(rev)) {
       errors.push('Expected Revenue must be a number');
     } else if (rev < 0) {
-      errors.push('Expected Revenue must be 0 or more');
+      errors.push('Expected Revenue must be ≥ 0');
     } else if (rev > 1_000_000_000_000) {
       errors.push('Expected Revenue cannot exceed 1,000,000,000,000');
     }
@@ -82,18 +83,18 @@ function toLeadPayload(tenantId: string, row: ImportRow, batchId: string, create
   return {
     tenantId,
     firstName:  String(row.firstName ?? '').trim(),
-    lastName:   row.lastName ? String(row.lastName).trim() : undefined,
-    email:      row.email ? String(row.email).trim() : undefined,
-    phone:      row.phone ? String(row.phone).trim() : undefined,
-    mobile:     row.mobile ? String(row.mobile).trim() : undefined,
-    company:    row.company ? String(row.company).trim() : undefined,
-    designation: row.designation ? String(row.designation).trim() : undefined,
-    source:     row.source || 'csv',
-    status:     row.status || undefined,
-    city:       row.city ? String(row.city).trim() : undefined,
-    state:      row.state ? String(row.state).trim() : undefined,
-    country:    row.country ? String(row.country).trim() : undefined,
-    leadOwner:  row.leadOwner ? String(row.leadOwner).trim() : undefined,
+    lastName:   row.lastName != null && String(row.lastName).trim() ? String(row.lastName).trim() : undefined,
+    email:      row.email != null && String(row.email).trim() ? String(row.email).trim() : undefined,
+    phone:      row.phone != null && String(row.phone).trim() ? String(row.phone).trim() : undefined,
+    mobile:     row.mobile != null && String(row.mobile).trim() ? String(row.mobile).trim() : undefined,
+    company:    row.company != null && String(row.company).trim() ? String(row.company).trim() : undefined,
+    designation: row.designation != null && String(row.designation).trim() ? String(row.designation).trim() : undefined,
+    source:     (row.source != null ? String(row.source).trim() : '') || 'csv',
+    status:     row.status != null && String(row.status).trim() ? String(row.status).trim() : undefined,
+    city:       row.city != null && String(row.city).trim() ? String(row.city).trim() : undefined,
+    state:      row.state != null && String(row.state).trim() ? String(row.state).trim() : undefined,
+    country:    row.country != null && String(row.country).trim() ? String(row.country).trim() : undefined,
+    leadOwner:  row.leadOwner != null && String(row.leadOwner).trim() ? String(row.leadOwner).trim() : undefined,
     expectedRevenue: row.expectedRevenue !== undefined && row.expectedRevenue !== '' && !isNaN(Number(row.expectedRevenue)) ? Number(row.expectedRevenue) : undefined,
     tags:       row.tags ? String(row.tags).split(';').map((t) => t.trim()).filter(Boolean) : [],
     importBatchId: batchId,
@@ -114,24 +115,33 @@ export async function importLeadsCsv(tenantId: string, rows: ImportRow[], create
     const row = rows[i];
     const errors = validateRow(row);
     if (errors.length) {
-      summary.rejected.push({ row: i + 1, errors, data: row });
+      summary.rejected.push({ row: i + 2, errors, data: row });
       continue;
     }
 
-    // Exact email or phone duplicate check
-    const duplicate = await findDuplicateContact(Lead, tenantId, {
-      email: row.email as string | undefined,
-      phone: row.phone as string | undefined,
-      mobile: row.mobile as string | undefined,
-    });
+    try {
+      // Exact email or phone duplicate check
+      const duplicate = await findDuplicateContact(Lead, tenantId, {
+        email: row.email != null ? String(row.email) : undefined,
+        phone: row.phone != null ? String(row.phone) : undefined,
+        mobile: row.mobile != null ? String(row.mobile) : undefined,
+      });
 
-    if (duplicate) {
-      summary.duplicates++;
-      continue;
+      if (duplicate) {
+        summary.duplicates++;
+        continue;
+      }
+
+      await createLead(toLeadPayload(tenantId, row, batchId, createdBy));
+      summary.created++;
+    } catch (rowErr: any) {
+      // LR-C4-IMP-003: Per-row error capture prevents 500 crash half-way after partial commit
+      summary.rejected.push({
+        row: i + 2,
+        errors: [rowErr?.message || 'Failed to import row'],
+        data: row,
+      });
     }
-
-    await createLead(toLeadPayload(tenantId, row, batchId, createdBy));
-    summary.created++;
   }
 
   return summary;

@@ -7,6 +7,8 @@ import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { sendWhatsAppNow } from '../messages/whatsapp.service';
 import { previewAudience, createRecipientsForCampaign, dispatchCampaignTick, renderVariablesForCustomer } from './campaign-dispatch.service';
+import { Tenant } from '../tenants/tenant.model';
+import { config } from '../../config';
 
 export class CampaignActionError extends Error {
   status: number;
@@ -50,20 +52,30 @@ export async function activateCampaign(tenantId: string, id: string): Promise<IC
     throw new CampaignActionError('No recipients match this campaign\'s audience', 400);
   }
 
-  await createRecipientsForCampaign(tenantId, campaign);
+  const recipientCount = await createRecipientsForCampaign(tenantId, campaign);
 
   const startAt = campaign.schedule?.startAt;
   const sendNow = !startAt || new Date(startAt).getTime() <= Date.now();
 
   campaign.status = sendNow ? 'running' : 'scheduled';
   campaign.activatedAt = new Date();
+  campaign.stats.total = recipientCount;
   await campaign.save();
 
   if (sendNow) {
-    // Fire-and-forget — covers "Send Now" immediately, with zero BullMQ
-    // dependency. The restart/safety-net cron (campaign-scheduler.service.ts)
-    // guarantees forward progress regardless of whether this completes.
-    void dispatchCampaignTick(String(campaign._id)).catch(() => {});
+    // Fire-and-forget — covers "Send Now" immediately and drives all batches
+    // to completion with zero BullMQ dependency. The restart/safety-net cron
+    // (campaign-scheduler.service.ts) guarantees forward progress regardless.
+    void (async () => {
+      try {
+        let result = await dispatchCampaignTick(String(campaign._id));
+        while (!result.done && result.processed > 0) {
+          result = await dispatchCampaignTick(String(campaign._id));
+        }
+      } catch {
+        // logging handled in dispatchCampaignTick
+      }
+    })();
   }
 
   return campaign;
@@ -89,7 +101,16 @@ export async function resumeCampaign(tenantId: string, id: string): Promise<ICam
   campaign.status = sendNow ? 'running' : 'scheduled';
   await campaign.save();
   if (sendNow) {
-    void dispatchCampaignTick(String(campaign._id)).catch(() => {});
+    void (async () => {
+      try {
+        let result = await dispatchCampaignTick(String(campaign._id));
+        while (!result.done && result.processed > 0) {
+          result = await dispatchCampaignTick(String(campaign._id));
+        }
+      } catch {
+        // logging handled in dispatchCampaignTick
+      }
+    })();
   }
   return campaign;
 }
@@ -133,17 +154,44 @@ export async function testSendCampaign(tenantId: string, id: string, to: string)
   const template = await getTemplateById(tenantId, String(campaign.templateId));
   if (!template) throw new CampaignActionError('Selected template could not be found', 400);
 
-  const sampleCustomer = await Customer.findOne({ tenantId }).lean();
-  const variables = sampleCustomer
-    ? renderVariablesForCustomer(sampleCustomer as any)
-    : { name: 'Test Recipient', firstName: 'Test', lastName: 'Recipient', email: to, phone: to, company: '' };
+  const tenant = await Tenant.findById(tenantId).select('name branding settings').lean();
+  const normalizedTo = to.toLowerCase().trim();
+  const matchedCustomer = await Customer.findOne({ tenantId, email: normalizedTo }).lean();
+
+  let recipientName = 'Test Recipient';
+  if (matchedCustomer?.name) {
+    recipientName = matchedCustomer.name;
+  } else if (normalizedTo.includes('@')) {
+    const localPart = normalizedTo.split('@')[0].replace(/[._-]/g, ' ').trim();
+    if (localPart.length > 1) {
+      recipientName = localPart.replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+  }
+
+  const customerData = matchedCustomer || {
+    name: recipientName,
+    email: to,
+    phone: '+91 98765 43210',
+    company: '',
+  };
+
+  const variables = renderVariablesForCustomer(customerData as any, tenant);
   const body = renderTemplate(template.body, variables);
 
   let messageId: string | null = null;
   if (campaign.channel === 'email') {
     const subject = renderTemplate(template.subject || '', variables);
+    const senderName = tenant?.branding?.companyName || tenant?.name || config.brevo.senderName;
+    const replyTo = tenant?.branding?.contactEmail || undefined;
     try {
-      messageId = await sendEmailNow({ to, subject, htmlContent: body });
+      messageId = await sendEmailNow({
+        to,
+        toName: recipientName,
+        senderName,
+        replyTo,
+        subject,
+        htmlContent: body,
+      });
     } catch {
       messageId = null;
     }

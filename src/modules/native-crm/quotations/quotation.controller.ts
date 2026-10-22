@@ -96,7 +96,15 @@ export async function remove(req: AuthRequest, res: Response) {
     runAutomationsOnDelete(req.tenantId!, 'quotation', item as any).catch(() => {});
     logAuditEvent('quotation.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'Quotation', targetId: req.params.id, detail: { before: { status: (item as any).status, amount: (item as any).servicesAmountWithTax } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'Quotation',
+        targetId: (item as any).quotationId ?? req.params.id,
+        detail: {
+          quotationId: (item as any).quotationId,
+          before: { status: (item as any).status, amount: (item as any).servicesAmountWithTax },
+        },
+      },
     );
     sendSuccess(res, null, 'Deleted successfully');
   } catch (err: any) {

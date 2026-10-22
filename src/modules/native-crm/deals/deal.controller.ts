@@ -74,7 +74,16 @@ export async function remove(req: AuthRequest, res: Response) {
     runAutomationsOnDelete(req.tenantId!, 'deal', record).catch(() => {});
     logAuditEvent('deal.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'Deal', targetId: req.params.id, detail: { before: { title: (record as any).title, stage: (record as any).stage, amount: (record as any).amount } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'Deal',
+        targetId: (record as any).dealId ?? req.params.id,
+        detail: {
+          dealId: (record as any).dealId,
+          title: (record as any).title,
+          before: { title: (record as any).title, stage: (record as any).stage, amount: (record as any).amount },
+        },
+      },
     );
     sendSuccess(res, null, 'Deal deleted');
   } catch { sendError(res, 'Failed to delete deal', 500); }
@@ -87,10 +96,10 @@ export async function stats(req: AuthRequest, res: Response) {
 
 export async function updateStage(req: AuthRequest, res: Response) {
   try {
-    const { stage } = req.body;
+    const { stage, updatedAt, __v, version } = req.body;
     if (!stage) return void sendError(res, 'stage is required', 400);
     const prev = await svc.getDealById(req.tenantId!, req.params.id, resolveEffectiveScope(req, 'deals'));
-    const record = await svc.updateDeal(req.tenantId!, req.params.id, { stage }, resolveEffectiveScope(req, 'deals'));
+    const record = await svc.updateDeal(req.tenantId!, req.params.id, { stage, updatedAt, __v, version } as any, resolveEffectiveScope(req, 'deals'));
     if (!record) return void sendError(res, 'Deal not found', 404);
     logTimeline(req.tenantId!, 'deal', String((record as any)._id), 'stage_changed', `Stage changed to ${stage}`, req.user?.userId,
       { previousStage: (prev as any)?.stage, newStage: stage }).catch(() => {});
@@ -100,5 +109,11 @@ export async function updateStage(req: AuthRequest, res: Response) {
     }
     runAutomations(req.tenantId!, 'deal', record as any, stage).catch(() => {});
     sendSuccess(res, record, 'Stage updated');
-  } catch (err: any) { sendError(res, err.message ?? 'Failed to update stage', 400); }
+  } catch (err: any) {
+    if (err?.name === 'VersionError') {
+      sendError(res, 'This deal was changed by someone else — please reload and try again.', 409);
+      return;
+    }
+    sendError(res, err.message ?? 'Failed to update stage', 400);
+  }
 }

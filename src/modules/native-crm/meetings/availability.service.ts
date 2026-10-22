@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { Meeting } from './meeting.model';
 import { Tenant } from '../../tenants/tenant.model';
 import { NativeStaff } from '../staffs/staff.model';
+import { zonedTimeToUtc } from '../shared/timezone';
 
 export interface AvailableSlot {
   startIso: string;
@@ -10,26 +11,6 @@ export interface AvailableSlot {
 }
 
 const WEEKDAY_MAP: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-
-/** Wall-clock offset (minutes) of `timeZone` at `date` — the standard,
- * dependency-free trick for IANA-timezone math in Node: format the same
- * instant once as UTC and once in the target zone, the wall-clock difference
- * IS the offset (correctly reflecting DST at that specific date). Good
- * enough for a business-hours booking feature; not meant for anything
- * needing sub-minute precision across a DST transition instant itself. */
-function tzOffsetMinutes(date: Date, timeZone: string): number {
-  const utc = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
-  const tz = new Date(date.toLocaleString('en-US', { timeZone }));
-  return (tz.getTime() - utc.getTime()) / 60000;
-}
-
-/** Builds the correct UTC Date for a given wall-clock date/time as observed
- * in `timeZone` (e.g. "9:00 AM on 2026-08-03 in Asia/Kolkata"). */
-function zonedTimeToUtc(year: number, month0: number, day: number, hour: number, minute: number, timeZone: string): Date {
-  const naiveUtc = new Date(Date.UTC(year, month0, day, hour, minute));
-  const offset = tzOffsetMinutes(naiveUtc, timeZone);
-  return new Date(naiveUtc.getTime() - offset * 60000);
-}
 
 function localDateParts(date: Date, timeZone: string): { year: number; month0: number; day: number; weekday: number; hour: number } {
   const fmt = new Intl.DateTimeFormat('en-US', {

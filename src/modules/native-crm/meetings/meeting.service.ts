@@ -35,6 +35,7 @@ export async function listMeetings(tenantId: string, opts: ListOptions = {}, sco
 }
 
 export async function getMeetingById(tenantId: string, id: string, scope?: DataScope) {
+  if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
@@ -73,6 +74,7 @@ export async function updateMeeting(
   scope?: DataScope,
   performedBy?: string,
 ) {
+  if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
@@ -144,6 +146,7 @@ export async function updateMeeting(
 }
 
 export async function deleteMeeting(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
+  if (!mongoose.isValidObjectId(id)) return false;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');

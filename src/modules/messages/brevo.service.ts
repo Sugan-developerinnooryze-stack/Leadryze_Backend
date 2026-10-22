@@ -21,6 +21,8 @@ export interface EmailAttachment {
 export interface EmailOptions {
   to: string;
   toName?: string;
+  senderName?: string;
+  senderEmail?: string;
   cc?: string[];
   bcc?: string[];
   replyTo?: string;
@@ -37,23 +39,25 @@ export async function sendEmailNow(opts: EmailOptions): Promise<string | null> {
   }
 
   try {
+    const senderName = opts.senderName || config.brevo.senderName;
+    const senderEmail = opts.senderEmail || config.brevo.senderEmail;
     const response = await axios.post(
       `${BREVO_API}/smtp/email`,
       {
-        sender: { name: config.brevo.senderName, email: config.brevo.senderEmail },
+        sender: { name: senderName, email: senderEmail },
         to: [{ email: opts.to, name: opts.toName || opts.to }],
         subject: opts.subject,
         htmlContent: opts.htmlContent,
         ...(opts.textContent ? { textContent: opts.textContent } : {}),
         ...(opts.cc?.length ? { cc: opts.cc.map((email) => ({ email })) } : {}),
         ...(opts.bcc?.length ? { bcc: opts.bcc.map((email) => ({ email })) } : {}),
-        ...(opts.replyTo ? { replyTo: { email: opts.replyTo } } : {}),
+        ...(opts.replyTo ? { replyTo: { email: opts.replyTo, name: senderName } } : {}),
         ...(opts.attachment?.length ? { attachment: opts.attachment } : {}),
       },
       { headers: headers(), timeout: 15000 }
     );
     const messageId: string = response.data?.messageId || '';
-    logger.info('Email sent via Brevo', { to: opts.to, subject: opts.subject, messageId });
+    logger.info('Email sent via Brevo', { to: opts.to, subject: opts.subject, messageId, senderName });
     void trackServiceUsage('brevo', true);
     return messageId;
   } catch (err) {

@@ -36,7 +36,10 @@ export async function listCustomers(tenantId: string, opts: CustomerListOptions,
 
 export async function getCustomerById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { customerId: id }] }
+    : { customerId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   return NativeCustomer.findOne(filter);
 }
@@ -51,7 +54,10 @@ export async function createCustomer(data: any) {
 
 export async function updateCustomer(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { customerId: id }] }
+    : { customerId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   const updated = await NativeCustomer.findOneAndUpdate(
     filter,
@@ -64,7 +70,10 @@ export async function updateCustomer(id: string, tenantId: string, data: any, sc
 
 export async function deleteCustomer(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { customerId: id }] }
+    : { customerId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
   const existing = await NativeCustomer.findOne(filter).select('customerId').lean();
   if (!existing) return null;

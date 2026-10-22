@@ -22,7 +22,7 @@ import { isWhatsAppConfigured } from '../messages/whatsapp.service';
 import { ChatSession } from '../bot/chat-session.model';
 import { attachAiActionTrace } from '../bot/chat-trace.util';
 import { sendCreated } from '../../utils/response';
-import { provisionTenant, getEffectiveFeatureFlags, forceAddUserSeat, updateTenantAiLimits, getAiUsage, getOrInitCreditsResetDate } from '../tenants/tenant.service';
+import { provisionTenant, getEffectiveFeatureFlags, forceAddUserSeat, updateTenantAiLimits, getAiUsage, getOrInitCreditsResetDate, releaseUserSeat } from '../tenants/tenant.service';
 import { getPlatformDefaults, setPlatformDefaults, getAiPlanDefaults, setAiPlanDefaults, getPlanLimits, DEFAULT_AI_PLAN_DEFAULTS } from './platform-defaults.model';
 import { generatePassword } from '../native-crm/shared/app-credentials.service';
 import { logger } from '../../utils/logger';
@@ -299,7 +299,19 @@ router.post('/users', async (req: AuthRequest, res, next) => {
 
     logAuditEvent('user.created_by_admin',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      { tenantId, target: 'User', targetId: user._id.toString(), detail: { tenantName: tenant.name, userEmail: normalizedEmail, role, emailSent } },
+      {
+        tenantId,
+        target: 'User',
+        targetId: user.loginId ?? user._id.toString(),
+        detail: {
+          tenantName: tenant.name,
+          userEmail: normalizedEmail,
+          name: `${firstName.trim()} ${lastName.trim()}`,
+          loginId: user.loginId ?? tenant.clientId,
+          role,
+          emailSent,
+        },
+      },
     );
 
     const userObj = user.toObject() as unknown as Record<string, unknown>;
@@ -318,13 +330,70 @@ router.post('/users/:id/verify-email', async (req: AuthRequest, res, next) => {
       req.params.id,
       { $set: { emailVerified: true }, $unset: { emailVerificationToken: 1, emailVerificationExpiry: 1 } },
       { new: true }
-    ).select('email firstName lastName emailVerified');
+    ).select('email firstName lastName emailVerified loginId tenantId');
     if (!user) { sendError(res, 'User not found', 404); return; }
     logAuditEvent('user.email_verified_forced',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      { target: 'User', targetId: req.params.id, detail: { userEmail: user.email } },
+      {
+        tenantId: user.tenantId?.toString(),
+        target: 'User',
+        targetId: user.loginId ?? req.params.id,
+        detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, loginId: user.loginId },
+      },
     );
     sendSuccess(res, { emailVerified: true, email: user.email }, 'Email verified');
+  } catch (err) { next(err); }
+});
+
+// DELETE /admin/users/:id — Super Admin deactivates/removes any user
+router.delete('/users/:id', async (req: AuthRequest, res, next) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) { sendError(res, 'User not found', 404); return; }
+    if (user.role === 'SUPER_ADMIN') {
+      sendError(res, 'Cannot deactivate a Super Admin user', 400); return;
+    }
+
+    const wasActive = user.isActive;
+    user.isActive = false;
+    user.set('refreshToken', undefined);
+    await user.save();
+    if (wasActive && user.tenantId) {
+      await releaseUserSeat(user.tenantId.toString());
+    }
+
+    const userTenant = user.tenantId ? await Tenant.findById(user.tenantId).select('name').lean() : null;
+
+    logAuditEvent('user.deactivated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      {
+        tenantId: user.tenantId?.toString(),
+        target: 'User',
+        targetId: user.loginId ?? user._id.toString(),
+        detail: {
+          userEmail: user.email,
+          name: `${user.firstName} ${user.lastName}`,
+          role: user.role,
+          tenantName: userTenant?.name,
+        },
+      },
+    );
+    logAuditEvent('user.removed',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
+      {
+        tenantId: user.tenantId?.toString(),
+        target: 'User',
+        targetId: user.loginId ?? user._id.toString(),
+        detail: {
+          userEmail: user.email,
+          name: `${user.firstName} ${user.lastName}`,
+          role: user.role,
+          tenantName: userTenant?.name,
+        },
+      },
+    );
+
+    sendSuccess(res, null, 'User deactivated successfully');
   } catch (err) { next(err); }
 });
 
@@ -394,9 +463,21 @@ router.post('/users/:id/reset-password', async (req: AuthRequest, res, next) => 
       }
     }
 
+    const userTenant = user.tenantId ? await Tenant.findById(user.tenantId).select('name').lean() : null;
     logAuditEvent('user.password_reset_by_admin',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      { target: 'User', targetId: req.params.id, detail: { userEmail: user.email, ...(sendEmail ? { emailSent } : {}) } },
+      {
+        tenantId: user.tenantId?.toString(),
+        target: 'User',
+        targetId: user.loginId ?? req.params.id,
+        detail: {
+          userEmail: user.email,
+          name: `${user.firstName} ${user.lastName}`,
+          loginId: user.loginId,
+          tenantName: userTenant?.name,
+          ...(sendEmail ? { emailSent } : {}),
+        },
+      },
     );
     sendSuccess(res, sendEmail ? { password, emailSent, loginId: user.loginId } : null, 'Password reset successfully');
   } catch (err) { next(err); }
@@ -1030,7 +1111,19 @@ router.get('/security-events', async (req: AuthRequest, res, next) => {
       SecurityEvent.find(filter).sort({ timestamp: -1 }).skip(offset).limit(limit).lean(),
       SecurityEvent.countDocuments(filter),
     ]);
-    sendSuccess(res, { events, total, limit, offset }, 'Security events fetched');
+
+    const tenantIds = [...new Set(events.map((e: any) => e.tenantId).filter(Boolean))] as string[];
+    const validTenantObjectIds = tenantIds.filter((id) => mongoose.isValidObjectId(id));
+    const tenants = validTenantObjectIds.length
+      ? await Tenant.find({ _id: { $in: validTenantObjectIds } }).select('_id name').lean()
+      : [];
+    const tenantMap = new Map<string, string>(tenants.map((t: any) => [t._id.toString(), t.name]));
+    const enrichedEvents = events.map((ev: any) => ({
+      ...ev,
+      tenantName: ev.tenantId ? tenantMap.get(ev.tenantId) : undefined,
+    }));
+
+    sendSuccess(res, { events: enrichedEvents, total, limit, offset }, 'Security events fetched');
   } catch (err) { next(err); }
 });
 
@@ -1260,7 +1353,25 @@ router.get('/audit-logs', async (req: AuthRequest, res, next) => {
       AuditLog.countDocuments(filter),
     ]);
 
-    sendSuccess(res, { logs, total, limit, offset }, 'Audit logs fetched');
+    const tenantIds = [...new Set(logs.map((l: any) => l.tenantId).filter(Boolean))] as string[];
+    const validTenantObjectIds = tenantIds.filter((id) => mongoose.isValidObjectId(id));
+    const tenants = validTenantObjectIds.length
+      ? await Tenant.find({ _id: { $in: validTenantObjectIds } }).select('_id name clientId').lean()
+      : [];
+    const tenantMap = new Map<string, { name: string; clientId?: string }>(
+      tenants.map((t: any) => [t._id.toString(), { name: t.name, clientId: t.clientId }]),
+    );
+
+    const enrichedLogs = logs.map((log: any) => {
+      const tenantInfo = log.tenantId ? tenantMap.get(log.tenantId) : undefined;
+      const tenantName = tenantInfo?.name ?? (log.detail?.tenantName as string) ?? (log.tenantId ? undefined : 'Platform');
+      return {
+        ...log,
+        tenantName,
+      };
+    });
+
+    sendSuccess(res, { logs: enrichedLogs, total, limit, offset }, 'Audit logs fetched');
   } catch (err) { next(err); }
 });
 

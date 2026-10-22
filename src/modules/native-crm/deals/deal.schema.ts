@@ -8,7 +8,7 @@ export const dealSchema = new Schema(
     clientId:    { type: String, index: true },
     title:       { type: String, required: true, trim: true },
     amount:      { type: Number },
-    currency:    { type: String, default: 'USD' },
+    currency:    { type: String },
     // Stage validity is enforced at the service layer against the tenant's
     // own configured pipeline (native-crm/pipeline-config), not a fixed
     // schema enum, so each tenant can have their own stage list.
@@ -38,8 +38,30 @@ export const dealSchema = new Schema(
 );
 
 dealSchema.pre('save', async function (next) {
-  if (!this.isNew || this.clientId) return next();
-  this.clientId = await resolveClientPrefix(this.tenantId as mongoose.Types.ObjectId);
+  if (this.isNew && !this.clientId) {
+    this.clientId = await resolveClientPrefix(this.tenantId as mongoose.Types.ObjectId);
+  }
+  // LR-C4-DEAL-001: Resolve default currency from tenant FSSettings instead of hardcoding USD
+  if (!this.currency && this.tenantId) {
+    try {
+      const fs = await mongoose.model('FSSettings').findOne({
+        tenantId: this.tenantId,
+        branchId: this.branchId || null,
+      }).select('currency').lean() as { currency?: string } | null;
+
+      if (fs?.currency) {
+        this.currency = fs.currency;
+      } else {
+        const orgFs = await mongoose.model('FSSettings').findOne({
+          tenantId: this.tenantId,
+          branchId: null,
+        }).select('currency').lean() as { currency?: string } | null;
+        this.currency = orgFs?.currency || 'INR';
+      }
+    } catch {
+      this.currency = 'INR';
+    }
+  }
   next();
 });
 

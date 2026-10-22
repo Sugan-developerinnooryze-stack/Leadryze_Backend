@@ -8,6 +8,7 @@ export const meetingSchema = new Schema(
     title:         { type: String, required: true, trim: true },
     startDate:     { type: Date },
     endDate:       { type: Date },
+    timezone:      { type: String, trim: true },
     location:      { type: String, trim: true },
     attendees:     [{ type: String }],
     meetingStatus: { type: String, enum: ['scheduled', 'completed', 'cancelled'], default: 'scheduled' },

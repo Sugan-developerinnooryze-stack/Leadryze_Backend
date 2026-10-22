@@ -3,14 +3,16 @@
  * of duplicating the math per module. Server-local time, not per-tenant
  * timezone-aware — an accepted simplification for now, not an oversight. */
 
-export type DateRangeKey = 'today' | 'week' | 'month' | '3months' | '6months' | '1year' | 'custom';
+import { zonedTimeToUtc, todayInTimezone } from './timezone';
+
+export type DateRangeKey = 'today' | 'week' | 'month' | 'this_month' | '3months' | '6months' | '1year' | 'custom';
 
 export interface ResolvedDateRange {
   start: Date;
   end: Date;
 }
 
-const RANGE_KEYS: readonly string[] = ['today', 'week', 'month', '3months', '6months', '1year', 'custom'];
+const RANGE_KEYS: readonly string[] = ['today', 'week', 'month', 'this_month', '3months', '6months', '1year', 'custom'];
 const ROLLING_MONTHS: Record<string, number> = { '3months': 3, '6months': 6, '1year': 12 };
 
 /** Undefined/unrecognized input returns null, meaning "apply no date
@@ -43,7 +45,7 @@ export function resolveDateRange(range?: string, customFrom?: string, customTo?:
     return { start, end };
   }
 
-  if (range === 'month') {
+  if (range === 'month' || range === 'this_month') {
     const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
     return { start, end };
   }
@@ -107,6 +109,27 @@ export function resolvePriorDateRange(range?: string, customFrom?: string, custo
   const priorStart = new Date(current.start.getFullYear(), current.start.getMonth() - n, current.start.getDate(), 0, 0, 0, 0);
   const priorEnd = new Date(current.start.getTime() - 1);
   return { start: priorStart, end: priorEnd };
+}
+
+/** Tenant-timezone-aware counterpart to resolveDateRange('today', ...)
+ * above — deliberately NOT a modification of resolveDateRange itself,
+ * which stays exactly as-is (server-local) for its many existing callers.
+ * Only 'today' is timezone-sensitive enough to matter for the use case
+ * this was built for (the CRM assistant's "what's happening today?"
+ * agenda, Increment 3b) — a record due at 11:30pm in a tenant's own
+ * timezone must land on today, not get pushed to tomorrow by comparing
+ * against the SERVER's midnight instead. Reuses the exact same, already-
+ * proven zonedTimeToUtc wall-clock math availability.service.ts's real
+ * booking feature already depends on — not a second, divergent
+ * implementation. */
+export function resolveDateRangeForTenant(timeZone: string): ResolvedDateRange {
+  const { year, month0, day } = todayInTimezone(timeZone);
+  const start = zonedTimeToUtc(year, month0, day, 0, 0, timeZone);
+  // 23:59:59.999 local, built the same way (minute-precision zonedTimeToUtc
+  // plus the remaining 59.999s added afterward) rather than inventing a
+  // separate end-of-day helper.
+  const end = new Date(zonedTimeToUtc(year, month0, day, 23, 59, timeZone).getTime() + 59_999);
+  return { start, end };
 }
 
 /** Applies a resolved range to a Mongo filter object in place — a no-op

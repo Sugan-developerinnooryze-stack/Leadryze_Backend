@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
-import { CustomModuleDef, CustomRecord, ICustomModuleDef, ICustomRecord } from './custom-module.model';
+import { CustomModuleDef, CustomRecord, ICustomModuleDef, ICustomRecord, ICustomModuleField } from './custom-module.model';
+import { assertValidModuleDefinition, assertValidModuleFields } from './custom-module-definition.validator';
 import { isValidStageKey } from '../native-crm/pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../native-crm/automation-rules/automation-rule.service';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../native-crm/shared/search-index';
@@ -278,6 +279,14 @@ export async function createCustomModule(tenantId: string, dto: Partial<ICustomM
     slug = `${base}-${attempt}`;
   }
 
+  // Validated against the SAME slug the module is actually about to get —
+  // the uniqueness loop above only ever checks collisions against this
+  // tenant's own other custom modules (never native module names), and
+  // neither it nor anything else previously validated the field list
+  // itself (duplicate keys, bad relationship targets, etc).
+  const existingSlugs = (await CustomModuleDef.find({ tenantId }).select('slug').lean()).map((m: any) => m.slug);
+  assertValidModuleDefinition(dto, slug, existingSlugs);
+
   const lastMod = await CustomModuleDef.findOne({ tenantId }).sort({ menuOrder: -1 }).lean();
   const menuOrder = ((lastMod as any)?.menuOrder ?? 0) + 1;
 
@@ -302,11 +311,92 @@ export async function updateCustomModule(
   dto: Partial<ICustomModuleDef>,
 ): Promise<any | null> {
   const { slug: _slug, tenantId: _tid, ...safe } = dto as any;
+
+  // Only validate the fields actually being set. A rename-only update
+  // (`{name: 'New Name'}`, no `fields` key) must not be rejected just
+  // because it doesn't happen to touch the field list — same "don't
+  // validate against an absent partial payload" care already applied to
+  // Custom Module RECORD updates earlier this session.
+  if (safe.fields) {
+    const mod: any = await CustomModuleDef.findOne({ tenantId, _id: id }).select('slug').lean();
+    if (mod) {
+      const existingSlugs = (await CustomModuleDef.find({ tenantId, _id: { $ne: id } }).select('slug').lean()).map((m: any) => m.slug);
+      assertValidModuleFields(safe.fields, existingSlugs, mod.slug);
+    }
+  }
+
   return CustomModuleDef.findOneAndUpdate(
     { tenantId, _id: id },
     { $set: safe },
     { new: true, runValidators: true },
   ).lean();
+}
+
+/** Adds or edits ONE field on an already-existing Custom Module — the
+ * server-side merge step `updateCustomModule` deliberately doesn't do itself
+ * (its own doc comment: "callers are responsible for merging onto the
+ * module's existing fields first"). Fetches the module fresh, builds the
+ * complete resulting fields array (append for create, in-place replace for
+ * update), then delegates entirely to the already-proven updateCustomModule
+ * — which itself re-runs assertValidModuleFields on the merged array — so no
+ * validation logic is duplicated here, only the merge.
+ *
+ * Stale-schema guard: `updateCustomModule` has no optimistic-concurrency
+ * check of its own (confirmed by reading it — a plain findOneAndUpdate).
+ * `expectedUpdatedAt`, when supplied, is the module's real `updatedAt` at
+ * the moment a chat proposal was shown to the staff member; a mismatch here
+ * means someone else (the Custom Module Builder UI, another chat session)
+ * changed the module in between, so this throws a 409 rather than silently
+ * overwriting a concurrent edit — same statusCode-on-the-error convention
+ * internal.routes.ts already uses for Company's VersionError. */
+export async function addOrUpdateCustomModuleField(
+  tenantId: string,
+  moduleId: string,
+  dto: {
+    operation: 'create' | 'update';
+    fieldKey: string;
+    field: Partial<ICustomModuleField>;
+    expectedUpdatedAt?: string;
+  },
+): Promise<any> {
+  // .lean() is required here, not optional — a real, confirmed-live bug
+  // without it: a non-lean fetch returns Mongoose subdocuments for
+  // mod.fields, and spreading one of them ({...f} in the update branch
+  // below) does not reliably copy its schema-defined properties the way it
+  // does for a plain object. Caught by live testing (an update's new
+  // label/required silently failed to apply) even though this function's
+  // own mocked Jest coverage passed, because that mock supplied plain
+  // objects — exactly the gap a real Mongoose document closes over.
+  const mod: any = await CustomModuleDef.findOne({ tenantId, _id: moduleId }).lean();
+  if (!mod) {
+    const err: any = new Error('Custom Module not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (dto.expectedUpdatedAt && mod.updatedAt && mod.updatedAt.toISOString() !== dto.expectedUpdatedAt) {
+    const err: any = new Error('This module changed since you looked at it — please ask again for a fresh look.');
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const existingFields: ICustomModuleField[] = mod.fields ?? [];
+  let newFields: ICustomModuleField[];
+
+  if (dto.operation === 'create') {
+    if (existingFields.some((f) => f.key === dto.fieldKey)) {
+      throw new Error(`A field with key "${dto.fieldKey}" already exists on this module`);
+    }
+    newFields = [...existingFields, { ...dto.field, key: dto.fieldKey, order: existingFields.length } as ICustomModuleField];
+  } else {
+    const idx = existingFields.findIndex((f) => f.key === dto.fieldKey);
+    if (idx === -1) {
+      throw new Error(`No field with key "${dto.fieldKey}" exists on this module — check the real field list first`);
+    }
+    newFields = existingFields.map((f, i) => (i === idx ? { ...f, ...dto.field, key: dto.fieldKey } : f));
+  }
+
+  return updateCustomModule(tenantId, moduleId, { fields: newFields });
 }
 
 export async function deleteCustomModule(tenantId: string, id: string): Promise<boolean> {

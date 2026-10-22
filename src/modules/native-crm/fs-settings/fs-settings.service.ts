@@ -27,11 +27,15 @@ export async function upsertSettings(tenantId: string, data: any, branchId?: str
   const tid = new mongoose.Types.ObjectId(tenantId);
   const { tenantId: _t, branchId: _b, ...safeData } = data;
   const filter: any = { tenantId: tid, branchId: branchId ? new mongoose.Types.ObjectId(branchId) : null };
-  return FSSettings.findOneAndUpdate(
+  const res = await FSSettings.findOneAndUpdate(
     filter,
     { $set: safeData },
     { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
   );
+  if (!branchId && safeData.timezone) {
+    await Tenant.findByIdAndUpdate(tid, { $set: { 'settings.timezone': safeData.timezone } });
+  }
+  return res;
 }
 
 /** One entry per active Company (Branch) plus a `branchId: null` entry for

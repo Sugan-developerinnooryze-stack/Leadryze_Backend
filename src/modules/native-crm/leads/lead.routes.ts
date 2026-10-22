@@ -13,7 +13,7 @@ router.get('/',                 requirePermission('native_crm.leads.view'),   ct
 router.get('/stats',            requirePermission('native_crm.leads.view'),   ctrl.stats);
 router.get('/export',           requirePermission('native_crm.leads.export'), ctrl.exportCsv);
 router.post('/import',                    requirePermission('native_crm.leads.create'), importCtrl.importCsv);
-router.get('/import/triage',              requirePermission('native_crm.leads.view'),   importCtrl.listTriage);
+router.get('/import/triage',              requirePermission('native_crm.leads.edit'),   importCtrl.listTriage);
 router.post('/import/triage/:id/resolve', requirePermission('native_crm.leads.edit'),   importCtrl.resolveTriage);
 router.post('/',                requirePermission('native_crm.leads.create'), validate({ body: createLeadSchema }), ctrl.create);
 router.get('/:id',              requirePermission('native_crm.leads.view'),   validate({ params: idParam }),        ctrl.getOne);

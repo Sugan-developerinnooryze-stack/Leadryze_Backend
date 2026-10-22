@@ -8,6 +8,11 @@ export type SlaStatus = 'on_track' | 'warning' | 'breached' | 'no_sla';
 export interface ITicket {
   _id: string;
   tenantId: string;
+  branchId?: string | null;
+  clientId?: string;
+  numId?: number;
+  ticketId?: string;
+  ticketNumber?: string;
   subject: string;
   priority: 'low' | 'medium' | 'high' | 'critical';
   ticketStatus: 'open' | 'in_progress' | 'resolved' | 'closed';

@@ -85,7 +85,9 @@ import { PipelineModule } from '../native-crm/pipeline-config/pipeline-config.mo
 import { CRM_WRITE_MODULE_MAP, permissionKeyFor } from './crm-write.module-map';
 import { countCrmModule, getOverdueCrmModule, getCrmModuleSchema, projectToSchemaFields, applyPIIProtection } from './crm-read.service';
 import { writeNativeCrmLog } from '../../middlewares/native-crm-log.middleware';
-import { listCustomModules, getCustomModuleBySlug, listCustomRecords } from '../custom-modules/custom-module.service';
+import { listCustomModules, getCustomModuleBySlug, listCustomRecords, createCustomModule, addOrUpdateCustomModuleField } from '../custom-modules/custom-module.service';
+import { createCustomField, updateCustomField } from '../native-crm/custom-fields/custom-field.service';
+import { resolveDateRangeForTenant } from '../native-crm/shared/date-range';
 
 const router = Router();
 
@@ -846,7 +848,7 @@ router.get('/crm-schema/:tenantId/:module', async (req: Request, res: Response, 
     if (!CRM_WRITE_MODULE_MAP[module]) { sendError(res, `Module "${module}" is not supported by the CRM assistant`, 400); return; }
     const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
     if (!identity.userId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
-    const result = await getCrmModuleSchema(module, tenantId);
+    const result = await getCrmModuleSchema(module, tenantId, identity.branchId);
     sendSuccess(res, result, 'OK');
   } catch (err) { next(err); }
 });
@@ -1281,6 +1283,302 @@ router.post('/crm-write/:tenantId/:module', async (req: Request, res: Response, 
     }).catch(() => {});
 
     sendSuccess(res, result, `${module} ${operation} succeeded`);
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/crm-custom-module-write/:tenantId
+ * body: { name, singularName?, icon?, color?, fields, internalAuth }
+ *
+ * Creates a new Custom Module DEFINITION — entirely separate from
+ * /crm-write above, which only ever writes RECORDS within an already-
+ * existing module. Same identity-verification/permission-check shape as
+ * every other route in this file: verify identity -> check the real RBAC
+ * permission (custom_modules.definitions.manage — the SAME key the human-
+ * facing POST /api/v1/custom-modules route already requires) -> call the
+ * real, existing createCustomModule() service function, which re-validates
+ * the full definition (name/slug collisions, field list) against the
+ * tenant's CURRENT state at the moment this route runs — not whatever was
+ * true when the chat proposal was first made — via
+ * assertValidModuleDefinition (see custom-module-definition.validator.ts).
+ */
+router.post('/crm-custom-module-write/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    const { name, singularName, icon, color, fields, internalAuth } = req.body as {
+      name?: string; singularName?: string; icon?: string; color?: string;
+      fields?: Record<string, unknown>[]; internalAuth?: string;
+    };
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    if (!name) { sendError(res, 'name is required', 400); return; }
+
+    const identity = verifyInternalIdentity(tenantId, internalAuth);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = 'custom_modules.definitions.manage';
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    let mod: any;
+    try {
+      mod = await createCustomModule(tenantId, { name, singularName, icon, color, fields: fields as any });
+    } catch (defErr) {
+      // assertValidModuleDefinition (re-run fresh, inside createCustomModule
+      // itself) throws a plain Error with a specific, real reason — relay
+      // it as a clean 400, same convention the human-facing route now uses.
+      await writeNativeCrmLog({
+        tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+        action: 'error', module: 'custom-module-definition', resourceId: '',
+        error: (defErr as Error).message, statusCode: 400, url: req.originalUrl,
+      }).catch(() => {});
+      sendError(res, (defErr as Error).message, 400);
+      return;
+    }
+
+    await writeNativeCrmLog({
+      tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+      action: 'create', module: 'custom-module-definition', resourceId: String(mod._id),
+      after: mod, statusCode: 200, url: req.originalUrl,
+    }).catch(() => {});
+
+    sendSuccess(res, mod, 'Custom module created');
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/crm-custom-module-field-write/:tenantId
+ * body: { moduleId, operation: 'create'|'update', fieldKey, label, fieldType, required?, options?, targetModule?, columns?, expectedUpdatedAt?, internalAuth }
+ *
+ * Adds or edits ONE field on an EXISTING Custom Module DEFINITION —
+ * distinct from /crm-custom-module-write above, which only ever CREATES a
+ * brand-new module (no update path for its own field list). Also distinct
+ * from /crm-custom-field-write below, which targets BUILT-IN modules only.
+ * Same identity/permission shape as every route in this file: verify
+ * identity -> custom_modules.definitions.manage (the same key module
+ * creation already requires, rechecked fresh here, not trusted from
+ * propose time) -> addOrUpdateCustomModuleField, which re-fetches the
+ * module fresh, rejects a stale expectedUpdatedAt with 409, and delegates
+ * the real field-list validation to the already-proven
+ * updateCustomModule/assertValidModuleFields — never duplicated here.
+ */
+router.post('/crm-custom-module-field-write/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    const {
+      moduleId, operation, fieldKey, label, fieldType, required, options,
+      targetModule, columns, expectedUpdatedAt, internalAuth,
+    } = req.body as {
+      moduleId?: string; operation?: 'create' | 'update'; fieldKey?: string; label?: string; fieldType?: string;
+      required?: boolean; options?: string[]; targetModule?: string; columns?: Array<Record<string, unknown>>;
+      expectedUpdatedAt?: string; internalAuth?: string;
+    };
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    if (!moduleId || !mongoose.isValidObjectId(moduleId)) { sendError(res, 'Invalid moduleId', 400); return; }
+    if (operation !== 'create' && operation !== 'update') { sendError(res, `Operation "${operation}" is not supported`, 400); return; }
+    if (!fieldKey) { sendError(res, 'fieldKey is required', 400); return; }
+
+    const identity = verifyInternalIdentity(tenantId, internalAuth);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = 'custom_modules.definitions.manage';
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    const field = {
+      label, fieldType,
+      required: !!required,
+      options: options ?? undefined,
+      meta: (targetModule || columns) ? { targetModule: targetModule ?? undefined, columns: columns ?? undefined } : undefined,
+    };
+
+    let mod: any;
+    try {
+      mod = await addOrUpdateCustomModuleField(tenantId, moduleId, { operation, fieldKey, field: field as any, expectedUpdatedAt });
+    } catch (defErr) {
+      // Respects the service-layer error's own statusCode when it carries
+      // one (404 module-not-found, 409 stale-schema) — same convention
+      // internal.routes.ts already uses for Company's VersionError, rather
+      // than flattening every failure to a generic 400.
+      const statusCode = (defErr as any).statusCode ?? 400;
+      await writeNativeCrmLog({
+        tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+        action: 'error', module: 'custom-module-field', resourceId: moduleId,
+        error: (defErr as Error).message, statusCode, url: req.originalUrl,
+      }).catch(() => {});
+      sendError(res, (defErr as Error).message, statusCode);
+      return;
+    }
+
+    await writeNativeCrmLog({
+      tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+      action: 'update', module: 'custom-module-field', resourceId: moduleId,
+      after: mod, changes: { operation, fieldKey }, statusCode: 200, url: req.originalUrl,
+    }).catch(() => {});
+
+    sendSuccess(res, mod, `Field ${operation === 'create' ? 'added' : 'updated'}`);
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/internal/crm-custom-field-write/:tenantId
+ * body: { operation: 'create'|'update', fieldId?, module, fieldKey, label, fieldType, options?, required?, formTemplateId?, internalAuth }
+ *
+ * Creates or updates a Custom FIELD on an EXISTING BUILT-IN module —
+ * entirely separate from /crm-custom-module-write above (a different
+ * system, see custom-field-definition.validator.ts's own doc comment).
+ * Same identity-verification/permission-check shape as every other route
+ * here: verify identity -> check fs.custom_fields.manage (the SAME key the
+ * human-facing POST/PUT /api/v1/native-crm/custom-fields routes already
+ * require) -> call the real createCustomField/updateCustomField service
+ * functions, which re-validate the full definition (module/key collisions,
+ * type-specific checks) against the tenant's CURRENT state at the moment
+ * this route runs, via assertValidCustomFieldDefinition.
+ */
+router.post('/crm-custom-field-write/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    const { operation, fieldId, module, fieldKey, label, fieldType, options, required, formTemplateId, internalAuth } = req.body as {
+      operation?: 'create' | 'update'; fieldId?: string; module?: string; fieldKey?: string; label?: string;
+      fieldType?: string; options?: string[]; required?: boolean; formTemplateId?: string; internalAuth?: string;
+    };
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+    if (operation !== 'create' && operation !== 'update') { sendError(res, `Operation "${operation}" is not supported`, 400); return; }
+    if (operation === 'update' && !fieldId) { sendError(res, 'fieldId is required for update', 400); return; }
+
+    const identity = verifyInternalIdentity(tenantId, internalAuth);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+
+    const permKey = 'fs.custom_fields.manage';
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+    if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) {
+      sendError(res, `Not permitted: ${permKey}`, 403); return;
+    }
+
+    const dto = { module, fieldKey, label, fieldType, options, required: !!required, formTemplateId };
+    let result: any;
+    try {
+      if (operation === 'create') {
+        result = await createCustomField(tenantId, dto, identity.branchId);
+      } else {
+        result = await updateCustomField(fieldId!, tenantId, dto);
+        if (!result) { sendError(res, 'Custom field not found', 404); return; }
+      }
+    } catch (defErr) {
+      // assertValidCustomFieldDefinition (re-run fresh, inside
+      // createCustomField/updateCustomField) throws a plain Error with a
+      // specific, real reason — relay it as a clean 400.
+      await writeNativeCrmLog({
+        tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+        action: 'error', module: 'custom-field-definition', resourceId: fieldId ?? '',
+        error: (defErr as Error).message, statusCode: 400, url: req.originalUrl,
+      }).catch(() => {});
+      sendError(res, (defErr as Error).message, 400);
+      return;
+    }
+
+    await writeNativeCrmLog({
+      tenantId, actorId: identity.userId, actorName: identity.userId, actorRole: identity.role ?? '',
+      action: operation, module: 'custom-field-definition', resourceId: String(result._id),
+      after: result, statusCode: 200, url: req.originalUrl,
+    }).catch(() => {});
+
+    sendSuccess(res, result, `Custom field ${operation === 'create' ? 'created' : 'updated'}`);
+  } catch (err) { next(err); }
+});
+
+/** Modules + their real "due/scheduled" date field for the "today" bucket
+ * of GET /crm-today below — deliberately NOT Contract/Quotation (absent
+ * from CRM_WRITE_MODULE_MAP entirely, a separate, already-made deliberate
+ * decision this session to keep the assistant blind to them — adding them
+ * here would silently re-open that boundary through a side door) and NOT
+ * Task/Call/Meeting (their list() functions only expose a boolean
+ * `upcoming`, not a bounded range, so "due exactly today" isn't
+ * expressible without new filter code — a named, explicit candidate for a
+ * later increment, not bundled in here) and NOT Lead (no date filtering in
+ * listLeads() at all, no natural "due" concept). */
+const CRM_TODAY_MODULES: Array<{ module: string; dateField: string }> = [
+  { module: 'workorder', dateField: 'scheduledDate' },
+  { module: 'invoice', dateField: 'dueDate' },
+];
+/** Overdue bucket — reuses the exact same overdueConfig-driven helper
+ * already built in an earlier increment; Ticket has no natural "due today"
+ * concept the way Work Order/Invoice do, so it's overdue-only here. */
+const CRM_TODAY_OVERDUE_MODULES = ['workorder', 'task', 'ticket'];
+
+/**
+ * GET /api/internal/crm-today/:tenantId?internalAuth=...
+ *
+ * "What's happening today?" aggregator for the CRM assistant — a fixed,
+ * explicitly-disclosed subset of modules (see CRM_TODAY_MODULES/
+ * CRM_TODAY_OVERDUE_MODULES above), each gated by the SAME per-module view
+ * permission every other read route in this file already requires. A
+ * module the caller lacks permission for is silently SKIPPED, never a 403
+ * for the whole request — a staff member missing Invoice-view still gets
+ * their Work Orders. Uses the tenant's own real configured timezone
+ * (resolveDateRangeForTenant, Increment 3a) for "today", not the server's.
+ */
+router.get('/crm-today/:tenantId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = req.params;
+    if (!mongoose.isValidObjectId(tenantId)) { sendError(res, 'Invalid tenantId', 400); return; }
+
+    const identity = verifyInternalIdentity(tenantId, req.query.internalAuth as string | undefined);
+    if (!identity.userId || !identity.roleId) { sendError(res, 'A verified internalAuth identity is required', 401); return; }
+    const isAdmin = identity.role === 'SUPER_ADMIN' || identity.role === 'TENANT_ADMIN';
+
+    const tenant = await Tenant.findById(tenantId).select('settings.timezone').lean();
+    const timezone = tenant?.settings?.timezone || 'UTC';
+    const { start: todayStart, end: todayEnd } = resolveDateRangeForTenant(timezone);
+    const scope = await resolveScopeForIdentity(tenantId, identity);
+
+    const today: Record<string, any[]> = {};
+    for (const { module, dateField } of CRM_TODAY_MODULES) {
+      const permKey = permissionKeyFor(module, 'view');
+      if (!permKey) continue;
+      if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) continue;
+
+      const moduleDef = CRM_WRITE_MODULE_MAP[module];
+      if (!moduleDef) continue;
+      // Fetch a wide, server-local-safe window (resolveDateRange's own
+      // 'custom' path normalizes to SERVER-local midnight/end-of-day,
+      // confirmed by direct read — it is NOT timezone-aware, which is
+      // exactly why Increment 3a exists), then re-filter precisely against
+      // the real tenant-timezone boundary below. This avoids needing any
+      // change to the module's own list() implementation.
+      const wideStart = new Date(todayStart.getTime() - 24 * 3600_000);
+      const wideEnd = new Date(todayEnd.getTime() + 24 * 3600_000);
+      const { items } = await moduleDef.list(
+        tenantId,
+        { range: 'custom', dateField, dateFrom: wideStart.toISOString(), dateTo: wideEnd.toISOString(), limit: 100 } as any,
+        identity.branchId, scope,
+      );
+      today[module] = (items ?? []).filter((item: any) => {
+        const raw = item[dateField];
+        if (!raw) return false;
+        const t = new Date(raw).getTime();
+        return t >= todayStart.getTime() && t <= todayEnd.getTime();
+      });
+    }
+
+    const overdue: Record<string, number> = {};
+    for (const module of CRM_TODAY_OVERDUE_MODULES) {
+      const permKey = permissionKeyFor(module, 'view');
+      if (!permKey) continue;
+      if (!isAdmin && !(await hasPermission(tenantId, identity.roleId, permKey).catch(() => false))) continue;
+      const result = await getOverdueCrmModule(module, tenantId, scope, { branchId: identity.branchId, role: identity.role });
+      if (result) overdue[module] = result.count;
+    }
+
+    sendSuccess(res, {
+      timezone,
+      coverage: { today: CRM_TODAY_MODULES.map((m) => m.module), overdue: CRM_TODAY_OVERDUE_MODULES },
+      today,
+      overdue,
+    });
   } catch (err) { next(err); }
 });
 

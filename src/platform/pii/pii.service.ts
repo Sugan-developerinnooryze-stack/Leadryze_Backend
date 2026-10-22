@@ -74,8 +74,7 @@ export function transformPIIResponse(
   userRole: string,
   piiViewRoles: string[],
 ): any | any[] {
-  const def = PII_FIELDS[module];
-  if (!def) return items;
+  const def = PII_FIELDS[module] ?? { level2: [], level3: [] };
 
   const isAdmin   = ADMIN_ROLES.includes(userRole);
   const canViewL2 = isAdmin || piiViewRoles.includes(userRole);
@@ -110,9 +109,17 @@ export function transformPIIResponse(
       plain[field] = revealOrMask(field, val, isAdmin);
     }
 
+    // Decrypt any residual ciphertext on any property so raw ciphertext is never returned
+    for (const [k, v] of Object.entries(plain)) {
+      if (typeof v === 'string' && isEncrypted(v)) {
+        plain[k] = safeDecrypt(v, k);
+      }
+    }
+
     // Remove internal search fields from API response
     delete plain['phoneSearch'];
     delete plain['emailDomain'];
+    delete plain['emailSearch'];
 
     return plain;
   };
@@ -133,3 +140,56 @@ function safeDecrypt(val: string, field: string): string {
     return val; // return as-is if decryption fails
   }
 }
+
+const SENSITIVE_AUDIT_KEYS = new Set([
+  'password', 'token', 'secret', 'apiKey', 'accessToken', 'refreshToken',
+  'verificationToken', 'resetToken', 'appPasswordHash', 'appPasswordEnc',
+]);
+
+const INTERNAL_SEARCH_KEYS = new Set([
+  'emailSearch', 'phoneSearch', 'emailDomain',
+]);
+
+/**
+ * Strips internal blind-index search hashes, redacts sensitive secrets,
+ * and decrypts any ciphertext stored in audit logs and diffs.
+ */
+export function sanitizeAuditData<T = any>(val: T): T {
+  if (val === null || val === undefined) return val;
+
+  if (typeof val === 'string') {
+    if (isEncrypted(val)) {
+      try {
+        return decrypt(val) as unknown as T;
+      } catch {
+        return '[ENCRYPTED]' as unknown as T;
+      }
+    }
+    return val;
+  }
+
+  if (Array.isArray(val)) {
+    return val.map((item) => sanitizeAuditData(item)) as unknown as T;
+  }
+
+  if (typeof val === 'object') {
+    const raw = typeof (val as any).toObject === 'function' ? (val as any).toObject() : val;
+    if (raw instanceof Date || (raw as any)?._bsontype) return raw;
+
+    const copy: Record<string, any> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (INTERNAL_SEARCH_KEYS.has(k)) {
+        continue;
+      }
+      if (SENSITIVE_AUDIT_KEYS.has(k)) {
+        copy[k] = '[REDACTED]';
+        continue;
+      }
+      copy[k] = sanitizeAuditData(v);
+    }
+    return copy as T;
+  }
+
+  return val;
+}
+

@@ -1,6 +1,7 @@
-﻿import mongoose, { Schema, Document } from 'mongoose';
+import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 import { encryptPIIFields } from '../../../platform/pii/pii.service';
+import { getNextSequence } from '../shared/counter.model';
 
 export interface IStaffDoc extends Document {
   tenantId:   mongoose.Types.ObjectId;
@@ -82,13 +83,8 @@ schema.pre('save', function (next) {
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();
-  const last = await (this.constructor as any)
-    .findOne({ tenantId: this.tenantId })
-    .sort({ numId: -1 })
-    .select('numId')
-    .lean();
-  this.numId   = (last?.numId ?? 0) + 1;
-  const pfx         = await resolveClientPrefix(this.tenantId);
+  this.numId   = await getNextSequence(this.tenantId, 'staffs', this.constructor as any);
+  const pfx    = await resolveClientPrefix(this.tenantId);
   this.clientId = pfx;
   this.staffId = `${pfx}-ST-${String(this.numId).padStart(4, '0')}`;
   next();

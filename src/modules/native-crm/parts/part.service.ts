@@ -28,7 +28,10 @@ export async function listParts(tenantId: string, opts: PartListOptions, branchI
 
 export async function getPartById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { partId: id }] }
+    : { partId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativePart.findOne(filter);
 }
@@ -41,7 +44,10 @@ export async function createPart(data: any) {
 
 export async function updatePart(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { partId: id }] }
+    : { partId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativePart.findOneAndUpdate(
     filter,
@@ -54,7 +60,10 @@ export async function updatePart(id: string, tenantId: string, data: any, scope?
 
 export async function deletePart(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { partId: id }] }
+    : { partId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativePart.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'parts', String(deleted._id));

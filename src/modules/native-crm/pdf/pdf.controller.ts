@@ -284,7 +284,7 @@ export async function generatePdf(req: AuthRequest, res: Response) {
     res.setHeader('Content-Length', buffer.length);
     res.send(buffer);
   } catch (err: any) {
-    sendError(res, err.message ?? 'PDF generation failed', 500);
+    sendError(res, err.message || 'PDF generation service is currently unavailable. Please use the Print option or contact support.', 500);
   }
 }
 
@@ -346,7 +346,7 @@ export async function downloadDraftPdf(req: AuthRequest, res: Response) {
     res.setHeader('Content-Length', buffer.length);
     res.send(buffer);
   } catch (err: any) {
-    sendError(res, err.message ?? 'PDF generation failed', 500);
+    sendError(res, err.message || 'PDF generation service is currently unavailable. Please use the Print option or contact support.', 500);
   }
 }
 

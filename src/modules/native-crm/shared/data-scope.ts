@@ -145,8 +145,18 @@ export function applyDataScopeToFilter(
   const scoped = !!scope && scope.kind !== 'all';
 
   if (ownerTab === 'my') {
-    if (!ownStaffId) { filter[ownerField] = NO_MATCH; return; }
-    if (scoped && !scope!.staffIds.includes(ownStaffId)) { filter[ownerField] = NO_MATCH; return; }
+    if (!ownStaffId) {
+      if (scope?.createdByUserIds?.length) {
+        filter[ownerField] = { $in: scope.createdByUserIds };
+        return;
+      }
+      filter[ownerField] = NO_MATCH;
+      return;
+    }
+    if (scoped && !scope!.staffIds.includes(ownStaffId) && !scope!.createdByUserIds.includes(ownStaffId)) {
+      filter[ownerField] = NO_MATCH;
+      return;
+    }
     filter[ownerField] = ownStaffId;
     return;
   }
@@ -157,11 +167,24 @@ export function applyDataScopeToFilter(
   }
 
   if (!scope || scope.kind === 'all') return;
+
+  // LR-C4-PERM-003: In CRM, assigned owners can be linked via NativeStaff.staffId
+  // OR directly via User._id (e.g. Lead's leadOwnerStaffId often stores user ID).
+  // Include both staffIds and createdByUserIds in allowedOwnerIds so records
+  // assigned to a manager or agent are visible regardless of ID representation.
+  const allowedOwnerIds = Array.from(new Set([
+    ...scope.staffIds,
+    ...scope.createdByUserIds,
+  ]));
+
   if (alsoMatchCreatedBy) {
-    const scopeOr = [
-      { [ownerField]: { $in: scope.staffIds } },
+    const scopeOr: Record<string, unknown>[] = [
+      { [ownerField]: { $in: allowedOwnerIds } },
       { [alsoMatchCreatedBy]: { $in: scope.createdByUserIds } },
     ];
+    if (scope.teamIds && scope.teamIds.length > 0) {
+      scopeOr.push({ teamId: { $in: scope.teamIds } });
+    }
     if (filter.$or) {
       const existingOr = filter.$or;
       delete filter.$or;
@@ -171,7 +194,7 @@ export function applyDataScopeToFilter(
     }
     return;
   }
-  filter[ownerField] = { $in: scope.staffIds };
+  filter[ownerField] = { $in: allowedOwnerIds };
 }
 
 /** Same idea, for modules with no real staff-assignment field — scopes on
@@ -184,31 +207,63 @@ export function applyDataScopeToFilter(
  * AND, never a blind overwrite, so a scoped Manager/Agent can't use the
  * Unassigned tab to see another team's unowned records, and "My" always
  * resolves to exactly the caller (verified against the scope's own allowed
- * set, in case a caller is ever in a scope that somehow excludes them). */
+ * set, in case a caller is ever in a scope that somehow excludes them).
+ *
+ * LR-C4-PERM-003: Added optional ownerField/extraOwnerValues so modules like
+ * Contacts (with contactOwner) can allow records assigned to a Manager/Agent
+ * to be visible even if created by Tenant Admin or another user. */
 export function applyDataScopeToCreatedByFilter(
   filter: Record<string, unknown>,
   scope: DataScope | undefined,
   field = 'createdBy',
   ownerTab?: 'my' | 'unassigned',
   userId?: string,
+  ownerField?: string,
+  extraOwnerValues?: string[],
 ): void {
   const scoped = !!scope && scope.kind !== 'all';
 
   if (ownerTab === 'my' && userId) {
-    if (scoped && !scope!.createdByUserIds.includes(userId)) { filter[field] = NO_MATCH; return; }
+    if (scoped && !scope!.createdByUserIds.includes(userId)) {
+      filter[ownerField || field] = NO_MATCH;
+      return;
+    }
+    if (ownerField) {
+      const allowed = Array.from(new Set([userId, ...(extraOwnerValues || [])]));
+      filter[ownerField] = { $in: allowed };
+      return;
+    }
     filter[field] = userId;
     return;
   }
   if (ownerTab === 'unassigned') {
-    // A scoped user's allowed createdBy set is always specific user ids,
-    // never "no owner" — so an unassigned record can never be in scope for
-    // them, same as any other tenant's record would be out of scope.
-    if (scoped) { filter[field] = NO_MATCH; return; }
-    filter[field] = { $in: [null, ''] };
+    if (scoped) { filter[ownerField || field] = NO_MATCH; return; }
+    filter[ownerField || field] = { $in: [null, ''] };
     return;
   }
 
   if (!scope || scope.kind === 'all') return;
+
+  if (ownerField) {
+    const allowedOwners = Array.from(new Set([
+      ...scope.createdByUserIds,
+      ...scope.staffIds,
+      ...(extraOwnerValues || []),
+    ]));
+    const scopeOr = [
+      { [field]: { $in: scope.createdByUserIds } },
+      { [ownerField]: { $in: allowedOwners } },
+    ];
+    if (filter.$or) {
+      const existingOr = filter.$or;
+      delete filter.$or;
+      filter.$and = [...((filter.$and as any[]) || []), { $or: existingOr }, { $or: scopeOr }];
+    } else {
+      filter.$or = scopeOr;
+    }
+    return;
+  }
+
   filter[field] = { $in: scope.createdByUserIds };
 }
 

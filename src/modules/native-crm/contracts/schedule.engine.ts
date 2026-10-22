@@ -272,7 +272,14 @@ export function computeBalance(visits?: IContractVisit[] | null): ServiceBalance
     switch (v.status) {
       case 'completed': b.completed++; break;
       case 'cancelled': b.cancelled++; break;
-      case 'scheduled': b.scheduled++; b.remaining++; break;
+      case 'scheduled': {
+        b.scheduled++;
+        b.remaining++;
+        // LR-C4-CTR-005: Count scheduled future visits as upcoming (or overdue if past)
+        if (dateOnly(new Date(v.serviceDate)).getTime() < today) b.overdue++;
+        else b.upcoming++;
+        break;
+      }
       default: {
         b.remaining++;
         if (dateOnly(new Date(v.serviceDate)).getTime() < today) b.overdue++;

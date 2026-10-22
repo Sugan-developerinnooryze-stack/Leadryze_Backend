@@ -54,8 +54,8 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
   if (opts.search) {
     // LR-LEAD-006: unescaped regex metacharacters (e.g. "+" in a phone
     // number) crashed this with "Invalid regular expression: Nothing to
-    // repeat" — same escape already used by Contacts'/Deals' own search.
-    const re = new RegExp(opts.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const rawSearch = opts.search.trim();
+    const re = new RegExp(rawSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     // LR-LEAD-005: email/phone are encrypted at rest, so a regex against
     // those columns directly can only ever match the rare row that's still
     // plaintext by accident — match the blind-index fields instead
@@ -67,6 +67,34 @@ function buildLeadFilter(tenantId: string, opts: LeadListOptions, branchId?: str
       { company: re }, { leadId: re },
       customFieldsSearchExpr(opts.search),
     ];
+    // LR-C4-SRCH-002: Searching a lead by full name ("first last") finds the lead
+    const nameTokens = rawSearch.split(/\s+/).filter(Boolean);
+    if (nameTokens.length >= 2) {
+      const firstToken = nameTokens[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const restTokens = nameTokens.slice(1).join(' ').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      orClauses.push({
+        $and: [
+          { firstName: new RegExp(firstToken, 'i') },
+          { lastName: new RegExp(restTokens, 'i') },
+        ],
+      });
+      orClauses.push({
+        $and: [
+          { firstName: new RegExp(restTokens, 'i') },
+          { lastName: new RegExp(firstToken, 'i') },
+        ],
+      });
+      const fullNamePattern = nameTokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
+      orClauses.push({
+        $expr: {
+          $regexMatch: {
+            input: { $concat: [{ $ifNull: ['$firstName', ''] }, ' ', { $ifNull: ['$lastName', ''] }] },
+            regex: fullNamePattern,
+            options: 'i',
+          },
+        },
+      });
+    }
     const searchDigits = opts.search.replace(/\D/g, '');
     if (searchDigits.length >= 4) {
       orClauses.push({ phoneSearch: new RegExp('^' + searchDigits) });
@@ -169,9 +197,14 @@ export async function updateLead(id: string, tenantId: string, data: any, scope?
   const updated = await Lead.findOne(filter);
   if (!updated) return null;
 
-  // LR-NEG-001: Detect stale concurrent save (lost update prevention)
+  // LR-NEG-001: Detect stale concurrent save (lost update prevention) — version token mandatory
   const clientUpdatedAt = data.updatedAt ? new Date(data.updatedAt).getTime() : null;
   const clientVersion = data.__v !== undefined ? Number(data.__v) : (data.version !== undefined ? Number(data.version) : null);
+  if (clientVersion === null && clientUpdatedAt === null) {
+    const err: any = new Error('This lead was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
   if (clientVersion !== null && updated.__v !== undefined && updated.__v !== clientVersion) {
     const err: any = new Error('This lead was changed by someone else — please reload and try again.');
     err.name = 'VersionError';
@@ -187,24 +220,65 @@ export async function updateLead(id: string, tenantId: string, data: any, scope?
   }
 
   const { updatedAt: _u, __v: _v, version: _ver, ...cleanData } = data;
+
+  // LR-C4-LEAD-003: If email or phone contains masking characters (* or X),
+  // never overwrite real stored PII with the masked string
+  const PII_FIELDS = ['email', 'secondaryEmail', 'phone', 'mobile', 'whatsapp', 'alternatePhone'];
+  for (const f of PII_FIELDS) {
+    const val = (cleanData as any)[f];
+    if (typeof val === 'string' && (val.includes('*') || /X{2,}/.test(val))) {
+      delete (cleanData as any)[f];
+    }
+  }
+
   updated.set({ ...cleanData, lastActivityAt: new Date() });
   await updated.save();
   indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
   return updated;
 }
 
-export async function updateLeadStage(id: string, tenantId: string, status: string, scope?: DataScope) {
+export async function updateLeadStage(
+  id: string,
+  tenantId: string,
+  status: string,
+  scope?: DataScope,
+  versionToken?: { updatedAt?: any; __v?: any; version?: any }
+) {
   await assertValidStatus(tenantId, status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
-  const updated = await Lead.findOneAndUpdate(
-    filter,
-    { status, lastActivityAt: new Date() },
-    { new: true }
-  );
-  if (updated) indexNativeSearchRecord(tenantId, 'native', 'leads', updated.toObject(), leadDisplayName(updated));
-  return updated;
+
+  const lead = await Lead.findOne(filter);
+  if (!lead) return null;
+
+  // LR-NEG-001: Stage move must also be version-checked
+  const clientUpdatedAt = versionToken?.updatedAt ? new Date(versionToken.updatedAt).getTime() : null;
+  const clientVersion = versionToken?.__v !== undefined ? Number(versionToken.__v) : (versionToken?.version !== undefined ? Number(versionToken.version) : null);
+  if (clientVersion === null && clientUpdatedAt === null) {
+    const err: any = new Error('This lead was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
+  if (clientVersion !== null && lead.__v !== undefined && lead.__v !== clientVersion) {
+    const err: any = new Error('This lead was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
+  if (clientUpdatedAt && (lead as any).updatedAt) {
+    const docTime = new Date((lead as any).updatedAt).getTime();
+    if (docTime - clientUpdatedAt > 500) {
+      const err: any = new Error('This lead was changed by someone else — please reload and try again.');
+      err.name = 'VersionError';
+      throw err;
+    }
+  }
+
+  lead.status = status;
+  lead.lastActivityAt = new Date();
+  await lead.save();
+  indexNativeSearchRecord(tenantId, 'native', 'leads', lead.toObject(), leadDisplayName(lead));
+  return lead;
 }
 
 export async function deleteLead(id: string, tenantId: string, scope?: DataScope) {

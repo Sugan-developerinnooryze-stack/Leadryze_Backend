@@ -25,7 +25,10 @@ export async function listProducts(tenantId: string, opts: any, branchId?: strin
 
 export async function getProductById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { productId: id }] }
+    : { productId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativeProduct.findOne(filter);
 }
@@ -38,7 +41,10 @@ export async function createProduct(data: any) {
 
 export async function updateProduct(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { productId: id }] }
+    : { productId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeProduct.findOneAndUpdate(filter, data, { new: true, runValidators: true });
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'products', updated.toObject(), (updated as any).name);
@@ -47,7 +53,10 @@ export async function updateProduct(id: string, tenantId: string, data: any, sco
 
 export async function deleteProduct(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { productId: id }] }
+    : { productId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeProduct.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'products', String(deleted._id));

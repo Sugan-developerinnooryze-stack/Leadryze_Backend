@@ -46,6 +46,7 @@ export interface ICustomerDoc extends Document {
   lockReason?:  string;
   phoneSearch?: string;
   emailDomain?: string;
+  emailSearch?: string;
   // Customer mobile-app credentials (never plaintext; managed via app-credentials.service)
   appUsername?:               string;
   appPasswordHash?:           string;
@@ -94,6 +95,7 @@ const schema = new Schema<ICustomerDoc>(
     lockReason:  { type: String },
     phoneSearch: { type: String, index: true },   // digits-only, unencrypted, for search (see pii.service.ts)
     emailDomain: { type: String, index: true },   // domain part unencrypted for search
+    emailSearch: { type: String, index: true },   // sha256 blind index for exact match
     // App credentials — select:false keeps secrets out of every list/get response
     appUsername:               { type: String, trim: true, lowercase: true },
     appPasswordHash:           { type: String, select: false },
@@ -101,7 +103,25 @@ const schema = new Schema<ICustomerDoc>(
     appCredentialsGeneratedAt: { type: Date },
     appLastLoginAt:            { type: Date },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: {
+      transform: (_doc, ret: Record<string, any>) => {
+        delete ret.emailSearch;
+        delete ret.phoneSearch;
+        delete ret.emailDomain;
+        return ret;
+      },
+    },
+    toObject: {
+      transform: (_doc, ret: Record<string, any>) => {
+        delete ret.emailSearch;
+        delete ret.phoneSearch;
+        delete ret.emailDomain;
+        return ret;
+      },
+    },
+  }
 );
 
 schema.pre('save', function (next) {

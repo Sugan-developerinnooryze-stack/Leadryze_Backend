@@ -14,20 +14,44 @@ export async function findDuplicateContact(
   excludeId?: string,
 ): Promise<{ id: string; label: string } | null> {
   const or: Record<string, unknown>[] = [];
-  if (data.email) or.push({ emailSearch: hashEmail(data.email) });
+  if (data.email) {
+    const rawEmail = String(data.email).trim();
+    const lowerEmail = rawEmail.toLowerCase();
+    or.push({ emailSearch: hashEmail(lowerEmail) });
+    or.push({ email: lowerEmail });
+    or.push({ email: rawEmail });
+    or.push({ secondaryEmail: lowerEmail });
+  }
   const phone = data.phone || data.mobile;
   if (phone) {
-    const digits = phone.replace(/\D/g, '');
-    if (digits.length >= 6) or.push({ phoneSearch: digits });
+    const rawPhone = String(phone).trim();
+    const digits = rawPhone.replace(/\D/g, '');
+    if (digits.length >= 6) {
+      or.push({ phoneSearch: digits });
+      if (digits.length > 10) {
+        or.push({ phoneSearch: digits.slice(-10) });
+      } else if (digits.length === 10) {
+        or.push({ phoneSearch: new RegExp(`${digits}$`) });
+      }
+    }
+    or.push({ phone: rawPhone });
+    or.push({ mobile: rawPhone });
   }
   if (!or.length) return null;
 
-  const filter: Record<string, unknown> = { tenantId: new mongoose.Types.ObjectId(tenantId), $or: or };
-  if (excludeId) filter._id = { $ne: excludeId };
+  const tid = mongoose.isValidObjectId(tenantId) ? new mongoose.Types.ObjectId(tenantId) : tenantId;
+  const filter: Record<string, unknown> = {
+    tenantId: { $in: [tenantId, tid] },
+    $or: or,
+  };
+  if (excludeId) {
+    const eid = mongoose.isValidObjectId(excludeId) ? new mongoose.Types.ObjectId(excludeId) : excludeId;
+    filter._id = { $nin: [excludeId, eid] };
+  }
 
-  const match = await model.findOne(filter).select('_id firstName lastName leadId').lean();
+  const match = await model.findOne(filter).select('_id firstName lastName leadId name customerId').lean();
   if (!match) return null;
   const m = match as any;
-  const label = [m.firstName, m.lastName].filter(Boolean).join(' ') || m.leadId || String(m._id);
-  return { id: String(m._id), label };
+  const label = [m.firstName, m.lastName].filter(Boolean).join(' ') || m.name || m.customerId || m.leadId || String(m._id);
+  return { id: String(m.customerId || m.leadId || m._id), label };
 }

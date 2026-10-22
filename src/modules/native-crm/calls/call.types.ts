@@ -8,6 +8,7 @@ export interface ICall {
   duration?: number;
   callStatus: 'planned' | 'completed' | 'missed' | 'cancelled';
   date?: Date;
+  timezone?: string;
   notes?: string;
   tags?: string[];
   relatedModule?: RelatedModule;
@@ -24,6 +25,7 @@ export interface CreateCallDTO {
   duration?: number;
   callStatus?: string;
   date?: string;
+  timezone?: string;
   notes?: string;
   tags?: string[];
   relatedModule?: RelatedModule;

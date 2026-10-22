@@ -1,4 +1,4 @@
-﻿import mongoose, { Schema, Document } from 'mongoose';
+import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 
 export interface IVehicleDoc extends Document {
@@ -35,11 +35,32 @@ const schema = new Schema<IVehicleDoc>(
     registrationNumber: { type: String, trim: true },
     make:               { type: String, trim: true },
     vehicleModel:       { type: String, trim: true },
-    year:               { type: Number },
+    year: {
+      type: Number,
+      min: [1900, 'Year must be at least 1900'],
+      validate: {
+        validator: function (v: number) {
+          if (v == null) return true;
+          return v <= new Date().getFullYear() + 1;
+        },
+        message: 'Year cannot be in the future',
+      },
+    },
     assignedTeam:       { type: String, trim: true },
     assignedDriver:     { type: String, trim: true },
     fuelType:           { type: String, enum: ['petrol', 'diesel', 'electric', 'hybrid'] },
-    lastServiceDate:    { type: Date },
+    lastServiceDate: {
+      type: Date,
+      validate: {
+        validator: function (v: Date) {
+          if (!v) return true;
+          const todayEnd = new Date();
+          todayEnd.setHours(23, 59, 59, 999);
+          return v <= todayEnd;
+        },
+        message: 'Last service date cannot be in the future',
+      },
+    },
     notes:              { type: String },
     status:             { type: String, enum: ['active', 'in_use', 'under_maintenance', 'retired'], default: 'active' },
     customFields: { type: Schema.Types.Mixed, default: {} },

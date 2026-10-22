@@ -68,7 +68,10 @@ export async function listQuotations(tenantId: string, opts: QuotationListOption
 
 export async function getQuotationById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { quotationId: id }] }
+    : { quotationId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativeQuotation.findOne(filter);
 }
@@ -107,7 +110,10 @@ export async function createQuotation(data: any) {
 export async function updateQuotation(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { quotationId: id }] }
+    : { quotationId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined || data.gstPercentage !== undefined) {
     const existing = await NativeQuotation.findOne(filter).lean();
@@ -135,7 +141,10 @@ export async function updateQuotation(id: string, tenantId: string, data: any, s
 
 export async function deleteQuotation(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { quotationId: id }] }
+    : { quotationId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeQuotation.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'quotations', String(deleted._id));

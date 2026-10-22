@@ -26,7 +26,10 @@ export async function listVehicles(tenantId: string, opts: any, branchId?: strin
 
 export async function getVehicleById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { vehicleId: id }] }
+    : { vehicleId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativeVehicle.findOne(filter);
 }
@@ -39,7 +42,10 @@ export async function createVehicle(data: any) {
 
 export async function updateVehicle(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { vehicleId: id }] }
+    : { vehicleId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeVehicle.findOneAndUpdate(filter, data, { new: true, runValidators: true });
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'vehicles', updated.toObject(), (updated as any).name);
@@ -48,7 +54,10 @@ export async function updateVehicle(id: string, tenantId: string, data: any, sco
 
 export async function deleteVehicle(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { vehicleId: id }] }
+    : { vehicleId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeVehicle.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'vehicles', String(deleted._id));

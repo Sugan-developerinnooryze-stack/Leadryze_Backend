@@ -39,8 +39,12 @@ router.post('/', requirePermission('custom_modules.definitions.manage'), async (
     if (!req.body.name) { sendError(res, 'name is required', 400); return; }
     const mod = await createCustomModule(req.tenantId!, req.body);
     res.status(201).json({ success: true, data: mod });
-  } catch {
-    sendError(res, 'Failed to create custom module', 500);
+  } catch (err: any) {
+    // assertValidModuleDefinition throws a plain Error with a real,
+    // specific reason (e.g. duplicate field key, native-name collision) —
+    // previously swallowed here into a generic 500, which hid the actual
+    // problem and reported the wrong status code for a validation failure.
+    sendError(res, err.message ?? 'Failed to create custom module', 400);
   }
 });
 
@@ -72,8 +76,8 @@ router.put('/:id', requirePermission('custom_modules.definitions.manage'), async
     const mod = await updateCustomModule(req.tenantId!, req.params.id, req.body);
     if (!mod) { sendError(res, 'Module not found', 404); return; }
     sendSuccess(res, mod);
-  } catch {
-    sendError(res, 'Failed to update custom module', 500);
+  } catch (err: any) {
+    sendError(res, err.message ?? 'Failed to update custom module', 400);
   }
 });
 

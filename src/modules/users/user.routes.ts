@@ -15,10 +15,17 @@ import { logAuditEvent } from '../logs/audit-log.model';
 import { isPasswordTakenAtTenant } from '../auth/auth.service';
 import { Tenant } from '../tenants/tenant.model';
 import { reserveUserSeat, releaseUserSeat } from '../tenants/tenant.service';
+import { getSettings } from '../native-crm/fs-settings/fs-settings.service';
+import { transformPIIResponse } from '../../platform/pii/pii.service';
 
 const router = Router();
 
 router.use(authenticate, requireTenant);
+
+async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
+  const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
+  return (settings as any)?.piiConfig?.find((p: any) => p.module === 'staffs' || p.module === 'users')?.viewRoles ?? [];
+}
 
 // GET /users — list all sub-users in the tenant (excluding the requester)
 router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, next) => {
@@ -39,6 +46,13 @@ router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, n
     }
 
     if (req.query.role) filter.role = req.query.role;
+    if (req.query.isActive !== undefined) {
+      filter.isActive = req.query.isActive === 'true';
+    } else if (req.query.status === 'active') {
+      filter.isActive = true;
+    } else if (req.query.status === 'inactive') {
+      filter.isActive = false;
+    }
 
     const [users, total, tenant, activeUsers] = await Promise.all([
       User.find(filter)
@@ -56,7 +70,10 @@ router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, n
       User.countDocuments({ tenantId: new mongoose.Types.ObjectId(tenantId), role: { $ne: 'SUPER_ADMIN' }, isActive: true }),
     ]);
 
-    return sendSuccess(res, users, 'Success', 200, {
+    const viewRoles = await getPIIViewRoles(tenantId, (req as any).branchId);
+    const safeUsers = transformPIIResponse(users, 'staffs', req.user!.role, viewRoles);
+
+    return sendSuccess(res, safeUsers, 'Success', 200, {
       page, limit, total, totalPages: Math.ceil(total / limit),
       maxUsers: tenant?.settings?.maxUsers ?? null,
       activeUsers,
@@ -273,13 +290,22 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
         { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
         { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
       );
+      if (deactivating) {
+        logAuditEvent('user.removed',
+          { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+          { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
+        );
+      }
     }
 
     const userObj = user.toObject() as unknown as Record<string, unknown>;
     delete userObj.password;
     delete userObj.refreshToken;
 
-    return sendSuccess(res, userObj);
+    const viewRoles = await getPIIViewRoles(tenantId, (req as any).branchId);
+    const safeUser = transformPIIResponse(userObj, 'staffs', req.user!.role, viewRoles);
+
+    return sendSuccess(res, safeUser);
   } catch (err) {
     next(err);
   }
@@ -310,6 +336,10 @@ router.delete('/:id', requirePermission('users.delete'), async (req: AuthRequest
     if (wasActive) await releaseUserSeat(tenantId); // frees the seat; no-op if already inactive
 
     logAuditEvent('user.deactivated',
+      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
+      { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
+    );
+    logAuditEvent('user.removed',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
       { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
     );

@@ -8,6 +8,7 @@ import { ITargetFieldDef } from '../native-crm/automation-rules/target-field-cat
 import { transformPIIResponse } from '../../platform/pii/pii.service';
 import { PII_FIELDS } from '../../platform/pii/constants';
 import { getSettings } from '../native-crm/fs-settings/fs-settings.service';
+import { listCustomFields } from '../native-crm/custom-fields/custom-field.service';
 
 /** Modules whose schema getFieldCatalog() already covers — everything else
  * in CRM_WRITE_MODULE_MAP gets its schema from its own hand-authored
@@ -132,6 +133,17 @@ export interface CrmModuleSchemaResult {
    * hand-authored allowlist — informational only, lets a caller note the
    * source if useful, never changes the shape returned. */
   fromAutomationCatalog: boolean;
+  /** Tenant-defined extra fields on this BUILT-IN module (the separate
+   * Custom Fields system, native-crm/custom-fields/ — NOT Custom Modules,
+   * a different, unrelated system for whole new tenant-defined objects).
+   * Deliberately a SEPARATE array from `fields` above, never merged in —
+   * the two systems have genuinely different type sets (5 fixed types for
+   * native fields vs. 19 real Custom Field types) and keeping them visibly
+   * distinct in this response is what lets a caller (or the AI prompt)
+   * never conflate the two. Always present (possibly empty), never
+   * undefined, so a caller never has to guess whether "no custom fields"
+   * means "none exist" vs. "wasn't checked". */
+  customFields: Array<{ id: string; key: string; label: string; fieldType: string; required: boolean; options?: string[] }>;
 }
 
 /** Schema introspection — getFieldCatalog() for the 5 modules it already
@@ -141,14 +153,28 @@ export interface CrmModuleSchemaResult {
  * reflection — see crm-write.module-map.ts's own comment on why (keeping
  * credential/internal-only fields, e.g. Staff's app-login fields,
  * impossible to expose even by accident). */
-export async function getCrmModuleSchema(module: string, tenantId: string): Promise<CrmModuleSchemaResult | null> {
+export async function getCrmModuleSchema(
+  module: string, tenantId: string,
+  /** Optional — when provided, Custom Fields are scoped to this branch (or
+   * tenant-wide when null/omitted), matching listCustomFields' own strict
+   * per-branch isolation. Omitted entirely by any pre-existing caller that
+   * doesn't pass it, which resolves to tenant-wide (branchId: null) —
+   * identical to today's behavior for every field that already existed
+   * before this parameter was added. */
+  branchId?: string | null,
+): Promise<CrmModuleSchemaResult | null> {
   const def = CRM_WRITE_MODULE_MAP[module];
   if (!def) return null;
 
+  const customFieldDocs = await listCustomFields(tenantId, module, branchId ?? null);
+  const customFields = customFieldDocs.map((f: any) => ({
+    id: String(f._id), key: f.fieldKey, label: f.label, fieldType: f.fieldType, required: !!f.required, options: f.options,
+  }));
+
   if (FIELD_CATALOG_MODULES.has(module as BuiltInPipelineModule)) {
     const fields = await getFieldCatalog(tenantId, module as PipelineModule);
-    return { module, fields, fromAutomationCatalog: true };
+    return { module, fields, fromAutomationCatalog: true, customFields };
   }
 
-  return { module, fields: def.schemaFields ?? [], fromAutomationCatalog: false };
+  return { module, fields: def.schemaFields ?? [], fromAutomationCatalog: false, customFields };
 }

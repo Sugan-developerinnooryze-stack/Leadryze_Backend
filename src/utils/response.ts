@@ -19,6 +19,12 @@ export function sendError(
   statusCode = 400,
   errors?: unknown
 ): Response {
+  if (
+    typeof message === 'string' &&
+    (message.includes('Cast to ObjectId failed') || message.includes('CastError'))
+  ) {
+    return res.status(404).json({ success: false, message: 'Resource not found' });
+  }
   const body: ApiResponse = { success: false, message };
   if (errors !== undefined) body.errors = errors;
   return res.status(statusCode).json(body);

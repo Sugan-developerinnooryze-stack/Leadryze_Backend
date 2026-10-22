@@ -98,9 +98,17 @@ export async function getOrCreateStages(tenantId: string, module: PipelineModule
   let doc = await PipelineConfig.findOne({ tenantId: tid, module });
   if (!doc) {
     const defaults = DEFAULT_STAGES[module as BuiltInPipelineModule] ?? [];
-    doc = await PipelineConfig.create({ tenantId: tid, module, stages: defaults });
+    try {
+      doc = await PipelineConfig.create({ tenantId: tid, module, stages: defaults });
+    } catch (err: any) {
+      if (err?.code === 11000) {
+        doc = await PipelineConfig.findOne({ tenantId: tid, module });
+      } else {
+        throw err;
+      }
+    }
   }
-  return doc.stages;
+  return doc?.stages ?? [];
 }
 
 export async function updateStages(tenantId: string, module: PipelineModule, stages: IPipelineStage[]): Promise<IPipelineStage[]> {

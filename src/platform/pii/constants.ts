@@ -20,6 +20,10 @@ export const PII_FIELDS: Record<string, PIIFieldDef> = {
     level2: ['phone', 'email'],
     level3: [],
   },
+  users: {
+    level2: ['phone', 'email'],
+    level3: [],
+  },
   sites: {
     level2: ['address', 'phone'],
     level3: [],

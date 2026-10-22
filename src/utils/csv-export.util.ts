@@ -16,7 +16,11 @@ function csvCell(value: any): string {
   else if (Array.isArray(value)) s = value.map((v) => (v == null ? '' : String(v))).join('; ');
   else if (typeof value === 'object') s = JSON.stringify(value);
   else s = String(value);
-  if (/[",\r\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+  // Neutralise CSV formula injection for cells starting with =, +, -, @
+  if (/^[=+\-@]/.test(s)) {
+    s = `'${s}`;
+  }
+  if (/[",\r\n]/.test(s) || s.startsWith("'")) s = `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 

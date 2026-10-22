@@ -8,6 +8,7 @@ export const createDealSchema = z.object({
   stage:       z.string().trim().min(1).optional(),
   amount:      z.number().min(0).optional(),
   currency:    z.string().trim().optional(),
+  branchId:    z.string().nullable().optional(),
   closeDate:   z.string().optional(),
   contactName: z.string().trim().optional(),
   companyName: z.string().trim().optional(),

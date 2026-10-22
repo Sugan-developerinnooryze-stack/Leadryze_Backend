@@ -1,6 +1,7 @@
 export interface IDeal {
   _id: string;
   tenantId: string;
+  branchId?: string | null;
   title: string;
   amount?: number;
   currency: string;
@@ -20,6 +21,7 @@ export interface IDeal {
 }
 
 export interface CreateDealDTO {
+  branchId?: string | null;
   title: string;
   amount?: number;
   currency?: string;

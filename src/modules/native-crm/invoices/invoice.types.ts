@@ -6,6 +6,8 @@ export interface InvoiceListOptions {
   range?:     string;
   dateFrom?:  string;
   dateTo?:    string;
+  customFrom?: string;
+  customTo?:   string;
   filters?:   string;
   // Calendar addition — optional, every existing caller that omits it keeps
   // today's exact 'createdAt' behavior. The Calendar sends 'dueDate' so

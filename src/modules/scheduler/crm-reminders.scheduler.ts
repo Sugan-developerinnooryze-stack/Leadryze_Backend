@@ -22,6 +22,7 @@ import { sendSmsNow } from '../messages/twilio.service';
 import { EmailLogSourceModule } from '../notifications/email-log.model';
 import { Tenant } from '../tenants/tenant.model';
 import { isFeatureFlagEnabled } from '../tenants/tenant.service';
+import { resolveEffectiveTimezone } from '../notifications/confirmation.service';
 
 type ReminderKind = Extract<EmailLogSourceModule, 'call' | 'meeting' | 'task'>;
 
@@ -81,7 +82,21 @@ async function sendReminder(target: ReminderTarget, windowMinutes: number): Prom
     return;
   }
 
-  const whenFmt = target.when ? target.when.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : 'soon';
+  const effectiveTz = await resolveEffectiveTimezone(tenantId);
+  let whenFmt = 'soon';
+  if (target.when) {
+    const base = target.when.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short', timeZone: effectiveTz });
+    try {
+      const tzPart = new Intl.DateTimeFormat('en-IN', { timeZone: effectiveTz, timeZoneName: 'short' })
+        .formatToParts(target.when)
+        .find((p) => p.type === 'timeZoneName')?.value;
+      const tzLabel = tzPart ? `${tzPart} (${effectiveTz})` : `(${effectiveTz})`;
+      whenFmt = `${base} ${tzLabel}`;
+    } catch {
+      whenFmt = `${base} (${effectiveTz})`;
+    }
+  }
+
   const { subject, htmlContent, smsText } = buildReminderContent(sourceModule, target.title, recipient.name, whenFmt, windowMinutes);
 
   await target.markSent();

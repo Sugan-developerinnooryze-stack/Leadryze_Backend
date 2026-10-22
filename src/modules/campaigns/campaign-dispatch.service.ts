@@ -9,6 +9,7 @@ import { sendSmsNow } from '../messages/twilio.service';
 import { sendWhatsAppNow } from '../messages/whatsapp.service';
 import { logger } from '../../utils/logger';
 import { config } from '../../config';
+import { Tenant } from '../tenants/tenant.model';
 
 // audience.filter is tenant-authored JSON that has never been executed as a
 // live Mongo query before today (it was a Mixed bag nothing read) — allowlist
@@ -89,14 +90,45 @@ export async function createRecipientsForCampaign(tenantId: string, campaign: IC
   return rows.length;
 }
 
-export function renderVariablesForCustomer(customer: ICustomer): Record<string, string> {
+function formatDateTime(timeZone?: string) {
+  const d = new Date();
+  const dateOpts: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short', day: 'numeric' };
+  const timeOpts: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', hour12: true };
+  if (timeZone) {
+    try {
+      return {
+        date: d.toLocaleDateString('en-US', { ...dateOpts, timeZone }),
+        time: d.toLocaleTimeString('en-US', { ...timeOpts, timeZone }),
+      };
+    } catch {
+      // fallback if invalid timezone
+    }
+  }
+  return {
+    date: d.toLocaleDateString('en-US', dateOpts),
+    time: d.toLocaleTimeString('en-US', timeOpts),
+  };
+}
+
+export function renderVariablesForCustomer(
+  customer: ICustomer,
+  tenant?: { name?: string; branding?: { companyName?: string; contactEmail?: string }; settings?: { timezone?: string } } | null
+): Record<string, string> {
+  const tenantCompany = tenant?.branding?.companyName || tenant?.name || 'LeadRyze';
+  const { date, time } = formatDateTime(tenant?.settings?.timezone);
   return {
     name: customer.name ?? '',
-    firstName: customer.firstName ?? customer.name ?? '',
-    lastName: customer.lastName ?? '',
+    firstName: customer.firstName ?? (customer.name ? customer.name.split(' ')[0] : ''),
+    lastName: customer.lastName ?? (customer.name ? customer.name.split(' ').slice(1).join(' ') : ''),
     email: customer.email ?? '',
     phone: customer.phone ?? '',
-    company: customer.company ?? '',
+    company: tenantCompany,
+    customerCompany: customer.company ?? '',
+    recipientCompany: customer.company ?? '',
+    tenantName: tenantCompany,
+    date,
+    time,
+    today: date,
   };
 }
 
@@ -105,10 +137,12 @@ async function sendToRecipient(
   recipient: ICampaignRecipient,
   subjectTpl: string | undefined,
   bodyTpl: string,
-  channel: 'email' | 'whatsapp' | 'sms'
+  channel: 'email' | 'whatsapp' | 'sms',
+  tenant?: { name?: string; branding?: { companyName?: string; contactEmail?: string }; settings?: { timezone?: string } } | null
 ): Promise<void> {
   const customer = await Customer.findById(recipient.customerId).lean();
-  const variables = customer ? renderVariablesForCustomer(customer as unknown as ICustomer) : {};
+  const resolvedTenant = tenant ?? (await Tenant.findById(tenantId).select('name branding settings').lean());
+  const variables = customer ? renderVariablesForCustomer(customer as unknown as ICustomer, resolvedTenant) : {};
   const body = renderTemplate(bodyTpl, variables);
 
   let providerMessageId: string | null = null;
@@ -117,7 +151,16 @@ async function sendToRecipient(
   try {
     if (channel === 'email') {
       const subject = renderTemplate(subjectTpl || '', variables);
-      providerMessageId = await sendEmailNow({ to: recipient.email!, toName: recipient.name, subject, htmlContent: body });
+      const senderName = resolvedTenant?.branding?.companyName || resolvedTenant?.name || config.brevo.senderName;
+      const replyTo = resolvedTenant?.branding?.contactEmail || undefined;
+      providerMessageId = await sendEmailNow({
+        to: recipient.email!,
+        toName: recipient.name,
+        senderName,
+        replyTo,
+        subject,
+        htmlContent: body,
+      });
     } else if (channel === 'whatsapp') {
       // sendWhatsAppNow never throws — null return means not configured or failed.
       providerMessageId = await sendWhatsAppNow(recipient.phone!, body);
@@ -207,9 +250,17 @@ export async function dispatchCampaignTick(campaignId: string, batchSize = 50): 
   await CampaignRecipient.updateMany({ _id: { $in: ids }, status: 'pending' }, { $set: { status: 'queued', queuedAt: new Date() } });
   const claimed = await CampaignRecipient.find({ _id: { $in: ids }, status: 'queued' });
 
+  const tenant = await Tenant.findById(campaign.tenantId).select('name branding settings').lean();
+
   await Promise.all(
-    claimed.map((r) => sendToRecipient(String(campaign.tenantId), r, template.subject, template.body, campaign.channel as 'email' | 'whatsapp' | 'sms'))
+    claimed.map((r) => sendToRecipient(String(campaign.tenantId), r, template.subject, template.body, campaign.channel as 'email' | 'whatsapp' | 'sms', tenant))
   );
+
+  const remaining = await CampaignRecipient.countDocuments({ campaignId, status: { $in: ['pending', 'queued'] } });
+  if (remaining === 0) {
+    await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'completed', completedAt: new Date() } });
+    return { processed: claimed.length, done: true };
+  }
 
   return { processed: claimed.length, done: false };
 }

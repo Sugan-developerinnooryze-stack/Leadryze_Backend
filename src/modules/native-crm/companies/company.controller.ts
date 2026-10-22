@@ -48,7 +48,10 @@ export async function remove(req: AuthRequest, res: Response) {
     const ok = await svc.deleteCompany(req.tenantId!, req.params.id, resolveEffectiveScope(req, 'companies'));
     if (!ok) return void sendError(res, 'Company not found', 404);
     sendSuccess(res, null, 'Company deleted');
-  } catch { sendError(res, 'Failed to delete company', 500); }
+  } catch (err: any) {
+    const status = err.statusCode ?? (err.message?.includes('Cannot delete') ? 409 : 500);
+    sendError(res, err.message ?? 'Failed to delete company', status);
+  }
 }
 
 export async function stats(req: AuthRequest, res: Response) {

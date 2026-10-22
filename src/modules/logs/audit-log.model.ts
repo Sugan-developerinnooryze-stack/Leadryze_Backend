@@ -1,5 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { logger } from '../../utils/logger';
+import { sanitizeAuditData } from '../../platform/pii/pii.service';
 
 export interface IAuditLog extends Document {
   tenantId?:   string;
@@ -56,7 +57,7 @@ export async function logAuditEvent(
       action,
       target:     options?.target,
       targetId:   options?.targetId,
-      detail:     options?.detail,
+      detail:     options?.detail ? sanitizeAuditData(options.detail) : undefined,
       ip:         actor.ip || 'unknown',
       userAgent:  actor.userAgent,
       timestamp:  new Date(),

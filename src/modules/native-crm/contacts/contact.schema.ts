@@ -47,7 +47,26 @@ export const contactSchema = new Schema(
     lockedBy:   { type: String },
     lockReason: { type: String },
   },
-  { timestamps: true, optimisticConcurrency: true }
+  {
+    timestamps: true,
+    optimisticConcurrency: true,
+    toJSON: {
+      transform: (_doc, ret: Record<string, any>) => {
+        delete ret.emailSearch;
+        delete ret.phoneSearch;
+        delete ret.emailDomain;
+        return ret;
+      },
+    },
+    toObject: {
+      transform: (_doc, ret: Record<string, any>) => {
+        delete ret.emailSearch;
+        delete ret.phoneSearch;
+        delete ret.emailDomain;
+        return ret;
+      },
+    },
+  }
 );
 
 // Must run BEFORE the PII-encryption hook below — email/phone are plaintext

@@ -4,6 +4,7 @@ import { AuthRequest } from '../types';
 import { logger } from '../utils/logger';
 import { NativeCrmLog } from '../modules/logs/native-crm-log.model';
 import { resolveClientPrefix } from '../utils/client-id';
+import { sanitizeAuditData } from '../platform/pii/pii.service';
 
 /* ── Model map — URL segment → Mongoose model ─────────────────────────────── */
 import { NativeCustomer }  from '../modules/native-crm/customers/customer.model';
@@ -72,13 +73,9 @@ const SKIP_MODULES = new Set([
   'lead-capture',
 ]);
 
-const SENSITIVE_KEYS = new Set(['password', 'token', 'secret', 'apiKey', 'accessToken', 'refreshToken']);
-
 export function sanitize(obj: Record<string, unknown> | null): Record<string, unknown> | null {
   if (!obj || typeof obj !== 'object') return obj;
-  const copy = { ...obj };
-  for (const k of SENSITIVE_KEYS) { if (k in copy) copy[k] = '[REDACTED]'; }
-  return copy;
+  return sanitizeAuditData(obj);
 }
 
 export interface NativeCrmLogParams {
@@ -170,7 +167,7 @@ export async function nativeCrmLog(req: AuthRequest, res: Response, next: NextFu
 
   // For updates: fetch state before modification
   let beforeState: Record<string, unknown> | null = null;
-  if ((req.method === 'PUT' || req.method === 'PATCH') && urlParamId) {
+  if ((req.method === 'PUT' || req.method === 'PATCH' || req.path.includes('/convert')) && urlParamId) {
     const Model = MODULE_MODEL_MAP[module];
     if (Model) {
       beforeState = await Model.findById(urlParamId).lean().catch(() => null) as Record<string, unknown> | null;
@@ -199,10 +196,13 @@ export async function nativeCrmLog(req: AuthRequest, res: Response, next: NextFu
         const method = req.method;
         const statusCode = res.statusCode;
         const isError = statusCode >= 400;
+        const isConvert = req.path.includes('/convert');
 
         let action: 'create' | 'update' | 'delete' | 'error';
         if (isError) {
           action = 'error';
+        } else if (isConvert) {
+          action = 'update';
         } else if (method === 'POST') {
           action = 'create';
         } else if (method === 'PUT' || method === 'PATCH') {
@@ -224,17 +224,50 @@ export async function nativeCrmLog(req: AuthRequest, res: Response, next: NextFu
         }
 
         const responseData = responseBody?.data ?? null;
-        const resourceId = urlParamId
+        let businessId = '';
+        if (responseData && typeof responseData === 'object') {
+          const targetDoc = responseData.lead || responseData;
+          switch (module) {
+            case 'receipts':   businessId = responseData.receiptId; break;
+            case 'invoices':   businessId = responseData.invoiceId; break;
+            case 'quotations': businessId = responseData.quotationId; break;
+            case 'contracts':  businessId = responseData.contractId; break;
+            case 'workorders': businessId = responseData.workOrderId; break;
+            case 'customers':  businessId = responseData.customerId; break;
+            case 'leads':      businessId = targetDoc.leadId; break;
+            case 'deals':      businessId = responseData.dealId; break;
+            case 'tickets':    businessId = responseData.ticketId; break;
+            case 'tasks':      businessId = responseData.taskId; break;
+            case 'parts':      businessId = responseData.partId; break;
+            case 'services':   businessId = responseData.serviceId; break;
+          }
+        }
+
+        const resourceId = businessId
+          || (urlParamId && !/^[0-9a-fA-F]{24}$/.test(urlParamId) ? urlParamId : '')
+          || (responseData?.recordId ? String(responseData.recordId) : '')
           || (responseData?._id ? String(responseData._id) : '')
-          || (responseData?.recordId ? String(responseData.recordId) : '');
+          || urlParamId;
 
         const afterState: Record<string, unknown> | null =
           (action === 'create' || action === 'update') && responseData && typeof responseData === 'object'
-            ? (responseData as Record<string, unknown>)
+            ? ((isConvert && responseData.lead) ? (responseData.lead as Record<string, unknown>) : (responseData as Record<string, unknown>))
             : null;
 
         const actor = req.user;
         const actorName = actor?.email ?? actor?.userId ?? 'anonymous';
+
+        const changes = (action === 'update' && isConvert && responseData?.lead)
+          ? {
+              status: responseData.lead.status,
+              isConverted: responseData.lead.isConverted,
+              ...(responseData.customer?.customerId ? { convertedCustomerId: responseData.customer.customerId } : {}),
+              ...(responseData.contact?._id ? { contactId: String(responseData.contact._id) } : {}),
+              ...(responseData.deal?._id ? { opportunityId: String(responseData.deal._id) } : {}),
+            }
+          : (action === 'update' && req.body && typeof req.body === 'object')
+            ? (req.body as Record<string, unknown>)
+            : null;
 
         await writeNativeCrmLog({
           tenantId:   req.tenantId ?? 'unknown',
@@ -246,9 +279,7 @@ export async function nativeCrmLog(req: AuthRequest, res: Response, next: NextFu
           resourceId,
           before:   beforeState,
           after:    afterState,
-          changes:  (action === 'update' && req.body && typeof req.body === 'object')
-            ? (req.body as Record<string, unknown>)
-            : null,
+          changes,
           error:      isError ? (responseBody?.message ?? `HTTP ${statusCode}`) : null,
           statusCode,
           ip:         req.ip || req.socket?.remoteAddress || 'unknown',

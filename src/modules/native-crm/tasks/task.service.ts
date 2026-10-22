@@ -2,7 +2,6 @@ import mongoose from 'mongoose';
 import { Task } from './task.model';
 import { CreateTaskDTO, UpdateTaskDTO } from './task.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
-import { sendOnCreateConfirmation } from '../../notifications/confirmation.service';
 import { isValidStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
@@ -37,6 +36,7 @@ export async function listTasks(tenantId: string, opts: ListOptions = {}, branch
 }
 
 export async function getTaskById(tenantId: string, id: string, scope?: DataScope) {
+  if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
@@ -50,13 +50,14 @@ export async function createTask(tenantId: string, dto: CreateTaskDTO & { create
     tenantId: tid, ...dto,
     branchId: dto.branchId ? new mongoose.Types.ObjectId(dto.branchId) : null,
   });
-  void sendOnCreateConfirmation(tenantId, 'task', created.toObject()); // fire-and-forget, never throws
+  // LR-PL-NOTIF-002: Internal tasks must not send customer confirmation notifications
   indexNativeSearchRecord(tenantId, 'native', 'tasks', created.toObject(), created.title);
   return created;
 }
 
 export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDTO, scope?: DataScope) {
   await assertValidStatus(tenantId, dto.taskStatus);
+  if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
@@ -66,6 +67,7 @@ export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDT
 }
 
 export async function deleteTask(tenantId: string, id: string, scope?: DataScope) {
+  if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);

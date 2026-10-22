@@ -83,8 +83,8 @@ export async function fsCounts(req: AuthRequest, res: Response) {
       // `supervisors` key at all, so the sidebar badge was permanently stuck
       // at 0 regardless of how many were added. A "Supervisor" isn't its own
       // model — it's exactly the same definition SupervisorsPage.tsx already
-      // uses client-side: any tenant User with role:'MANAGER'.
-      User.countDocuments({ tenantId: tid, role: 'MANAGER' }),
+      // LR-C4-USER-006: Count only active managers as supervisors
+      User.countDocuments({ tenantId: tid, role: 'MANAGER', isActive: { $ne: false } }),
     ]);
 
     sendSuccess(res, {

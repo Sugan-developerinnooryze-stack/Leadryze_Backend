@@ -113,6 +113,26 @@ userSchema.index({ loginId: 1 }, { unique: true, sparse: true });
 userSchema.index({ emailVerificationExpiry: 1 }, { expireAfterSeconds: 0, sparse: true });
 userSchema.index({ passwordResetExpiry: 1 }, { expireAfterSeconds: 0, sparse: true });
 
+// Globally unique login email across all tenants (LR-RULE-002)
+userSchema.pre('save', async function (next) {
+  if (this.email) {
+    this.email = this.email.toLowerCase().trim();
+  }
+  if (this.isModified('email')) {
+    const existing = await mongoose.model('User').findOne({
+      email: this.email,
+      _id: { $ne: this._id },
+    });
+    if (existing) {
+      const err: any = new Error('This email is already used by another user');
+      err.statusCode = 409;
+      err.code = 11000;
+      return next(err);
+    }
+  }
+  next();
+});
+
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
   this.password = await bcrypt.hash(this.password, 12);

@@ -98,7 +98,10 @@ export async function listWorkorders(tenantId: string, opts: WorkorderListOption
 
 export async function getWorkorderById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { workOrderId: id }] }
+    : { workOrderId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
   return NativeWorkorder.findOne(filter);
 }
@@ -171,7 +174,10 @@ export async function createWorkorder(data: any) {
 export async function updateWorkorder(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { workOrderId: id }] }
+    : { workOrderId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
   const doc = await NativeWorkorder.findOneAndUpdate(
     filter,
@@ -205,7 +211,10 @@ export async function updateWorkorder(id: string, tenantId: string, data: any, s
 
 export async function deleteWorkorder(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { workOrderId: id }] }
+    : { workOrderId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
   const deleted = await NativeWorkorder.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'workorders', String(deleted._id));

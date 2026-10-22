@@ -35,7 +35,10 @@ export async function listStaffs(tenantId: string, opts: StaffListOptions, branc
 
 export async function getStaffById(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeStaff.findOne({ _id: id, tenantId: tid }).populate('teamId', 'name');
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { staffId: id }] }
+    : { staffId: id };
+  return NativeStaff.findOne({ ...idFilter, tenantId: tid }).populate('teamId', 'name');
 }
 
 /** Resolves a staff doc by its business `staffId` string (e.g. "ACME-ST-0002"),
@@ -65,7 +68,10 @@ export async function updateStaff(id: string, tenantId: string, data: any, scope
   // without it, a scoped Manager could edit (or reassign onto their own
   // team) a Staff record outside their scope just by knowing its id, even
   // though they'd never see it in their own scoped list in the first place.
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { staffId: id }] }
+    : { staffId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffId');
   const updated = await NativeStaff.findOneAndUpdate(
     filter,
@@ -78,7 +84,10 @@ export async function updateStaff(id: string, tenantId: string, data: any, scope
 
 export async function deleteStaff(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const deleted = await NativeStaff.findOneAndDelete({ _id: id, tenantId: tid });
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { staffId: id }] }
+    : { staffId: id };
+  const deleted = await NativeStaff.findOneAndDelete({ ...idFilter, tenantId: tid });
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'staffs', String(deleted._id));
   return deleted;
 }

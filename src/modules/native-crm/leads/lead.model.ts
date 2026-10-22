@@ -1,6 +1,7 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 import { encryptPIIFields, hashEmail } from '../../../platform/pii/pii.service';
+import { getNextSequence } from '../shared/counter.model';
 
 // A tenant-configurable stage key (native-crm/pipeline-config) — no longer a
 // fixed union, since each tenant defines their own pipeline. Default seed
@@ -267,7 +268,26 @@ const schema = new Schema<ILeadDoc>(
     emailSearch: { type: String, index: true },
     importBatchId: { type: String, index: true },
   },
-  { timestamps: true, optimisticConcurrency: true }
+  {
+    timestamps: true,
+    optimisticConcurrency: true,
+    toJSON: {
+      transform: (_doc, ret: Record<string, any>) => {
+        delete ret.emailSearch;
+        delete ret.phoneSearch;
+        delete ret.emailDomain;
+        return ret;
+      },
+    },
+    toObject: {
+      transform: (_doc, ret: Record<string, any>) => {
+        delete ret.emailSearch;
+        delete ret.phoneSearch;
+        delete ret.emailDomain;
+        return ret;
+      },
+    },
+  }
 );
 
 // Must run BEFORE the PII-encryption hook below — email/phone are plaintext
@@ -280,8 +300,9 @@ schema.pre('save', function (next) {
     // LR-LEAD-005: exact-match blind index — see pii.service.ts's hashEmail.
     this.emailSearch = this.email ? hashEmail(this.email) : undefined;
   }
-  if (this.isModified('phone')) {
-    const digits = (this.phone ?? '').replace(/\D/g, '');
+  if (this.isModified('phone') || this.isModified('mobile')) {
+    const raw = this.phone || this.mobile;
+    const digits = (raw ?? '').replace(/\D/g, '');
     this.phoneSearch = digits || undefined;
   }
   next();
@@ -294,12 +315,7 @@ schema.pre('save', function (next) {
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();
-  const last = await (this.constructor as any)
-    .findOne({ tenantId: this.tenantId })
-    .sort({ numId: -1 })
-    .select('numId')
-    .lean();
-  this.numId    = (last?.numId ?? 0) + 1;
+  this.numId    = await getNextSequence(this.tenantId, 'leads', this.constructor as any);
   const pfx     = await resolveClientPrefix(this.tenantId);
   this.clientId = pfx;
   this.leadId   = `${pfx}-LEAD-${String(this.numId).padStart(4, '0')}`;

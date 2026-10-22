@@ -1,5 +1,6 @@
-﻿import mongoose, { Schema, Document } from 'mongoose';
+import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
+import { getNextSequence } from '../shared/counter.model';
 
 export interface IAssetDoc extends Document {
   tenantId:        mongoose.Types.ObjectId;
@@ -48,9 +49,8 @@ const schema = new Schema<IAssetDoc>(
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();
-  const last = await (this.constructor as any).findOne({ tenantId: this.tenantId }).sort({ numId: -1 }).select('numId').lean();
-  this.numId   = (last?.numId ?? 0) + 1;
-  const pfx         = await resolveClientPrefix(this.tenantId);
+  this.numId   = await getNextSequence(this.tenantId, 'assets', this.constructor as any);
+  const pfx    = await resolveClientPrefix(this.tenantId);
   this.clientId = pfx;
   this.assetId = `${pfx}-AST-${String(this.numId).padStart(4, '0')}`;
   next();

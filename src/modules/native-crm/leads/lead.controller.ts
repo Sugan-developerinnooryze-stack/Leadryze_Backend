@@ -10,12 +10,18 @@ import { NativeCustomField } from '../custom-fields/custom-field.model';
 import { rowsToCsv, sendCsvResponse, CsvColumn } from '../../../utils/csv-export.util';
 import { getSettings } from '../fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../../platform/pii/pii.service';
+import { decrypt, isEncrypted } from '../../../utils/crypto';
 import { NativeCrmLog } from '../../logs/native-crm-log.model';
 import { logAuditEvent } from '../../logs/audit-log.model';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
   return (settings as any)?.piiConfig?.find((p: any) => p.module === 'leads')?.viewRoles ?? [];
+}
+
+async function getModulePIIViewRoles(module: string, tenantId: string, branchId?: string | null): Promise<string[]> {
+  const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
+  return (settings as any)?.piiConfig?.find((p: any) => p.module === module)?.viewRoles ?? [];
 }
 import { Lead }            from './lead.model';
 import { NativeTimeline }  from '../timeline/timeline.model';
@@ -134,8 +140,11 @@ export async function create(req: AuthRequest, res: Response) {
   try {
     // LR-LEAD-001 / LR-IMP-001: exact email/phone match against an existing lead
     const duplicate = await findDuplicateContact(Lead, req.tenantId!, req.body);
-    if (req.query.skipDuplicates === 'true' && duplicate) {
-      return sendSuccess(res, { duplicate: true, duplicateWarning: duplicate, skipped: true });
+    if (duplicate && req.query.allowDuplicate !== 'true' && req.body.allowDuplicate !== true) {
+      if (req.query.skipDuplicates === 'true' || req.body.skipDuplicates === true) {
+        return sendSuccess(res, { duplicate: true, duplicateWarning: duplicate, skipped: true });
+      }
+      return sendError(res, `Duplicate lead — exact email or phone matches ${duplicate.label} (${duplicate.id})`, 409);
     }
     const item = await createLead({
       ...req.body,
@@ -154,7 +163,9 @@ export async function create(req: AuthRequest, res: Response) {
       performedBy:  req.user?.userId,
     });
     runAutomationsOnCreate(req.tenantId!, 'lead', item.toObject()).catch(() => {});
-    sendCreated(res, { ...item.toObject(), duplicateWarning: duplicate });
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeItem = transformPIIResponse(item, 'leads', req.user!.role, viewRoles);
+    sendCreated(res, { ...safeItem, duplicateWarning: duplicate });
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -206,41 +217,104 @@ export async function update(req: AuthRequest, res: Response) {
     }
 
     // LR-UI-002: Enumerate specifically updated fields instead of a generic "Lead details updated"
-    const IGNORE_FIELDS = new Set(['_id', 'tenantId', '__v', 'updatedAt', 'createdAt', 'status']);
+    // Filter out internal/system keys and fields handled by separate timeline entries (reassigned, status_changed).
+    const IGNORE_FIELDS = new Set([
+      '_id', 'tenantId', '__v', 'updatedAt', 'createdAt', 'status', 'version',
+      'lastActivityAt', 'conversionHistory', 'isConverted', 'convertedCustomerId', 'convertedAt',
+      'contactId', 'opportunityId', 'emailSearch', 'phoneSearch', 'emailDomain',
+      'leadId', 'numId', 'clientId', 'branchId', 'teamId', 'teamName', 'leadOwnerStaffId',
+    ]);
     const changedFields: string[] = [];
+    let singleOldVal = '';
+    let singleNewVal = '';
+
     if (prev) {
       const prevObj = (prev as any).toObject ? (prev as any).toObject() : prev;
       for (const [k, v] of Object.entries(req.body)) {
-        if (!IGNORE_FIELDS.has(k) && v !== undefined && String(v) !== String((prevObj as any)[k] ?? '')) {
+        if (IGNORE_FIELDS.has(k) || v === undefined) continue;
+
+        let prevVal = prevObj[k];
+        if (typeof prevVal === 'string' && isEncrypted(prevVal)) {
+          try {
+            prevVal = decrypt(prevVal);
+          } catch {
+            // Keep as-is if decrypt fails
+          }
+        }
+
+        let isChanged = false;
+        let oldStr = '';
+        let newStr = '';
+
+        if (Array.isArray(v)) {
+          const oldArr = Array.isArray(prevVal) ? prevVal.map(String).sort() : [];
+          const newArr = v.map(String).sort();
+          if (JSON.stringify(oldArr) !== JSON.stringify(newArr)) {
+            isChanged = true;
+          }
+        } else if (typeof v === 'number') {
+          if (Number(prevVal ?? 0) !== v) {
+            isChanged = true;
+            oldStr = String(prevVal ?? '');
+            newStr = String(v);
+          }
+        } else if (k === 'email' || k === 'secondaryEmail') {
+          const sOld = String(prevVal ?? '').trim().toLowerCase();
+          const sNew = String(v ?? '').trim().toLowerCase();
+          if (sOld !== sNew) {
+            isChanged = true;
+            oldStr = String(prevVal ?? '').trim();
+            newStr = String(v ?? '').trim();
+          }
+        } else if (typeof v === 'object' && v !== null) {
+          if (JSON.stringify(v) !== JSON.stringify(prevVal ?? {})) {
+            isChanged = true;
+          }
+        } else {
+          const sOld = String(prevVal ?? '').trim();
+          const sNew = String(v ?? '').trim();
+          if (sOld !== sNew) {
+            isChanged = true;
+            oldStr = sOld;
+            newStr = sNew;
+          }
+        }
+
+        if (isChanged) {
           changedFields.push(k);
+          singleOldVal = oldStr;
+          singleNewVal = newStr;
         }
       }
     }
+
     if (changedFields.length > 0) {
       const formattedFields = changedFields.map((f) => f.replace(/([A-Z])/g, ' $1').toLowerCase().trim());
+      let desc = `Updated: ${formattedFields.join(', ')}`;
+      const metadata: Record<string, any> = { changedFields: formattedFields };
+
+      if (changedFields.length === 1 && singleOldVal && singleNewVal && singleOldVal.length <= 30 && singleNewVal.length <= 30) {
+        desc = `Updated ${formattedFields[0]}: ${singleOldVal} → ${singleNewVal}`;
+        metadata.from = singleOldVal;
+        metadata.to = singleNewVal;
+      }
+
       await NativeTimeline.create({
         tenantId:     tid,
         entityModule: 'leads',
         entityId:     item._id.toString(),
         action:       'updated',
-        description:  `Updated: ${formattedFields.join(', ')}`,
+        description:  desc,
         performedBy:  req.user?.userId,
-        metadata:     { changedFields: formattedFields },
-      });
-    } else if (!isReassignment && (!req.body.status || req.body.status === prev?.status)) {
-      await NativeTimeline.create({
-        tenantId:     tid,
-        entityModule: 'leads',
-        entityId:     item._id.toString(),
-        action:       'updated',
-        description:  'Lead details updated',
-        performedBy:  req.user?.userId,
+        metadata,
       });
     }
     if (prev) {
       runAutomationsOnUpdate(req.tenantId!, 'lead', prev.toObject(), item.toObject()).catch(() => {});
     }
-    sendSuccess(res, item);
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeItem = transformPIIResponse(item, 'leads', req.user!.role, viewRoles);
+    sendSuccess(res, safeItem);
   } catch (err: any) {
     // LR-NEG-001: updateLead() now loads-then-saves (see LR-LEAD-005's fix),
     // which gives Mongoose's built-in __v optimistic-concurrency check for
@@ -257,7 +331,13 @@ export async function update(req: AuthRequest, res: Response) {
 export async function updateStage(req: AuthRequest, res: Response) {
   try {
     const prev = await getLeadRaw(req.params.id, req.tenantId!, resolveEffectiveScope(req, 'leads'));
-    const item = await updateLeadStage(req.params.id, req.tenantId!, req.body.status, resolveEffectiveScope(req, 'leads'));
+    const item = await updateLeadStage(
+      req.params.id,
+      req.tenantId!,
+      req.body.status,
+      resolveEffectiveScope(req, 'leads'),
+      { updatedAt: req.body.updatedAt, __v: req.body.__v, version: req.body.version }
+    );
     if (!item) return sendError(res, 'Lead not found', 404);
 
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
@@ -275,8 +355,14 @@ export async function updateStage(req: AuthRequest, res: Response) {
       autoLockIfConfigured(req.tenantId!, 'leads', item._id.toString(), wonKey, req.user?.userId ?? 'system').catch(() => {});
     }
     runAutomations(req.tenantId!, 'lead', item.toObject(), req.body.status).catch(() => {});
-    sendSuccess(res, item);
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeItem = transformPIIResponse(item, 'leads', req.user!.role, viewRoles);
+    sendSuccess(res, safeItem);
   } catch (err: any) {
+    if (err?.name === 'VersionError') {
+      sendError(res, 'This lead was changed by someone else — please reload and try again.', 409);
+      return;
+    }
     sendError(res, err.message, 400);
   }
 }
@@ -367,8 +453,20 @@ export async function stats(req: AuthRequest, res: Response) {
 export async function convertToContact(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
-    const result = await convertLeadToContact(tid, req.params.id, req.user?.userId ?? '');
-    sendSuccess(res, result);
+    const actor = {
+      actorId:   req.user?.userId ?? '',
+      actorName: req.user?.email ?? req.user?.userId ?? 'anonymous',
+      actorRole: req.user?.role ?? '',
+      ip:        req.ip || req.socket?.remoteAddress || 'unknown',
+      url:       req.originalUrl,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    };
+    const result = await convertLeadToContact(tid, req.params.id, req.user?.userId ?? '', actor);
+    const leadViewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const contactViewRoles = await getModulePIIViewRoles('contacts', req.tenantId!, req.branchId);
+    const safeLead = transformPIIResponse(result.lead, 'leads', req.user!.role, leadViewRoles);
+    const safeContact = transformPIIResponse(result.contact, 'contacts', req.user!.role, contactViewRoles);
+    sendSuccess(res, { lead: safeLead, contact: safeContact });
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -377,8 +475,18 @@ export async function convertToContact(req: AuthRequest, res: Response) {
 export async function convertToOpportunity(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
-    const result = await convertLeadToOpportunity(tid, req.params.id, req.user?.userId ?? '');
-    sendSuccess(res, result);
+    const actor = {
+      actorId:   req.user?.userId ?? '',
+      actorName: req.user?.email ?? req.user?.userId ?? 'anonymous',
+      actorRole: req.user?.role ?? '',
+      ip:        req.ip || req.socket?.remoteAddress || 'unknown',
+      url:       req.originalUrl,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    };
+    const result = await convertLeadToOpportunity(tid, req.params.id, req.user?.userId ?? '', actor);
+    const leadViewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeLead = transformPIIResponse(result.lead, 'leads', req.user!.role, leadViewRoles);
+    sendSuccess(res, { lead: safeLead, deal: result.deal });
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -387,8 +495,20 @@ export async function convertToOpportunity(req: AuthRequest, res: Response) {
 export async function convertToCustomer(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
-    const result = await convertLeadToCustomerSvc(tid, req.params.id, req.user?.userId ?? '');
-    sendSuccess(res, result);
+    const actor = {
+      actorId:   req.user?.userId ?? '',
+      actorName: req.user?.email ?? req.user?.userId ?? 'anonymous',
+      actorRole: req.user?.role ?? '',
+      ip:        req.ip || req.socket?.remoteAddress || 'unknown',
+      url:       req.originalUrl,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    };
+    const result = await convertLeadToCustomerSvc(tid, req.params.id, req.user?.userId ?? '', actor);
+    const leadViewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const customerViewRoles = await getModulePIIViewRoles('customers', req.tenantId!, req.branchId);
+    const safeLead = transformPIIResponse(result.lead, 'leads', req.user!.role, leadViewRoles);
+    const safeCustomer = transformPIIResponse(result.customer, 'customers', req.user!.role, customerViewRoles);
+    sendSuccess(res, { lead: safeLead, customer: safeCustomer });
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -414,8 +534,20 @@ export async function getConversions(req: AuthRequest, res: Response) {
 export async function convertLead(req: AuthRequest, res: Response) {
   try {
     const tid = new mongoose.Types.ObjectId(req.tenantId!);
-    const result = await convertLeadToCustomerSvc(tid, req.params.id, req.user?.userId ?? '');
-    sendSuccess(res, result);
+    const actor = {
+      actorId:   req.user?.userId ?? '',
+      actorName: req.user?.email ?? req.user?.userId ?? 'anonymous',
+      actorRole: req.user?.role ?? '',
+      ip:        req.ip || req.socket?.remoteAddress || 'unknown',
+      url:       req.originalUrl,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    };
+    const result = await convertLeadToCustomerSvc(tid, req.params.id, req.user?.userId ?? '', actor);
+    const leadViewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const customerViewRoles = await getModulePIIViewRoles('customers', req.tenantId!, req.branchId);
+    const safeLead = transformPIIResponse(result.lead, 'leads', req.user!.role, leadViewRoles);
+    const safeCustomer = transformPIIResponse(result.customer, 'customers', req.user!.role, customerViewRoles);
+    sendSuccess(res, { lead: safeLead, customer: safeCustomer });
   } catch (err: any) {
     sendError(res, err.message, 400);
   }

@@ -14,6 +14,8 @@ import { transformPIIResponse } from '../../../platform/pii/pii.service';
 import { resolveEffectiveScope } from '../shared/data-scope';
 import { logTimeline } from '../timeline/timeline.service';
 import { logAuditEvent } from '../../logs/audit-log.model';
+import { findDuplicateContact } from '../shared/duplicate-check';
+import { NativeCustomer } from './customer.model';
 
 async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
   const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
@@ -44,6 +46,11 @@ export async function getOne(req: AuthRequest, res: Response) {
 
 export async function create(req: AuthRequest, res: Response) {
   try {
+    // LR-C4-IMP-005 / LR-IMP-001: exact email/phone duplicate check
+    const duplicate = await findDuplicateContact(NativeCustomer, req.tenantId!, req.body);
+    if (duplicate && req.query.allowDuplicate !== 'true' && req.body.allowDuplicate !== true) {
+      return sendError(res, `Duplicate customer — exact email or phone matches ${duplicate.label} (${duplicate.id})`, 409);
+    }
     const item = await createCustomer({
       ...req.body,
       tenantId:  req.tenantId!,
@@ -52,7 +59,9 @@ export async function create(req: AuthRequest, res: Response) {
     });
     logTimeline(req.tenantId!, 'customer', String((item as any)._id), 'created', `Customer "${(item as any).name}" created`, req.user?.userId,
       { status: (item as any).status }).catch(() => {});
-    sendCreated(res, item);
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeItem = transformPIIResponse(item, 'customers', req.user!.role, viewRoles);
+    sendCreated(res, safeItem);
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -70,7 +79,9 @@ export async function update(req: AuthRequest, res: Response) {
       req.user?.userId,
       statusChanged ? { previousStatus: (prev as any).status, newStatus: req.body.status } : undefined,
     ).catch(() => {});
-    sendSuccess(res, item);
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeItem = transformPIIResponse(item, 'customers', req.user!.role, viewRoles);
+    sendSuccess(res, safeItem);
   } catch (err: any) {
     sendError(res, err.message, 400);
   }

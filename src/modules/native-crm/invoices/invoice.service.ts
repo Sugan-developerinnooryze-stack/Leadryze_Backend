@@ -31,12 +31,26 @@ const INVOICE_DATE_FIELDS = new Set(['dueDate', 'createdAt']);
  * against a hardcoded string. Applies to every caller (this service's own
  * createInvoice, used by both the chatbot and the existing Invoices UI),
  * not a chatbot-only check. */
-async function assertWorkOrderCompleted(tenantId: string, workOrderId: string): Promise<void> {
-  const wo = await NativeWorkorder.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), workOrderId }).select('status').lean();
+async function assertWorkOrderEligibleForInvoice(tenantId: string, workOrderId: string, customerId?: string, allowDuplicate = false): Promise<void> {
+  const tid = new mongoose.Types.ObjectId(tenantId);
+  const wo = await NativeWorkorder.findOne({ tenantId: tid, workOrderId }).select('status customerId').lean();
   if (!wo) throw new Error(`Work Order "${workOrderId}" was not found`);
+  if (customerId && (wo as any).customerId && (wo as any).customerId !== customerId) {
+    throw new Error(`Work Order "${workOrderId}" belongs to customer "${(wo as any).customerId}", not "${customerId}"`);
+  }
   const completedKey = await getOutcomeStageKey(tenantId, 'workorder', 'completed', 'completed');
   if ((wo as any).status !== completedKey) {
     throw new Error(`Work Order "${workOrderId}" has not been completed yet (current status: "${(wo as any).status}") — an invoice can only be created once it's completed`);
+  }
+  if (!allowDuplicate) {
+    const existingInv = await NativeInvoice.findOne({
+      tenantId: tid,
+      workOrderId,
+      status: { $ne: 'cancelled' },
+    }).select('invoiceId status').lean();
+    if (existingInv) {
+      throw new Error(`Work Order "${workOrderId}" is already invoiced on invoice "${(existingInv as any).invoiceId}" (status: ${(existingInv as any).status}). Duplicate invoicing requires an explicit override.`);
+    }
   }
 }
 
@@ -66,7 +80,9 @@ export async function listInvoices(tenantId: string, opts: InvoiceListOptions, b
     }
   }
   const dateField = opts.dateField && INVOICE_DATE_FIELDS.has(opts.dateField) ? opts.dateField : 'createdAt';
-  applyDateRangeToFilter(filter, dateField, resolveDateRange(opts.range, opts.dateFrom, opts.dateTo));
+  const from = (opts.dateFrom || opts.customFrom) as string | undefined;
+  const to = (opts.dateTo || opts.customTo) as string | undefined;
+  applyDateRangeToFilter(filter, dateField, resolveDateRange(opts.range, from, to));
   if (opts.filters) {
     const catalog = await getInvoiceFilterCatalog(tenantId, branchId);
     applyDynamicFilters(filter, opts.filters, catalog);
@@ -81,7 +97,10 @@ export async function listInvoices(tenantId: string, opts: InvoiceListOptions, b
 
 export async function getInvoiceById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { invoiceId: id }] }
+    : { invoiceId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const invoice = await NativeInvoice.findOne(filter);
   if (invoice) {
@@ -95,12 +114,6 @@ export async function getInvoiceById(id: string, tenantId: string, scope?: DataS
       invoice.paidAmount = totalPaid;
       const totalDue = Number(invoice.servicesAmountWithTax) || 0;
       invoice.paid = totalDue > 0 && totalPaid >= totalDue;
-      if (invoice.paid && invoice.status !== 'paid') {
-        invoice.status = 'paid';
-      } else if (!invoice.paid && invoice.status === 'paid') {
-        invoice.status = 'sent';
-      }
-      await invoice.save();
     }
   }
   return invoice;
@@ -108,7 +121,14 @@ export async function getInvoiceById(id: string, tenantId: string, scope?: DataS
 
 export async function createInvoice(data: any) {
   await assertValidStatus(String(data.tenantId), data.status);
-  if (data.workOrderId) await assertWorkOrderCompleted(String(data.tenantId), data.workOrderId);
+  if (data.workOrderId) {
+    await assertWorkOrderEligibleForInvoice(
+      String(data.tenantId),
+      data.workOrderId,
+      data.customerId ? String(data.customerId) : undefined,
+      Boolean(data.allowDuplicateWorkOrderInvoice)
+    );
+  }
   const services: any[]  = data.services ?? [];
   const parts: any[]     = data.parts ?? [];
   const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
@@ -153,6 +173,7 @@ export async function createInvoice(data: any) {
     partsAmount:           prtTotal,
     servicesAmount,
     servicesAmountWithTax,
+    priorStatus:           data.status && data.status !== 'paid' ? data.status : 'draft',
   });
   const mongoId = (doc._id as any).toString();
   // Independent checks, not if/else-if — same fix and same reason as
@@ -180,8 +201,14 @@ export async function createInvoice(data: any) {
 export async function updateInvoice(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { invoiceId: id }] }
+    : { invoiceId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
+  if (data.status && data.status !== 'paid') {
+    data.priorStatus = data.status;
+  }
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined || data.gstPercentage !== undefined) {
     const existing = await NativeInvoice.findOne(filter).lean();
     const services  = data.services        ?? (existing as any)?.services        ?? [];
@@ -233,7 +260,10 @@ export async function updateInvoice(id: string, tenantId: string, data: any, sco
 
 export async function deleteInvoice(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { invoiceId: id }] }
+    : { invoiceId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeInvoice.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'invoices', String(deleted._id));

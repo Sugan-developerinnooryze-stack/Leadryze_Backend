@@ -30,7 +30,10 @@ export async function listServices(tenantId: string, opts: ServiceListOptions, b
 
 export async function getServiceById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { serviceId: id }] }
+    : { serviceId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativeService.findOne(filter).populate('categoryId', 'name color icon');
 }
@@ -43,7 +46,10 @@ export async function createService(data: any) {
 
 export async function updateService(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { serviceId: id }] }
+    : { serviceId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeService.findOneAndUpdate(
     filter,
@@ -56,7 +62,10 @@ export async function updateService(id: string, tenantId: string, data: any, sco
 
 export async function deleteService(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { serviceId: id }] }
+    : { serviceId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeService.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'services', String(deleted._id));

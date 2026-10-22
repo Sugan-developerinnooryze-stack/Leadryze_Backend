@@ -10,6 +10,7 @@ export const callSchema = new Schema(
     duration:    { type: Number },
     callStatus:  { type: String, enum: ['planned', 'completed', 'missed', 'cancelled'], default: 'planned' },
     date:        { type: Date },
+    timezone:    { type: String, trim: true },
     notes:       { type: String },
     tags:        [{ type: String }],
     customFields: { type: Schema.Types.Mixed },

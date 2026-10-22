@@ -33,7 +33,10 @@ export async function listSites(tenantId: string, opts: SiteListOptions, branchI
 
 export async function getSiteById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { siteId: id }] }
+    : { siteId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   return NativeSite.findOne(filter).populate('customerId', 'name phone email');
 }
@@ -46,7 +49,10 @@ export async function createSite(data: any) {
 
 export async function updateSite(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { siteId: id }] }
+    : { siteId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeSite.findOneAndUpdate(
     filter,
@@ -59,7 +65,10 @@ export async function updateSite(id: string, tenantId: string, data: any, scope?
 
 export async function deleteSite(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { siteId: id }] }
+    : { siteId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const deleted = await NativeSite.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'sites', String(deleted._id));

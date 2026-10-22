@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { logger } from '../../utils/logger';
 import { resolveRecipient } from './recipient-resolver';
 import { writeLog } from './email-log.service';
@@ -5,6 +6,8 @@ import { getOrCreateSettings } from '../native-crm/notification-settings/notific
 import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { Tenant } from '../tenants/tenant.model';
+import { FSSettings } from '../native-crm/fs-settings/fs-settings.model';
+import { Branch } from '../native-crm/branches/branch.model';
 // This module only ever handles the 4 "scheduled item" sources — the wider
 // EmailLogSourceModule (which also covers automation-rule sources like
 // 'lead'/'deal'/'quotation') is a storage-level type, not this file's scope.
@@ -29,23 +32,85 @@ function titleOf(sourceModule: ConfirmationSourceModule, r: SourceRecord): strin
   return String(r.title ?? `your ${NOUN[sourceModule]}`);
 }
 
-// `timeZone` matters specifically for meetings: without it, toLocaleString()
-// falls back to whatever system timezone the Node process happens to be
-// running in (Render's containers default to UTC, but a local dev machine —
-// or any future host — can be set to anything), which has nothing to do
-// with the tenant's own configured booking timezone. A meeting's startDate
-// is a real UTC instant; formatting it without the tenant's timezone can
-// silently show the wrong wall-clock time to the recipient (confirmed live:
-// a UTC-configured tenant's 10:00 AM booking rendered as 3:30 PM on an
-// IST-local machine — exactly the +5:30 offset). Call/task/ticket records
-// have no per-tenant timezone concept to draw from, so they're left exactly
-// as before — this fix is scoped to what's actually wrong.
-function whenFmt(sourceModule: ConfirmationSourceModule, r: SourceRecord, timeZone?: string): string | null {
+/**
+ * LR-PL-NOTIF-001: Resolve decided timezone in order of priority:
+ * 1. Record explicit timezone (e.g. call.timezone, meeting.timezone)
+ * 2. Branch-specific settings / timezone if linked to branch
+ * 3. Field Service business settings (FSSettings.timezone, e.g. Asia/Kolkata)
+ * 4. Tenant settings or widget booking config (Tenant.settings.timezone)
+ * 5. Fallback: 'Asia/Kolkata'
+ */
+export async function resolveEffectiveTimezone(
+  tenantId: string,
+  record?: SourceRecord | null,
+): Promise<string> {
+  if (record?.timezone && typeof record.timezone === 'string' && record.timezone.trim()) {
+    return record.timezone.trim();
+  }
+
+  try {
+    const tid = new mongoose.Types.ObjectId(tenantId);
+    const branchId = (record?.branchId as string) || null;
+
+    if (branchId) {
+      try {
+        const bid = new mongoose.Types.ObjectId(branchId);
+        const branchSettings = await FSSettings.findOne({ tenantId: tid, branchId: bid }).select('timezone').lean();
+        if (branchSettings?.timezone && branchSettings.timezone.trim() && branchSettings.timezone !== 'UTC') {
+          return branchSettings.timezone.trim();
+        }
+        const branchDoc = await Branch.findById(bid).select('timezone').lean();
+        if (branchDoc?.timezone && branchDoc.timezone.trim()) {
+          return branchDoc.timezone.trim();
+        }
+      } catch {}
+    }
+
+    const fsSettings = await FSSettings.findOne({ tenantId: tid, branchId: null }).select('timezone').lean();
+    if (fsSettings?.timezone && fsSettings.timezone.trim() && fsSettings.timezone !== 'UTC') {
+      return fsSettings.timezone.trim();
+    }
+
+    const tenantDoc = await Tenant.findById(tid).select('settings.timezone widget.booking.timezone').lean();
+    if (tenantDoc?.settings?.timezone && tenantDoc.settings.timezone.trim() && tenantDoc.settings.timezone !== 'UTC') {
+      return tenantDoc.settings.timezone.trim();
+    }
+    if (tenantDoc?.widget?.booking?.timezone && tenantDoc.widget.booking.timezone.trim() && tenantDoc.widget.booking.timezone !== 'UTC') {
+      return tenantDoc.widget.booking.timezone.trim();
+    }
+    if (tenantDoc?.settings?.timezone && tenantDoc.settings.timezone.trim()) {
+      return tenantDoc.settings.timezone.trim();
+    }
+  } catch (err) {
+    logger.warn('Failed to resolve effective timezone, using fallback', { tenantId, err });
+  }
+
+  return 'Asia/Kolkata';
+}
+
+/**
+ * LR-PL-NOTIF-001: Format scheduled times in the decided timezone and print the zone name (rule LR-C3-DEC-009).
+ */
+export function whenFmt(sourceModule: ConfirmationSourceModule, r: SourceRecord, timeZone: string): string | null {
   const raw = sourceModule === 'call' ? r.date : sourceModule === 'meeting' ? r.startDate : sourceModule === 'task' ? r.dueDate : null;
   if (!raw) return null;
   const d = new Date(raw as string);
   if (isNaN(d.getTime())) return null;
-  return d.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short', ...(timeZone ? { timeZone } : {}) });
+  const tz = timeZone || 'Asia/Kolkata';
+  const base = d.toLocaleString('en-IN', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: tz,
+  });
+  try {
+    const tzPart = new Intl.DateTimeFormat('en-IN', { timeZone: tz, timeZoneName: 'short' })
+      .formatToParts(d)
+      .find((p) => p.type === 'timeZoneName')?.value;
+    const tzLabel = tzPart ? `${tzPart} (${tz})` : `(${tz})`;
+    return `${base} ${tzLabel}`;
+  } catch {
+    return `${base} (${tz})`;
+  }
 }
 
 export function isPastOrInactiveStatus(sourceModule: ConfirmationSourceModule, record: SourceRecord): boolean {
@@ -81,6 +146,8 @@ export async function sendOnCreateConfirmation(
   record: SourceRecord,
 ): Promise<void> {
   try {
+    // LR-PL-NOTIF-002: Internal tasks must never send customer confirmations
+    if (sourceModule === 'task') return;
     const settings = await getOrCreateSettings(tenantId);
     if (!settings.sendOnCreateConfirmation) return;
     // LR-R2-NOTIF-001: Logging a completed/missed/cancelled call or past activity
@@ -105,32 +172,29 @@ export async function sendOnCreateConfirmation(
       return;
     }
 
-    // LR-R2-ACT-001: Resolve timezone from record, tenant settings, or booking config
-    let effectiveTimezone: string | undefined = undefined;
-    if (sourceModule === 'meeting') {
-      const tenantDoc = await Tenant.findById(tenantId).select('settings.timezone widget.booking.timezone').lean();
-      effectiveTimezone = (record.timezone as string) || tenantDoc?.settings?.timezone || tenantDoc?.widget?.booking?.timezone || 'Asia/Kolkata';
-    }
+    // LR-PL-NOTIF-001: Resolve timezone from record, branch, FSSettings, tenant settings, or booking config
+    const effectiveTimezone: string = await resolveEffectiveTimezone(tenantId, record);
+
     const when = whenFmt(sourceModule, record, effectiveTimezone);
     const whenLine = when ? ` scheduled for <strong>${when}</strong>` : '';
     const subject = `Confirmed: ${title} — new ${noun}`;
 
-    // Meeting-specific enrichment — team/assigned staff/timezone/service are
-    // all real fields already on the Meeting document (createMeeting()
-    // passes the full saved doc as `record`), just never surfaced in this
-    // shared, generic confirmation email before now.
-    let meetingDetailLines = '';
+    // Activity enrichment: display timezone & meeting/call details
+    let activityDetailLines = '';
+    const details: string[] = [];
     if (sourceModule === 'meeting') {
-      const details: string[] = [];
       if (record.teamName) details.push(`<strong>Team:</strong> ${record.teamName}`);
       if (record.assignedStaffName) details.push(`<strong>With:</strong> ${record.assignedStaffName}`);
       const topicMatch = typeof record.notes === 'string' ? record.notes.match(/Topic:\s*(.+)$/) : null;
       if (topicMatch) details.push(`<strong>Reason:</strong> ${topicMatch[1]}`);
       if (effectiveTimezone) details.push(`<strong>Timezone:</strong> ${effectiveTimezone}`);
-      if (details.length) meetingDetailLines = `<p>${details.join('<br/>')}</p>`;
+    } else if (sourceModule === 'call') {
+      if (record.duration) details.push(`<strong>Duration:</strong> ${record.duration} mins`);
+      if (effectiveTimezone) details.push(`<strong>Timezone:</strong> ${effectiveTimezone}`);
     }
+    if (details.length) activityDetailLines = `<p>${details.join('<br/>')}</p>`;
 
-    const htmlContent = `<p>Hi <strong>${recipient.name}</strong>,</p><p>This confirms a new ${noun} — <strong>${title}</strong>${whenLine}.</p>${meetingDetailLines}<p>We'll follow up ahead of time if it's coming up soon.</p><p>Best regards,<br/>LeadRyze AI</p>`;
+    const htmlContent = `<p>Hi <strong>${recipient.name}</strong>,</p><p>This confirms a new ${noun} — <strong>${title}</strong>${whenLine}.</p>${activityDetailLines}<p>We'll follow up ahead of time if it's coming up soon.</p><p>Best regards,<br/>LeadRyze AI</p>`;
     const smsText = `Hi ${recipient.name}, confirming your new ${noun} "${title}"${when ? ` on ${when}` : ''}.`;
 
     if (settings.emailEnabled && recipient.email) {

@@ -2,6 +2,13 @@ import { Response } from 'express';
 import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError } from '../../../utils/response';
 import { importLeadsCsv, listTriageItems, resolveTriageItem } from './lead-import.service';
+import { getSettings } from '../fs-settings/fs-settings.service';
+import { transformPIIResponse } from '../../../platform/pii/pii.service';
+
+async function getPIIViewRoles(tenantId: string, branchId?: string | null): Promise<string[]> {
+  const settings = await getSettings(tenantId, branchId ?? null).catch(() => null);
+  return (settings as any)?.piiConfig?.find((p: any) => p.module === 'leads')?.viewRoles ?? [];
+}
 
 export async function importCsv(req: AuthRequest, res: Response) {
   try {
@@ -19,7 +26,12 @@ export async function importCsv(req: AuthRequest, res: Response) {
 export async function listTriage(req: AuthRequest, res: Response) {
   try {
     const items = await listTriageItems(req.tenantId!, req.query.batchId as string | undefined);
-    sendSuccess(res, items);
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    const safeItems = items.map((item: any) => ({
+      ...item,
+      rawRow: transformPIIResponse(item.rawRow, 'leads', req.user!.role, viewRoles),
+    }));
+    sendSuccess(res, safeItems);
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

@@ -56,7 +56,16 @@ export async function remove(req: AuthRequest, res: Response) {
     runAutomationsOnDelete(req.tenantId!, 'ticket', record as any).catch(() => {});
     logAuditEvent('ticket.deleted',
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId: req.tenantId!, target: 'Ticket', targetId: req.params.id, detail: { before: { subject: record.subject, priority: record.priority, ticketStatus: record.ticketStatus } } },
+      {
+        tenantId: req.tenantId!,
+        target: 'Ticket',
+        targetId: (record as any).ticketId ?? req.params.id,
+        detail: {
+          ticketId: (record as any).ticketId,
+          subject: record.subject,
+          before: { subject: record.subject, priority: record.priority, ticketStatus: record.ticketStatus },
+        },
+      },
     );
     sendSuccess(res, null, 'Ticket deleted');
   } catch { sendError(res, 'Failed to delete ticket', 500); }

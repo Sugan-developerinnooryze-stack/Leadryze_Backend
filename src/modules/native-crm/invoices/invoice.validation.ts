@@ -21,6 +21,7 @@ export const createInvoiceSchema = z.object({
   status:                z.string().trim().min(1).optional(),
   notes:                 z.string().optional(),
   termsAndConditions:    z.string().optional(),
+  allowDuplicateWorkOrderInvoice: z.boolean().optional(),
   customFields,
 });
 

@@ -6,6 +6,7 @@ export interface IMeeting {
   title: string;
   startDate?: Date;
   endDate?: Date;
+  timezone?: string;
   location?: string;
   attendees?: string[];
   meetingStatus: 'scheduled' | 'completed' | 'cancelled';
@@ -28,6 +29,7 @@ export interface CreateMeetingDTO {
   title: string;
   startDate?: string;
   endDate?: string;
+  timezone?: string;
   location?: string;
   attendees?: string[];
   meetingStatus?: string;

@@ -8,7 +8,7 @@ export const createContactSchema = z.object({
   firstName:      z.string().trim().min(1).max(100),
   lastName:       z.string().trim().min(1).max(100),
   email:          z.string().trim().email(),
-  phone:          z.string().trim().optional(),
+  phone:          z.preprocess((v) => (v != null && typeof v === 'number' ? String(v) : v), z.string().trim().optional()),
   company:        z.string().trim().optional(),
   companyId:      z.string().trim().optional(),
   jobTitle:       z.string().trim().optional(),
@@ -22,6 +22,16 @@ export const createContactSchema = z.object({
   customFields,
 });
 
+// LR-C4-LEAD-003: On update, allow masked email and phone so Manager/Agent can save records
+const isMaskedPiiString = (v: string) => typeof v === 'string' && (v.includes('*') || /X{2,}/.test(v));
+
+const updateEmailSchema = z.string().trim().refine(
+  (v) => !v || isMaskedPiiString(v) || z.string().email().safeParse(v).success,
+  { message: 'Invalid email address' }
+).optional();
+
+const updatePhoneSchema = z.string().trim().optional();
+
 // LR-NEG-001: stale-save/conflict detection (contact.service.ts's
 // updateContact) reads dto.updatedAt/dto.__v — without declaring them here,
 // validate.middleware.ts's req.body = schema.parse(req.body) silently
@@ -30,6 +40,8 @@ export const createContactSchema = z.object({
 // "fix" claimed this worked, but only because whatever verified it called
 // the service function directly, bypassing this exact stripping).
 export const updateContactSchema = createContactSchema.partial().extend({
+  email: updateEmailSchema,
+  phone: updatePhoneSchema,
   updatedAt: z.string().optional(),
   __v: z.number().optional(),
 });

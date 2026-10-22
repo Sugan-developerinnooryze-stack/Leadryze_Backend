@@ -249,7 +249,7 @@ export async function provisionTenant(input: ProvisionTenantInput): Promise<Prov
   const temporaryPassword = generatePassword();
 
   const user = await User.create({
-    email: input.adminEmail.toLowerCase(),
+    email: input.adminEmail.toLowerCase().trim(),
     password: temporaryPassword, // hashed by the model's pre-save hook, never written raw
     firstName: input.adminFirstName,
     lastName: input.adminLastName,

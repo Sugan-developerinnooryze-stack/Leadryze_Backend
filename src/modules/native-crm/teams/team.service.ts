@@ -30,7 +30,10 @@ export async function listTeams(tenantId: string, opts: TeamListOptions, branchI
 
 export async function getTeamById(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeTeam.findOne({ _id: id, tenantId: tid });
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { teamId: id }] }
+    : { teamId: id };
+  return NativeTeam.findOne({ ...idFilter, tenantId: tid });
 }
 
 /** Case-insensitive duplicate check within the tenant — "Team A" and
@@ -39,7 +42,7 @@ export async function getTeamById(id: string, tenantId: string) {
  * updateTeam() re-use this without flagging a team against its own name. */
 async function assertUniqueTeamName(tenantId: mongoose.Types.ObjectId, name: string, excludeId?: string): Promise<void> {
   const filter: any = { tenantId, name: new RegExp(`^${name.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') };
-  if (excludeId) filter._id = { $ne: excludeId };
+  if (excludeId && mongoose.isValidObjectId(excludeId)) filter._id = { $ne: new mongoose.Types.ObjectId(excludeId) };
   const existing = await NativeTeam.findOne(filter).select('_id').lean();
   if (existing) throw new Error(`A team named "${name.trim()}" already exists`);
 }
@@ -53,6 +56,9 @@ export async function createTeam(data: any) {
 
 export async function updateTeam(id: string, tenantId: string, data: any, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { teamId: id }] }
+    : { teamId: id };
   // Same row-level enforcement listTeams already applies to the list view —
   // without this, a scoped Manager who knows/guesses another team's id could
   // reassign its managerUserId onto themselves (or unassign it) via a direct
@@ -63,7 +69,7 @@ export async function updateTeam(id: string, tenantId: string, data: any, scope?
   if (scope && scope.kind !== 'all' && !scope.teamIds.includes(id)) return null;
   if (data.name) await assertUniqueTeamName(tid, data.name, id);
   const updated = await NativeTeam.findOneAndUpdate(
-    { _id: id, tenantId: tid },
+    { ...idFilter, tenantId: tid },
     data,
     { new: true, runValidators: true }
   );
@@ -73,7 +79,10 @@ export async function updateTeam(id: string, tenantId: string, data: any, scope?
 
 export async function deleteTeam(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const deleted = await NativeTeam.findOneAndDelete({ _id: id, tenantId: tid });
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { teamId: id }] }
+    : { teamId: id };
+  const deleted = await NativeTeam.findOneAndDelete({ ...idFilter, tenantId: tid });
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'teams', String(deleted._id));
   return deleted;
 }
@@ -89,7 +98,10 @@ export async function deleteTeam(id: string, tenantId: string) {
  * managed teams). */
 export async function getTeamStats(id: string, tenantId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const team = await NativeTeam.findOne({ _id: id, tenantId: tid }).lean();
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { teamId: id }] }
+    : { teamId: id };
+  const team = await NativeTeam.findOne({ ...idFilter, tenantId: tid }).lean();
   if (!team) return null;
 
   const roster = await NativeStaff.find({ tenantId: tid, teamId: new mongoose.Types.ObjectId(id), status: 'active' })

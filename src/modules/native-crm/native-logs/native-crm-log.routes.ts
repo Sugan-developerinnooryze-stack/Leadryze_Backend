@@ -4,6 +4,7 @@ import { AuthRequest } from '../../../types';
 import { sendSuccess, sendError } from '../../../utils/response';
 import { requirePermission } from '../../../middlewares/auth.middleware';
 import { NativeCrmLog } from '../../logs/native-crm-log.model';
+import { sanitizeAuditData } from '../../../platform/pii/pii.service';
 
 const router = Router();
 
@@ -43,8 +44,15 @@ router.get('/', requirePermission('logs.view'), async (req: AuthRequest, res: Re
       NativeCrmLog.countDocuments(filter),
     ]);
 
+    const sanitizedItems = items.map((item: any) => ({
+      ...item,
+      before:  sanitizeAuditData(item.before),
+      after:   sanitizeAuditData(item.after),
+      changes: sanitizeAuditData(item.changes),
+    }));
+
     sendSuccess(res, {
-      items,
+      items: sanitizedItems,
       meta: {
         total,
         page,

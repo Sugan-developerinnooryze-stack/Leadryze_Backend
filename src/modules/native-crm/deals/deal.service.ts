@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { Deal } from './deal.model';
 import { CreateDealDTO, UpdateDealDTO } from './deal.types';
 import { PaginatedResult, ListOptions } from '../native-crm.types';
-import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
+import { isValidStageKey, getOutcomeStageKey, getOrCreateStages } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
@@ -13,6 +13,7 @@ import { IFlowCondition } from '../automation-rules/automation-rule.model';
 import { NativeStaff } from '../staffs/staff.model';
 import { Contact } from '../contacts/contact.model';
 import { Company } from '../companies/company.model';
+import { getSettings } from '../fs-settings/fs-settings.service';
 
 async function enrichDealsWithContactAndCompany(tenantId: mongoose.Types.ObjectId, deals: any[]): Promise<any[]> {
   if (!deals || deals.length === 0) return deals;
@@ -132,7 +133,10 @@ export async function listDeals(tenantId: string, opts: ListOptions = {}, branch
 
 export async function getDealById(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
+    : { clientId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   const deal = await Deal.findOne(filter).lean();
   if (!deal) return null;
@@ -164,6 +168,14 @@ export async function createDeal(tenantId: string, dto: CreateDealDTO) {
     }).select('name').lean();
     if (company) dto.companyName = company.name || '';
   }
+  if (!dto.currency) {
+    try {
+      const fsSettings = await getSettings(tenantId, dto.branchId);
+      dto.currency = fsSettings?.currency || 'INR';
+    } catch {
+      dto.currency = 'INR';
+    }
+  }
   const created = await Deal.create({ tenantId: tid, ...dto });
   indexNativeSearchRecord(tenantId, 'native', 'deals', created.toObject(), created.title);
   return created;
@@ -173,7 +185,10 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   await assertValidStage(tenantId, dto.stage);
   await assertValidOwner(tenantId, dto.assignedStaffId);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
+    : { clientId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   // LR-NEG-001: load-then-save instead of findOneAndUpdate() gets Mongoose's
   // built-in __v optimistic-concurrency check for free — two concurrent
@@ -181,9 +196,14 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   const doc = await Deal.findOne(filter);
   if (!doc) return null;
 
-  // LR-NEG-001: Detect stale concurrent save (lost update prevention)
+  // LR-NEG-001: Detect stale concurrent save (lost update prevention) — version token mandatory
   const clientUpdatedAt = (dto as any).updatedAt ? new Date((dto as any).updatedAt).getTime() : null;
   const clientVersion = (dto as any).__v !== undefined ? Number((dto as any).__v) : ((dto as any).version !== undefined ? Number((dto as any).version) : null);
+  if (clientVersion === null && clientUpdatedAt === null) {
+    const err: any = new Error('This deal was changed by someone else — please reload and try again.');
+    err.name = 'VersionError';
+    throw err;
+  }
   if (clientVersion !== null && doc.__v !== undefined && doc.__v !== clientVersion) {
     const err: any = new Error('This deal was changed by someone else — please reload and try again.');
     err.name = 'VersionError';
@@ -229,7 +249,10 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
 
 export async function deleteDeal(tenantId: string, id: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: Record<string, unknown> = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
+    : { clientId: id };
+  const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   const deleted = await Deal.findOneAndDelete(filter).lean();
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'deals', String(deleted._id));
@@ -264,16 +287,27 @@ export async function getDealStats(tenantId: string, scope?: DataScope, range?: 
   const sparklineFilter: Record<string, unknown> = { tenantId: tid, createdAt: { $gte: sparklineWindowStart() } };
   applyDataScopeToFilter(sparklineFilter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
 
+  // LR-C4-DASH-003: "Active Deals" KPI card counts open/active deals only,
+  // excluding terminal/closed stages (e.g. closed_won, closed_lost).
+  const stages = await getOrCreateStages(tenantId, 'deal');
+  const closedStageKeys = stages
+    .filter((s) => s.isTerminal || s.outcome === 'won' || s.outcome === 'lost')
+    .map((s) => s.key);
+  const closedKeys = closedStageKeys.length > 0 ? closedStageKeys : ['closed_won', 'closed_lost'];
+  const activeFilter = { ...filter, stage: { $nin: closedKeys } };
+  const priorActiveFilter = { ...priorFilter, stage: { $nin: closedKeys } };
+  const sparklineActiveFilter = { ...sparklineFilter, stage: { $nin: closedKeys } };
+
   const [total, allTimeTotal, byStage, totalValue, allTimeTotalValue, priorTotal, priorTotalValue, dailyRaw] = await Promise.all([
-    Deal.countDocuments(filter),
+    Deal.countDocuments(activeFilter),
     Deal.countDocuments(allTimeFilter),
     Deal.aggregate([{ $match: filter }, { $group: { _id: '$stage', count: { $sum: 1 } } }]),
     Deal.aggregate([{ $match: revenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     Deal.aggregate([{ $match: allTimeRevenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-    priorRange ? Deal.countDocuments(priorFilter) : Promise.resolve(null),
+    priorRange ? Deal.countDocuments(priorActiveFilter) : Promise.resolve(null),
     priorRange ? Deal.aggregate([{ $match: priorRevenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]) : Promise.resolve(null),
     Deal.aggregate([
-      { $match: sparklineFilter },
+      { $match: sparklineActiveFilter },
       { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
     ]),
   ]);

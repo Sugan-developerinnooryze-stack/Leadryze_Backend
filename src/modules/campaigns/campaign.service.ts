@@ -16,10 +16,6 @@ export async function createCampaign(
 
 export async function getCampaigns(tenantId: string, query: Record<string, unknown>) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const existingCount = await Campaign.countDocuments({ tenantId: tid });
-  if (existingCount === 0) {
-    await seedDefaultCampaigns(tenantId);
-  }
 
   const { page, limit, sort, order } = parsePagination(query);
   const skip = buildSkip(page, limit);
@@ -50,96 +46,96 @@ export async function seedDefaultCampaigns(tenantId: string, userId?: string): P
 
   const uid = userId ? new mongoose.Types.ObjectId(userId) : new mongoose.Types.ObjectId();
   const now = new Date();
+  const zeroStats = { total: 0, sent: 0, delivered: 0, opened: 0, clicked: 0, replied: 0, failed: 0 };
 
   const seeds: Partial<ICampaign>[] = [
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'Q4 Product Launch Announcement',
+      name: '[Sample] Q4 Product Launch Announcement',
       type: 'broadcast',
       channel: 'email',
-      status: 'completed',
+      status: 'draft',
       audience: { type: 'all_customers', filter: {} },
-      stats: { total: 850, sent: 850, delivered: 832, opened: 468, clicked: 184, replied: 42, failed: 18 },
-      createdAt: new Date(now.getTime() - 14 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'VIP Customer Loyalty Offer',
+      name: '[Sample] VIP Customer Loyalty Offer',
       type: 'broadcast',
       channel: 'whatsapp',
-      status: 'running',
+      status: 'draft',
       audience: { type: 'filtered', filter: { tags: 'vip' } },
-      stats: { total: 320, sent: 280, delivered: 275, opened: 260, clicked: 95, replied: 88, failed: 5 },
-      createdAt: new Date(now.getTime() - 3 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'Monthly Appointment Reminder Drip',
+      name: '[Sample] Monthly Appointment Reminder Drip',
       type: 'drip',
       channel: 'sms',
-      status: 'running',
+      status: 'draft',
       audience: { type: 'all_customers', filter: {} },
-      stats: { total: 540, sent: 490, delivered: 482, opened: 410, clicked: 72, replied: 65, failed: 8 },
-      createdAt: new Date(now.getTime() - 7 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'New Client Onboarding Sequence',
+      name: '[Sample] New Client Onboarding Sequence',
       type: 'followup',
       channel: 'email',
-      status: 'running',
+      status: 'draft',
       audience: { type: 'filtered', filter: { status: 'new' } },
-      stats: { total: 410, sent: 395, delivered: 390, opened: 245, clicked: 110, replied: 35, failed: 5 },
-      createdAt: new Date(now.getTime() - 5 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'Weekend Flash Sale WhatsApp Blast',
+      name: '[Sample] Weekend Flash Sale WhatsApp Blast',
       type: 'broadcast',
       channel: 'whatsapp',
-      status: 'completed',
+      status: 'draft',
       audience: { type: 'all_customers', filter: {} },
-      stats: { total: 650, sent: 650, delivered: 642, opened: 610, clicked: 230, replied: 145, failed: 8 },
-      createdAt: new Date(now.getTime() - 4 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'Inactive Customer Re-engagement',
+      name: '[Sample] Inactive Customer Re-engagement',
       type: 'reengagement',
       channel: 'email',
-      status: 'paused',
+      status: 'draft',
       audience: { type: 'filtered', filter: { inactiveDays: 30 } },
-      stats: { total: 280, sent: 120, delivered: 115, opened: 42, clicked: 14, replied: 6, failed: 5 },
-      createdAt: new Date(now.getTime() - 6 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'Upcoming Industry Webinar Invitation',
+      name: '[Sample] Upcoming Industry Webinar Invitation',
       type: 'broadcast',
       channel: 'email',
-      status: 'scheduled',
-      schedule: { startAt: new Date(now.getTime() + 5 * 86400000), timezone: 'Asia/Kolkata' },
+      status: 'draft',
       audience: { type: 'all_customers', filter: {} },
-      stats: { total: 400, sent: 0, delivered: 0, opened: 0, clicked: 0, replied: 0, failed: 0 },
-      createdAt: new Date(now.getTime() - 2 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
     {
       tenantId: tid,
       createdBy: uid,
-      name: 'Customer Feedback & CSAT Survey',
+      name: '[Sample] Customer Feedback & CSAT Survey',
       type: 'followup',
       channel: 'sms',
       status: 'draft',
       audience: { type: 'manual', filter: {} },
-      stats: { total: 0, sent: 0, delivered: 0, opened: 0, clicked: 0, replied: 0, failed: 0 },
-      createdAt: new Date(now.getTime() - 1 * 86400000) as any,
+      stats: zeroStats,
+      createdAt: now,
     },
   ];
 

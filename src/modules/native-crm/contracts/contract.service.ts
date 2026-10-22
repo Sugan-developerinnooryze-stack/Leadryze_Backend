@@ -4,6 +4,8 @@ import { NativeCustomer } from '../customers/customer.model';
 import { ContractListOptions } from './contract.types';
 import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
+import { NativeWorkorder } from '../workorders/workorder.model';
+import { NativeInvoice } from '../invoices/invoice.model';
 import { generateVisits, computeBalance, serviceRangeSummary } from './schedule.engine';
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
@@ -13,6 +15,8 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { applyDynamicFilters } from '../shared/dynamic-filter';
 import { getContractFilterCatalog } from './contract.filter-catalog';
+import { Tenant } from '../../tenants/tenant.model';
+import { zonedTimeToUtc } from '../shared/timezone';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -27,6 +31,35 @@ function hasScheduleRules(services: any[]): boolean {
 }
 
 const CONTRACT_DATE_FIELDS = new Set(['startDate', 'endDate', 'overlap', 'createdAt']);
+
+/**
+ * LR-R2-ACT-001: Normalize incoming contract start date.
+ * If incoming date string lacks timezone offset (naive ISO "YYYY-MM-DDTHH:mm"),
+ * resolves the tenant's configured timezone and converts to true UTC Date to
+ * prevent timezone drift upon subsequent saves.
+ */
+export async function normalizeContractStartDate(tenantId: string, startDate?: string | Date): Promise<Date | undefined> {
+  if (!startDate) return undefined;
+  if (startDate instanceof Date) return isNaN(startDate.getTime()) ? undefined : startDate;
+  const s = String(startDate).trim();
+  if (!s) return undefined;
+  if (s.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(s)) {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? undefined : d;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    return new Date(`${s}T00:00:00.000Z`);
+  }
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (m) {
+    const tenantDoc = await Tenant.findById(tenantId).select('settings.timezone').lean();
+    const tz = tenantDoc?.settings?.timezone || 'Asia/Singapore';
+    const [, y, mo, d, h, min] = m.map(Number);
+    return zonedTimeToUtc(y, mo - 1, d, h, min, tz);
+  }
+  const fallback = new Date(s);
+  return isNaN(fallback.getTime()) ? undefined : fallback;
+}
 
 export async function listContracts(tenantId: string, opts: ContractListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -100,7 +133,10 @@ export async function listContracts(tenantId: string, opts: ContractListOptions,
 
 export async function getContractById(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { contractId: id }] }
+    : { contractId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
   const doc = await NativeContract.findOne(filter);
   if (!doc) return null;
@@ -123,6 +159,13 @@ export async function createContract(data: any) {
   const after    = subtotal - (subtotal * discount) / 100;
 
   // Master engine: expand per-service schedule rules into the visit schedule
+  if (data.startDate) {
+    data.startDate = await normalizeContractStartDate(String(data.tenantId), data.startDate);
+  }
+  if (data.endDate && typeof data.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.endDate)) {
+    data.endDate = new Date(`${data.endDate}T23:59:59.999Z`);
+  }
+
   let visits = data.visits;
   if (hasScheduleRules(services) && data.startDate && data.endDate) {
     visits = generateVisits(services, data.startDate, data.endDate);
@@ -147,10 +190,20 @@ export async function createContract(data: any) {
 export async function updateContract(id: string, tenantId: string, data: any, scope?: DataScope) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { contractId: id }] }
+    : { contractId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
   const touchesSchedule =
     data.services !== undefined || data.startDate !== undefined || data.endDate !== undefined;
+
+  if (data.startDate !== undefined) {
+    data.startDate = await normalizeContractStartDate(tenantId, data.startDate);
+  }
+  if (data.endDate && typeof data.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.endDate)) {
+    data.endDate = new Date(`${data.endDate}T23:59:59.999Z`);
+  }
 
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined
       || data.gstPercentage !== undefined || touchesSchedule) {
@@ -192,8 +245,34 @@ export async function updateContract(id: string, tenantId: string, data: any, sc
 
 export async function deleteContract(id: string, tenantId: string, scope?: DataScope) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const filter: any = { _id: id, tenantId: tid };
+  const idFilter = mongoose.isValidObjectId(id)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { contractId: id }] }
+    : { contractId: id };
+  const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
+  const existing = await NativeContract.findOne(filter);
+  if (!existing) return null;
+
+  // LR-C4-DEL-003: Check for linked work orders and invoices before deleting
+  const idStr = String(existing._id);
+  const contractId = (existing as any).contractId ? String((existing as any).contractId) : null;
+  const matchIds = contractId ? [idStr, contractId] : [idStr];
+
+  const [workorders, invoices] = await Promise.all([
+    NativeWorkorder.countDocuments({ tenantId: tid, contractId: { $in: matchIds } }),
+    NativeInvoice.countDocuments({ tenantId: tid, contractId: { $in: matchIds } }),
+  ]);
+
+  const linked: string[] = [];
+  if (workorders) linked.push(`${workorders} work order${workorders > 1 ? 's' : ''}`);
+  if (invoices)   linked.push(`${invoices} invoice${invoices > 1 ? 's' : ''}`);
+  if (linked.length) {
+    throw Object.assign(
+      new Error(`Cannot delete — this contract has ${linked.join(', ')}. Remove or reassign them first.`),
+      { statusCode: 409 }
+    );
+  }
+
   const deleted = await NativeContract.findOneAndDelete(filter);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'contracts', String(deleted._id));
   return deleted;

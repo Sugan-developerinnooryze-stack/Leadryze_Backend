@@ -92,9 +92,14 @@ export function parseDateRange(filter?: DateRangeFilter): ParsedDateRange {
     endLocal = now.endOf('day');
     nextDayExclusive = now.plus({ days: 1 }).startOf('day');
   }
-  // 4. This Month: rolling one-month period (September 9 through October 9, 2026, inclusive)
-  else if (preset === 'this_month' || preset === 'month' || preset === '30d') {
-    startLocal = now.minus({ months: 1 }).startOf('day');
+  // 4. This Month: calendar month (e.g. October 1 through today/end of month) - matching Dashboard
+  else if (preset === 'this_month' || preset === 'month') {
+    startLocal = now.startOf('month');
+    endLocal = now.endOf('day');
+    nextDayExclusive = now.plus({ days: 1 }).startOf('day');
+  }
+  else if (preset === '30d') {
+    startLocal = now.minus({ days: 30 }).startOf('day');
     endLocal = now.endOf('day');
     nextDayExclusive = now.plus({ days: 1 }).startOf('day');
   }
@@ -143,9 +148,9 @@ export function parseDateRange(filter?: DateRangeFilter): ParsedDateRange {
     endLocal = now.endOf('day');
     nextDayExclusive = now.plus({ days: 1 }).startOf('day');
   }
-  // Default: This Month (rolling one-month period)
+  // Default: This Month (calendar month)
   else {
-    startLocal = now.minus({ months: 1 }).startOf('day');
+    startLocal = now.startOf('month');
     endLocal = now.endOf('day');
     nextDayExclusive = now.plus({ days: 1 }).startOf('day');
   }
@@ -283,6 +288,7 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
     allTicketsCount,
     resolvedTicketsCount,
     openWOCount,
+    totalWOCount,
     completedWOCount,
     customersCount,
     companiesCount,
@@ -337,7 +343,7 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
           },
           openPipelineValue: {
             $sum: {
-              $cond: [{ $in: ['$stage', ['won', 'closed_won', 'lost', 'closed_lost']] }, 0, { $ifNull: ['$amount', 0] }],
+              $cond: [{ $in: ['$stage', ['won', 'closed_won', 'lost', 'closed_lost']] }, 0, { $ifNull: ['$amount', { $ifNull: ['$value', 0] }] }],
             },
           },
           wonCount: {
@@ -347,7 +353,7 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
           },
           wonRevenue: {
             $sum: {
-              $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, { $ifNull: ['$amount', 0] }, 0],
+              $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, { $ifNull: ['$amount', { $ifNull: ['$value', 0] }] }, 0],
             },
           },
         },
@@ -361,7 +367,7 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
           _id: null,
           wonRevenue: {
             $sum: {
-              $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, { $ifNull: ['$amount', 0] }, 0],
+              $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, { $ifNull: ['$amount', { $ifNull: ['$value', 0] }] }, 0],
             },
           },
         },
@@ -406,6 +412,8 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
     Ticket.countDocuments({ ...ticketBase, ticketStatus: { $in: ['resolved', 'closed'] }, ...dateMatch }),
     // Open work orders
     NativeWorkorder.countDocuments({ ...woBase, status: { $in: ['draft', 'scheduled', 'in_progress'] }, ...dateMatch }),
+    // Total work orders in period
+    NativeWorkorder.countDocuments({ ...woBase, ...dateMatch }),
     // Completed work orders in period
     NativeWorkorder.countDocuments({ ...woBase, status: 'completed', ...getDateMatchWithFallback(range, 'completedDate', 'createdAt') }),
     // Customers count
@@ -555,6 +563,8 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
         slaBreaches: slaBreachTicketsCount,
       },
       workOrders: {
+        value: totalWOCount,
+        total: totalWOCount,
         open: openWOCount,
         completedInPeriod: completedWOCount,
       },

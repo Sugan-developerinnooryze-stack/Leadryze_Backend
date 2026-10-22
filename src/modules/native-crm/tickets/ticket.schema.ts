@@ -1,11 +1,15 @@
 import mongoose, { Schema } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
+import { getNextSequence } from '../shared/counter.model';
 
 export const ticketSchema = new Schema(
   {
     tenantId:     { type: Schema.Types.ObjectId, ref: 'Tenant', required: true },
     branchId:     { type: Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
     clientId:     { type: String, index: true },
+    numId:        { type: Number },
+    ticketId:     { type: String, index: true },
+    ticketNumber: { type: String, index: true },
     subject:      { type: String, required: true, trim: true },
     priority:     { type: String, enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },
     // Stage validity is enforced at the service layer against the tenant's
@@ -40,12 +44,23 @@ export const ticketSchema = new Schema(
 );
 
 ticketSchema.pre('save', async function (next) {
-  if (!this.isNew || this.clientId) return next();
-  this.clientId = await resolveClientPrefix(this.tenantId as mongoose.Types.ObjectId);
+  if (!this.isNew) return next();
+  if (!this.numId) {
+    this.numId = await getNextSequence(this.tenantId as mongoose.Types.ObjectId, 'tickets', this.constructor as any);
+  }
+  const pfx = this.clientId || (await resolveClientPrefix(this.tenantId as mongoose.Types.ObjectId));
+  this.clientId = pfx;
+  if (!this.ticketNumber) {
+    const formatted = `${pfx}-TKT-${String(this.numId).padStart(4, '0')}`;
+    this.ticketNumber = formatted;
+    this.ticketId = formatted;
+  }
   next();
 });
 
 ticketSchema.index({ tenantId: 1 });
 ticketSchema.index({ tenantId: 1, ticketStatus: 1 });
 ticketSchema.index({ tenantId: 1, priority: 1 });
+ticketSchema.index({ tenantId: 1, ticketNumber: 1 });
+ticketSchema.index({ tenantId: 1, ticketId: 1 });
 ticketSchema.index({ tenantId: 1, relatedModule: 1, relatedId: 1 });
