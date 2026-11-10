@@ -128,6 +128,7 @@ schema.pre('save', async function (next) {
 schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, customerId: 1 });
+schema.index({ tenantId: 1, validUntil: 1 }); // date-range reads (Daily Events, calendar)
 
 export const NativeQuotation = mongoose.model<IQuotationDoc>(
   'NativeQuotation',

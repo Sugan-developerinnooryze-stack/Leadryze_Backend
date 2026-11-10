@@ -378,20 +378,9 @@ router.delete('/users/:id', async (req: AuthRequest, res, next) => {
         },
       },
     );
-    logAuditEvent('user.removed',
-      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip },
-      {
-        tenantId: user.tenantId?.toString(),
-        target: 'User',
-        targetId: user.loginId ?? user._id.toString(),
-        detail: {
-          userEmail: user.email,
-          name: `${user.firstName} ${user.lastName}`,
-          role: user.role,
-          tenantName: userTenant?.name,
-        },
-      },
-    );
+    // LR-UX-003: one audit row per deactivation. It also wrote a second
+    // 'user.removed' row with the same content (the user is deactivated, never
+    // deleted), so each deactivation showed twice in Security Center.
 
     sendSuccess(res, null, 'User deactivated successfully');
   } catch (err) { next(err); }

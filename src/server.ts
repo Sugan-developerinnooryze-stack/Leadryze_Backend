@@ -13,6 +13,7 @@ import { logger } from './utils/logger';
 // Campaigns module reloaded
 import { logSecurityEvent } from './modules/logs/security-event.model';
 import { hasPermission } from './modules/rbac/permission.service';
+import { isCrmAssistantToken } from './modules/ai/crm-assistant-token';
 
 async function ensureSuperAdmin(): Promise<void> {
   try {
@@ -146,9 +147,19 @@ async function bootstrap(): Promise<void> {
       return next(new Error('Authentication required'));
     }
     try {
-      const payload = jwt.verify(token, config.jwt.secret) as {
+      const payload = jwt.verify(token, config.jwt.secret) as jwt.JwtPayload & {
         scope?: string; tenantId: string; userId?: string; role?: string; roleId?: string; sessionId?: string;
       };
+      // The CRM assistant's short-lived internal token is never a login
+      // session, here as on /api/v1 (see authenticate).
+      if (isCrmAssistantToken(payload)) {
+        logSecurityEvent('websocket.auth_failed', {
+          ip:        socket.handshake.address ?? 'unknown',
+          userAgent: (socket.handshake.headers['user-agent'] as string) ?? 'unknown',
+          detail:    { reason: 'crm_assistant_audience' },
+        });
+        return next(new Error('Invalid or expired token'));
+      }
       if (payload.scope === 'widget') {
         socket.data.isWidgetVisitor = true;
         socket.data.tenantId        = payload.tenantId;
@@ -254,7 +265,12 @@ async function bootstrap(): Promise<void> {
   process.on('SIGINT', shutdown);
 
   process.on('unhandledRejection', (reason) => {
-    logger.error('Unhandled promise rejection', { reason });
+    // LR-R26-RCPT-006: an Error inside the log metadata is written as "{}",
+    // so the outage logs never said what failed. Log its message and stack,
+    // in the same shape as the uncaughtException handler below.
+    logger.error('Unhandled promise rejection', reason instanceof Error
+      ? { error: reason.message, stack: reason.stack }
+      : { reason });
     process.exit(1);
   });
 

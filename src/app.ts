@@ -9,7 +9,7 @@ import swaggerUi from 'swagger-ui-express';
 import { config } from './config';
 import { swaggerSpec } from './config/swagger';
 import { globalRateLimit } from './middlewares/rate-limit.middleware';
-import { auditLog } from './middlewares/audit.middleware';
+import { auditLog, redactUrl } from './middlewares/audit.middleware';
 import { notFound, errorHandler } from './middlewares/error.middleware';
 import { logger } from './utils/logger';
 
@@ -28,6 +28,7 @@ import publicWidgetRoutes from './modules/public-widget/public-widget.routes';
 import notificationRoutes from './modules/notifications/notification.routes';
 import aiRoutes from './modules/ai/ai.routes';
 import crmChatRoutes from './modules/ai/crm-chat.routes';
+import dailyEventsRoutes from './modules/daily-events/daily-events.routes';
 import adminRoutes from './modules/admin/admin.routes';
 import crmRoutes from './modules/crm/crm-record.routes';
 import internalRoutes from './modules/internal/internal.routes';
@@ -76,7 +77,7 @@ const fixedOriginCors = cors({
   origin: allowedOrigins,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-tenant-id', 'X-Branch-Id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-tenant-id', 'X-Branch-Id', 'Idempotency-Key'],   // Idempotency-Key: LR-C4-RCPT-005
 });
 
 // The public widget module has its own tenant-aware, dynamic CORS handling
@@ -99,7 +100,11 @@ app.use((req, res, next) => {
   fixedOriginCors(req, res, next);
 });
 
-const morganFormat = ':method :url :status :res[content-length]b - :response-time ms';
+// :safe-url is :url with the internal CRM gateway's internalAuth query
+// value redacted (same redactUrl the audit log uses) â€” the raw URL carries
+// a per-user JWT on every GET /api/internal/crm-* call.
+morgan.token('safe-url', (req) => redactUrl((req as express.Request).originalUrl || req.url || ''));
+const morganFormat = ':method :safe-url :status :res[content-length]b - :response-time ms';
 app.use(morgan(morganFormat, { stream: { write: (msg) => logger.http(msg.trim()) } }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -170,6 +175,7 @@ app.use(`${V}/public/widget`, publicWidgetRoutes); // public, unauthenticated â€
 app.use(`${V}/notifications`, notificationRoutes);
 app.use(`${V}/ai`, aiRoutes);
 app.use(`${V}/ai`, crmChatRoutes);
+app.use(`${V}/daily-events`, dailyEventsRoutes); // internal chat panel's read-only Daily Events view
 app.use(`${V}/admin`, adminRoutes);
 app.use(`${V}/crm`, crmRoutes);
 app.use(`${V}/logs`, logRoutes);

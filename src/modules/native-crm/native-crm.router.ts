@@ -71,6 +71,7 @@ import automationTemplateRoutes from './automation-templates/automation-template
 import automationSettingsRoutes from './automation-settings/automation-settings.routes';
 
 import { Contact }  from './contacts/contact.model';
+import { contactOwnerValues } from './contacts/contact.service';
 import { Company }  from './companies/company.model';
 import { Deal }     from './deals/deal.model';
 import { Task }     from './tasks/task.model';
@@ -175,8 +176,15 @@ router.get('/stats', async (req: AuthRequest, res: Response) => {
       applyDataScopeToFilter(f, resolveEffectiveScope(req, moduleKey), field);
       return f;
     };
+    // LR-C4-PERM-003: the Contacts badge counts what the Contacts list shows
+    // a Manager/Agent: contacts they created OR own (contactOwner holds their
+    // user id or, on older contacts, their name), not only created ones.
+    const contactScope = resolveEffectiveScope(req, 'contacts');
+    const contactFilter: Record<string, unknown> = { tenantId: tid };
+    applyDataScopeToCreatedByFilter(contactFilter, contactScope, 'createdBy', undefined, undefined, 'contactOwner',
+      contactScope.kind === 'all' ? undefined : await contactOwnerValues(req.user?.userId));
     const [contacts, companies, deals, tasks, tickets, calls, meetings] = await Promise.all([
-      Contact.countDocuments(createdByAnchored('contacts')),
+      Contact.countDocuments(contactFilter),
       Company.countDocuments(createdByAnchored('companies')),
       Deal.countDocuments(staffAnchored('deals', 'assignedStaffId')),
       Task.countDocuments(createdByAnchored('tasks')),
@@ -215,7 +223,10 @@ router.get('/dashboard-stats', async (req: AuthRequest, res: Response) => {
     // branches left it silently showing tenant-wide numbers. Meeting has no
     // branchId field at all yet (a separate, larger gap — not scoped here).
     if (req.branchId) leadFilterBase.branchId = new mongoose.Types.ObjectId(req.branchId);
-    applyDataScopeToFilter(leadFilterBase, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId');
+    // LR-C4-PERM-003: the same lead scope as the Leads list and its KPI
+    // (lead.service.ts / lead.controller.ts stats): owned OR created by the
+    // caller, plus a Manager's teams, so the Dashboard counts match the list.
+    applyDataScopeToFilter(leadFilterBase, resolveEffectiveScope(req, 'leads'), 'leadOwnerStaffId', undefined, undefined, 'createdBy');
     const meetingFilter: Record<string, unknown> = { tenantId: tid };
     applyDataScopeToFilter(meetingFilter, resolveEffectiveScope(req, 'meetings'), 'assignedStaffId');
 

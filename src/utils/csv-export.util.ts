@@ -16,8 +16,10 @@ function csvCell(value: any): string {
   else if (Array.isArray(value)) s = value.map((v) => (v == null ? '' : String(v))).join('; ');
   else if (typeof value === 'object') s = JSON.stringify(value);
   else s = String(value);
-  // Neutralise CSV formula injection for cells starting with =, +, -, @
-  if (/^[=+\-@]/.test(s)) {
+  // Neutralise CSV formula injection for cells starting with =, +, -, @.
+  // LR-PL-EXPORT-002: a value that is only a number (-5000, -12.5) cannot run
+  // as a formula and is left as it is, so it stays a number in Excel.
+  if (/^[=+\-@]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) {
     s = `'${s}`;
   }
   if (/[",\r\n]/.test(s) || s.startsWith("'")) s = `"${s.replace(/"/g, '""')}"`;

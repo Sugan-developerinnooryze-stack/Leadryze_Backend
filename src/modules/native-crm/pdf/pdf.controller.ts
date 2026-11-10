@@ -12,6 +12,7 @@ import {
   workorderTemplate,
   contractTemplate,
   invoiceTemplate,
+  TemplateExtras,
 } from './pdf.templates';
 import { FSSettings }            from '../fs-settings/fs-settings.model';
 import { NativeCustomer }        from '../customers/customer.model';
@@ -29,6 +30,8 @@ import { sendEmailNow }          from '../../messages/brevo.service';
 import { sendWhatsAppDocumentNow } from '../../messages/whatsapp.service';
 import { uploadToS3 }            from '../../../services/s3.service';
 import { getOutcomeStageKey }    from '../pipeline-config/pipeline-config.service';
+import { transformPIIResponse, decryptPIIFields } from '../../../platform/pii/pii.service';
+import { Tenant }                from '../../tenants/tenant.model';
 
 /** Resolved once per render — see RenderCtx.invoicePaidKey. */
 async function resolveInvoicePaidKey(docType: TemplateDocType, tenantId: string): Promise<string | undefined> {
@@ -38,7 +41,7 @@ async function resolveInvoicePaidKey(docType: TemplateDocType, tenantId: string)
 
 const MODULE_MAP: Record<string, {
   fetch:    (id: string, tenantId: string) => Promise<any>;
-  template: (doc: any, settings: any, customer: any, variant: string, sections?: Partial<ITemplateSections>) => string;
+  template: (doc: any, settings: any, customer: any, variant: string, sections?: Partial<ITemplateSections>, extras?: TemplateExtras) => string;
   idField:  string;
 }> = {
   quotations: { fetch: getQuotationById, template: quotationTemplate, idField: 'quotationId' },
@@ -49,7 +52,22 @@ const MODULE_MAP: Record<string, {
 
 const ALLOWED_VARIANTS = new Set(['classic', 'modern', 'minimal', 'elegant']);
 
+/**
+ * LR-R26-PDF-002: who reads the PDF decides how the customer's PII (e-mail,
+ * phone, address and the other PII_FIELDS.customers fields) is printed. A
+ * staff member downloading, previewing or sharing it gets what the customer
+ * screens show them: the real values for admins and for the roles ticked for
+ * Customers under PII & Field Visibility, masked values otherwise. The app
+ * offers Email PDF and WhatsApp only to those roles (ShareMenuButton's
+ * showContactShare), so a PDF shared with the customer carries the real
+ * values, and a direct API call from another role cannot get them. An
+ * automation's attachment ('customer') carries the real values. The PDF
+ * printed the stored ciphertext in every case.
+ */
+export type PdfAudience = { viewerRole: string } | 'customer';
+
 interface BuildHtmlOptions {
+  audience:       PdfAudience;     // required: every caller decides (LR-R26-PDF-002)
   templateId?:    string;          // explicit designer template
   variant?:       unknown;         // ?template= query (legacy variants)
   draftElements?: IDesignElement[]; // unsaved designer draft (preview only)
@@ -98,7 +116,7 @@ async function toPdfBuffer(built: BuiltHtml): Promise<{ buffer: Buffer; pdfOptio
 export async function generateRecordPdfBuffer(
   module: string, id: string, tenantId: string, branchId?: string,
 ): Promise<{ buffer: Buffer; filename: string } | null> {
-  const result = await buildDocumentHtml(module, id, tenantId, branchId, {});
+  const result = await buildDocumentHtml(module, id, tenantId, branchId, { audience: 'customer' });
   if ('error' in result) return null;
   const { buffer } = await toPdfBuffer(result);
   return { buffer, filename: result.filename };
@@ -121,6 +139,23 @@ interface ResolvedDoc {
   team:     any;
 }
 
+/** LR-R26-PDF-002: the customer's PII as this PDF's audience may see it. */
+function customerForAudience(customer: any, settings: any, audience: PdfAudience): any {
+  if (audience === 'customer') return decryptPIIFields(customer, 'customers');
+  const viewRoles: string[] = settings?.piiConfig?.find((p: any) => p.module === 'customers')?.viewRoles ?? [];
+  return transformPIIResponse(customer, 'customers', audience.viewerRole, viewRoles);
+}
+
+/** LR-R26-PDF-002: every document names its seller. FS Settings > Company
+ * name, else the tenant's name (QA's TAX INVOICE had no seller at all). Only
+ * this render's copy of the settings changes; nothing is saved. */
+async function withSellerName(settings: any, tenantId: string): Promise<any> {
+  if (typeof settings?.companyName === 'string' && settings.companyName.trim() !== '') return settings;
+  const tenant: any = await Tenant.findById(tenantId).select('name').lean().exec().catch(() => null);
+  const name = typeof tenant?.name === 'string' ? tenant.name.trim() : '';
+  return name ? { ...settings, companyName: name } : settings;
+}
+
 /**
  * Shared "fetch doc + settings + customer" step used by every PDF consumption
  * path (download, share-email, preview, live-data) so they can never drift.
@@ -130,6 +165,7 @@ async function resolveRenderCtx(
   id: string,
   tenantId: string,
   branchId: string | undefined,
+  audience: PdfAudience,
 ): Promise<ResolvedDoc | { error: string; status: number }> {
   const entry = MODULE_MAP[module];
   if (!entry) return { error: `PDF not supported for module: ${module}`, status: 400 };
@@ -142,13 +178,18 @@ async function resolveRenderCtx(
 
   // Enrich with FSSettings: prefer branch-specific settings, fall back to main-org
   const bid = branchId ? new mongoose.Types.ObjectId(branchId) : null;
-  const settings = await FSSettings.findOne({ tenantId, branchId: bid }).lean().exec()
+  const rawSettings = await FSSettings.findOne({ tenantId, branchId: bid }).lean().exec()
     ?? await FSSettings.findOne({ tenantId, branchId: null }).lean().exec()
     ?? {};
+  const settings = await withSellerName(rawSettings, tenantId);
 
-  const customer = docObj.customerId
+  // Stored encrypted (customer.model.ts pre-save); decrypted or masked for
+  // the audience here, so every template, the designer and live data get the
+  // same values.
+  const storedCustomer = docObj.customerId
     ? await NativeCustomer.findOne({ tenantId, customerId: docObj.customerId }).lean().exec()
     : null;
+  const customer = storedCustomer ? customerForAudience(storedCustomer, settings, audience) : null;
 
   // Assigned site/staff/team — only contracts/workorders carry these fields,
   // stored as human-readable codes (not ObjectId refs), so look up by code.
@@ -181,7 +222,7 @@ async function buildDocumentHtml(
   branchId: string | undefined,
   opts: BuildHtmlOptions,
 ): Promise<BuiltHtml | { error: string; status: number }> {
-  const resolved = await resolveRenderCtx(module, id, tenantId, branchId);
+  const resolved = await resolveRenderCtx(module, id, tenantId, branchId, opts.audience);
   if ('error' in resolved) return resolved;
   const { entry, docType, docObj, settings, customer, filename, site, staff, team } = resolved;
 
@@ -265,7 +306,9 @@ async function buildDocumentHtml(
     teamName:  team?.name,
   };
 
-  const html = entry.template(enrichedDoc, settings, customer, variant, sections);
+  const html = entry.template(enrichedDoc, settings, customer, variant, sections, {
+    invoicePaidKey: await resolveInvoicePaidKey(docType, tenantId),
+  });
   return { kind: 'legacy', html, docObj, filename };
 }
 
@@ -273,6 +316,7 @@ export async function generatePdf(req: AuthRequest, res: Response) {
   try {
     const { module, id } = req.params;
     const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      audience:   { viewerRole: req.user?.role ?? '' },
       templateId: req.query.templateId ? String(req.query.templateId) : undefined,
       variant:    req.query.template,
     });
@@ -293,6 +337,7 @@ export async function previewHtml(req: AuthRequest, res: Response) {
   try {
     const { module, id } = req.params;
     const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      audience:   { viewerRole: req.user?.role ?? '' },
       templateId: req.query.templateId ? String(req.query.templateId) : undefined,
       variant:    req.query.template,
     });
@@ -312,6 +357,7 @@ export async function previewDraftHtml(req: AuthRequest, res: Response) {
       elements: IDesignElement[]; page?: ITemplatePage; header?: ITemplateRegion; footer?: ITemplateRegion;
     };
     const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      audience:      { viewerRole: req.user?.role ?? '' },
       draftElements: elements,
       draftPage:     page,
       draftHeader:   header,
@@ -333,6 +379,7 @@ export async function downloadDraftPdf(req: AuthRequest, res: Response) {
       elements: IDesignElement[]; page?: ITemplatePage; header?: ITemplateRegion; footer?: ITemplateRegion;
     };
     const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      audience:      { viewerRole: req.user?.role ?? '' },
       draftElements: elements,
       draftPage:     page,
       draftHeader:   header,
@@ -375,7 +422,7 @@ function unescapeHtml(s: string): string {
 export async function getLiveData(req: AuthRequest, res: Response) {
   try {
     const { module, id } = req.params;
-    const resolved = await resolveRenderCtx(module, id, req.tenantId!, req.branchId);
+    const resolved = await resolveRenderCtx(module, id, req.tenantId!, req.branchId, { viewerRole: req.user?.role ?? '' });
     if ('error' in resolved) return sendError(res, resolved.error, resolved.status);
     const { docType, docObj, settings, customer, site, staff, team } = resolved;
 
@@ -429,6 +476,7 @@ export async function shareDocumentEmail(req: AuthRequest, res: Response) {
     };
 
     const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      audience:   { viewerRole: req.user?.role ?? '' },
       templateId: req.query.templateId ? String(req.query.templateId) : undefined,
       variant:    req.query.template,
     });
@@ -478,6 +526,7 @@ export async function shareDocumentWhatsApp(req: AuthRequest, res: Response) {
     const { to, message } = req.body as { to: string; message?: string };
 
     const result = await buildDocumentHtml(module, id, req.tenantId!, req.branchId, {
+      audience:   { viewerRole: req.user?.role ?? '' },
       templateId: req.query.templateId ? String(req.query.templateId) : undefined,
       variant:    req.query.template,
     });

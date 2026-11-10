@@ -7,6 +7,7 @@ import { Contact } from '../contacts/contact.model';
 import { Deal } from '../deals/deal.model';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listCompanies(tenantId: string, opts: ListOptions = {}, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status, ownerTab } = opts;
@@ -76,7 +77,7 @@ export async function updateCompany(tenantId: string, id: string, dto: UpdateCom
   return updated;
 }
 
-export async function deleteCompany(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
+export async function deleteCompany(tenantId: string, id: string, scope?: DataScope, guard?: WriteGuard): Promise<boolean> {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
@@ -103,7 +104,8 @@ export async function deleteCompany(tenantId: string, id: string, scope?: DataSc
     );
   }
 
-  const res = await Company.findOneAndDelete(filter);
+  const res = await Company.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!res) await throwIfStale(Company, filter, guard);
   if (res) removeNativeSearchRecord(tenantId, 'native', 'companies', String(res._id));
   return !!res;
 }

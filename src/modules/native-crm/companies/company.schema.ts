@@ -19,7 +19,10 @@ export const companySchema = new Schema(
     customFields: { type: Schema.Types.Mixed },
     createdBy:     { type: String },
   },
-  { timestamps: true }
+  // LR-NEG-001: like Lead, Contact and Deal. Without it a company's __v never
+  // changed, so the stale-save check rested on updatedAt alone, and two saves
+  // within its 0.5 s tolerance (or at the same moment) overwrote each other.
+  { timestamps: true, optimisticConcurrency: true }
 );
 
 companySchema.pre('save', async function (next) {

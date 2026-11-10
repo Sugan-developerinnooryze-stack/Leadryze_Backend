@@ -10,6 +10,7 @@ import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
 import { getOrCreateSlaPolicy, computeDueDates, deriveSlaStatus, slaStatusMongoFilter } from './ticket-sla-policy.service';
 import { SlaStatus } from './ticket.types';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -73,7 +74,7 @@ export async function createTicket(tenantId: string, dto: CreateTicketDTO & { cr
   return created;
 }
 
-export async function updateTicket(tenantId: string, id: string, dto: UpdateTicketDTO, scope?: DataScope) {
+export async function updateTicket(tenantId: string, id: string, dto: UpdateTicketDTO, scope?: DataScope, guard?: WriteGuard) {
   await assertValidStatus(tenantId, dto.ticketStatus);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
@@ -91,19 +92,21 @@ export async function updateTicket(tenantId: string, id: string, dto: UpdateTick
     }
   }
 
-  const updated = await Ticket.findOneAndUpdate(filter, { $set: setDto }, { new: true }).lean();
+  const updated = await Ticket.findOneAndUpdate(withExpectedVersion(filter, guard), { $set: setDto }, { new: true }).lean();
+  if (!updated) await throwIfStale(Ticket, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native', 'tickets', updated, updated.subject);
   return updated ? { ...updated, slaStatus: deriveSlaStatus(updated) } : updated;
 }
 
-export async function deleteTicket(tenantId: string, id: string, scope?: DataScope) {
+export async function deleteTicket(tenantId: string, id: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { ticketId: id }] }
     : { ticketId: id };
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await Ticket.findOneAndDelete(filter).lean();
+  const deleted = await Ticket.findOneAndDelete(withExpectedVersion(filter, guard)).lean();
+  if (!deleted) await throwIfStale(Ticket, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'tickets', String(deleted._id));
   return deleted;
 }

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { customFields } from '../../../utils/common.schemas';
+import { customFields, ianaTimezone } from '../../../utils/common.schemas';
 
 // LR-ACT-003: nothing stopped an end time before the start time — checked
 // on both create and update (update's fields are all optional, so this is
@@ -14,6 +14,10 @@ const meetingSchemaBase = z.object({
   title:         z.string().trim().min(1).max(300),
   startDate:     z.string().optional(),
   endDate:       z.string().optional(),
+  // LR-R2-ACT-001: the zone the times were entered in (the form sends the
+  // browser's). It was stripped here, so the e-mails fell back to the
+  // tenant's stored zone.
+  timezone:      ianaTimezone.optional(),
   location:      z.string().trim().optional(),
   attendees:     z.array(z.string()).optional(),
   meetingStatus: z.enum(['scheduled','completed','cancelled']).optional(),

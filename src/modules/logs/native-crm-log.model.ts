@@ -16,6 +16,8 @@ export interface INativeCrmLog extends Document {
   statusCode: number;
   ip:         string;
   url:        string;
+  /** 'assistant' when the CRM assistant made the change; absent for the screens. */
+  origin?:    'assistant';
   timestamp:  Date;
 }
 
@@ -36,6 +38,7 @@ const NativeCrmLogSchema = new Schema<INativeCrmLog>(
     statusCode: { type: Number, default: 200 },
     ip:         { type: String, default: 'unknown' },
     url:        { type: String, default: '' },
+    origin:     { type: String, enum: ['assistant'] },
     timestamp:  { type: Date, default: Date.now, index: true },
   },
   { timestamps: false },

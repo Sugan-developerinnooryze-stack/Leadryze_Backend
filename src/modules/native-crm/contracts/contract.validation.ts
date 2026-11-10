@@ -56,7 +56,9 @@ export const createContractSchema = z.object({
   recurringUnit:         z.enum(['day','week','fortnight','month','bimonthly','quarter','halfyear','year','custom']).optional(),
   recurringInterval:     z.coerce.number().min(1).optional(),
   nextServiceDate:       z.string().optional(),
-  discount:              z.number().min(0).optional(),
+  // LR-R26-CTR-007: a percentage, as everywhere it is used (100 meant 100 %
+  // off, a total of 0, while the form said "flat").
+  discount:              z.number().min(0).max(100, 'Discount is a percentage (0-100)').optional(),
   gstPercentage:         z.number().min(0).optional(),
   servicesAmount:        z.number().min(0).optional(),
   servicesAmountWithTax: z.number().min(0).optional(),

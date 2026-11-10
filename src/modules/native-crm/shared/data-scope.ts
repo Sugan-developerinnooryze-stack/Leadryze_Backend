@@ -97,6 +97,8 @@ export async function resolveDataScopeMiddleware(req: AuthRequest, res: Response
     // grant unscoped access. 'self' + empty staffIds/teamIds matches nothing.
     req.dataScope = { kind: 'self', staffIds: [], teamIds: [], createdByUserIds: [] };
     req.dataScopeConfig = DEFAULT_DATA_SCOPE_CONFIG;
+    // Marked so a summary view can say "couldn't load" instead of a fake zero.
+    req.dataScopeFailed = true;
   }
   next();
 }
@@ -182,7 +184,10 @@ export function applyDataScopeToFilter(
       { [ownerField]: { $in: allowedOwnerIds } },
       { [alsoMatchCreatedBy]: { $in: scope.createdByUserIds } },
     ];
-    if (scope.teamIds && scope.teamIds.length > 0) {
+    // LR-C4-PERM-003 (approved rule): team-wide visibility is a Manager's
+    // ('team' scope) only. An Agent ('self') sees the records they own or
+    // created, never a team-mate's, so their own team id is not matched here.
+    if (scope.kind === 'team' && scope.teamIds && scope.teamIds.length > 0) {
       scopeOr.push({ teamId: { $in: scope.teamIds } });
     }
     if (filter.$or) {

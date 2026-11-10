@@ -179,6 +179,7 @@ schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, customerId: 1 });
 schema.index({ tenantId: 1, staffIds: 1 });
+schema.index({ tenantId: 1, scheduledDate: 1 }); // date-range reads (Daily Events, calendar)
 
 export const NativeWorkorder = mongoose.model<IWorkorderDoc>(
   'NativeWorkorder',

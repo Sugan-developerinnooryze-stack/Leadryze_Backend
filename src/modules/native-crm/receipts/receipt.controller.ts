@@ -4,7 +4,7 @@ import { sendSuccess, sendError, sendCreated, sendPaginated } from '../../../uti
 import {
   listReceipts,
   getReceiptById,
-  createReceipt,
+  createReceiptWithOutcome,
   updateReceipt,
   deleteReceipt,
 } from './receipt.service';
@@ -29,18 +29,33 @@ export async function getOne(req: AuthRequest, res: Response) {
   }
 }
 
+// LR-C4-RCPT-005: the idempotency key comes from the Idempotency-Key header
+// (or X-Idempotency-Key) or the body's idempotencyKey (which the validation
+// now keeps). A request the service recognises as already recorded gets that
+// receipt with 200 and replayed: true, never 201 "Created successfully", so
+// no caller is told a second payment was saved when it was not; a key reused
+// with different payment details gets 409.
 export async function create(req: AuthRequest, res: Response) {
   try {
-    const item = await createReceipt({
+    const header = req.headers['idempotency-key'] ?? req.headers['x-idempotency-key'];
+    const headerKey = (Array.isArray(header) ? header[0] : header)?.trim();
+    if (headerKey !== undefined && headerKey !== '' && (headerKey.length < 8 || headerKey.length > 128)) {
+      return sendError(res, 'Idempotency-Key must be 8 to 128 characters', 400);
+    }
+    const { receipt, replayed } = await createReceiptWithOutcome({
       ...req.body,
       tenantId:  req.tenantId!,
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
-      idempotencyKey: req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey,
+      idempotencyKey: headerKey || req.body?.idempotencyKey,
     });
-    sendCreated(res, item);
+    if (replayed) {
+      const plain = typeof receipt?.toObject === 'function' ? receipt.toObject() : receipt;
+      return sendSuccess(res, { ...plain, replayed: true }, 'This payment was already recorded; the existing receipt is returned');
+    }
+    sendCreated(res, receipt);
   } catch (err: any) {
-    sendError(res, err.message, 400);
+    sendError(res, err.message, err?.statusCode === 409 ? 409 : 400);
   }
 }
 

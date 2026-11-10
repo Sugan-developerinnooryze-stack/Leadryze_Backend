@@ -4,6 +4,7 @@ import { assertValidModuleDefinition, assertValidModuleFields } from './custom-m
 import { isValidStageKey } from '../native-crm/pipeline-config/pipeline-config.service';
 import { runAutomations, runAutomationsOnCreate, runAutomationsOnUpdate, runAutomationsOnDelete } from '../native-crm/automation-rules/automation-rule.service';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../native-crm/shared/search-index';
+import { getNextSequence } from '../native-crm/shared/counter.model';
 import { removeMeiliRecords, buildMeiliId } from '../../services/meilisearch.service';
 import { NativeCustomer } from '../native-crm/customers/customer.model';
 import { NativeStaff } from '../native-crm/staffs/staff.model';
@@ -468,8 +469,10 @@ export async function createCustomRecord(
   await assertValidRecordData(tenantId, moduleSlug, data);
   await assertValidPipelineField(tenantId, moduleSlug, data);
 
-  const last: any = await CustomRecord.findOne({ tenantId, moduleSlug }).sort({ numId: -1 }).lean();
-  const numId = (last?.numId ?? 0) + 1;
+  // LR-C4-NUM-001: the shared per-tenant counter, one per module ("custom:<slug>"),
+  // so a deleted record's number is never re-issued and concurrent creates
+  // get distinct numbers ("highest + 1" did both wrong).
+  const numId = await getNextSequence(new mongoose.Types.ObjectId(String(tenantId)), `custom:${moduleSlug}`, CustomRecord, { moduleSlug });
   const recordId = `${moduleSlug.toUpperCase().replace(/-/g, '')}-${String(numId).padStart(4, '0')}`;
 
   const rec = await CustomRecord.create({ tenantId, moduleSlug, numId, recordId, data, createdBy });

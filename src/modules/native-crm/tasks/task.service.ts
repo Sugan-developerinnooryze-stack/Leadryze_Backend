@@ -7,6 +7,7 @@ import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -55,23 +56,25 @@ export async function createTask(tenantId: string, dto: CreateTaskDTO & { create
   return created;
 }
 
-export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDTO, scope?: DataScope) {
+export async function updateTask(tenantId: string, id: string, dto: UpdateTaskDTO, scope?: DataScope, guard?: WriteGuard) {
   await assertValidStatus(tenantId, dto.taskStatus);
   if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const updated = await Task.findOneAndUpdate(filter, { $set: dto }, { new: true }).lean();
+  const updated = await Task.findOneAndUpdate(withExpectedVersion(filter, guard), { $set: dto }, { new: true }).lean();
+  if (!updated) await throwIfStale(Task, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native', 'tasks', updated, updated.title);
   return updated;
 }
 
-export async function deleteTask(tenantId: string, id: string, scope?: DataScope) {
+export async function deleteTask(tenantId: string, id: string, scope?: DataScope, guard?: WriteGuard) {
   if (!mongoose.isValidObjectId(id)) return null;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await Task.findOneAndDelete(filter).lean();
+  const deleted = await Task.findOneAndDelete(withExpectedVersion(filter, guard)).lean();
+  if (!deleted) await throwIfStale(Task, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'tasks', String(deleted._id));
   return deleted;
 }

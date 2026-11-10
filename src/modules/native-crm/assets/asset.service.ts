@@ -3,6 +3,7 @@ import { NativeAsset } from './asset.model';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listAssets(tenantId: string, opts: any, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -36,20 +37,22 @@ export async function createAsset(data: any) {
   return created;
 }
 
-export async function updateAsset(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateAsset(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const updated = await NativeAsset.findOneAndUpdate(filter, data, { new: true, runValidators: true });
+  const updated = await NativeAsset.findOneAndUpdate(withExpectedVersion(filter, guard), data, { new: true, runValidators: true });
+  if (!updated) await throwIfStale(NativeAsset, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'assets', updated.toObject(), (updated as any).name);
   return updated;
 }
 
-export async function deleteAsset(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteAsset(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeAsset.findOneAndDelete(filter);
+  const deleted = await NativeAsset.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeAsset, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'assets', String(deleted._id));
   return deleted;
 }

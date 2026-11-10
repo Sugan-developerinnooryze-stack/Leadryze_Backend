@@ -9,6 +9,10 @@ export interface JwtPayload {
   role:     UserRole;
   email:    string;
   roleId?:  string;   // DB role ID — undefined for legacy sessions (TENANT_ADMIN fast-path)
+  /** LR-R26-SEC-002: set (true) only while the account must change its
+   * password; authenticate() then lets the token reach only the
+   * change-password screen's own calls until the change is made. */
+  mustChangePassword?: true;
   iat?:     number;
   exp?:     number;
 }
@@ -52,6 +56,8 @@ export interface AuthRequest extends Request {
    * even before a Tenant Admin ever visits the settings page. Read via
    * resolveEffectiveScope(req, moduleKey), never this map directly. */
   dataScopeConfig?: Record<string, boolean>;
+  /** Set when resolveDataScopeMiddleware failed closed (scope matches nothing). */
+  dataScopeFailed?: boolean;
   /** This tenant's EFFECTIVE feature flags (already resolved through
    * accessConfigMode — see getEffectiveFeatureFlags() in
    * modules/tenants/tenant.service.ts), attached once by requireTenant so
@@ -78,6 +84,9 @@ export interface ApiResponse<T = unknown> {
     // site is unaffected.
     maxUsers?: number | null;
     activeUsers?: number;
+    // Additive, optional — only the internal CRM assistant's GET
+    // /api/internal/crm-list sets it, echoing the filters it applied.
+    appliedFilters?: Record<string, unknown>;
   };
 }
 

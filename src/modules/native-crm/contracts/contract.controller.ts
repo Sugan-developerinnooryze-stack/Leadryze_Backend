@@ -123,7 +123,7 @@ export async function remove(req: AuthRequest, res: Response) {
 /** POST /schedule-preview — dry-run the schedule engine for the form preview. */
 export async function schedulePreview(req: AuthRequest, res: Response) {
   try {
-    const { services, startDate, endDate } = req.body ?? {};
+    const { services, startDate, endDate, discount, gstPercentage } = req.body ?? {};
     if (!Array.isArray(services) || !startDate || !endDate) {
       return sendError(res, 'services, startDate and endDate are required', 400);
     }
@@ -131,7 +131,8 @@ export async function schedulePreview(req: AuthRequest, res: Response) {
     const normEnd   = typeof endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(endDate)
       ? new Date(`${endDate}T23:59:59.999Z`)
       : new Date(endDate);
-    const visits  = generateVisits(services, normStart, normEnd);
+    // LR-R26-CTR-007: the header rates price the lines that have none.
+    const visits  = generateVisits(services, normStart, normEnd, { discount, gstPercentage });
     const summary = summarizeVisits(visits, normStart, normEnd, services);
     sendSuccess(res, { summary, visits });
   } catch (err: any) {

@@ -1,10 +1,13 @@
 import mongoose from 'mongoose';
 import { NativeStaff } from './staff.model';
+import { excludeDeactivatedLogins } from './bookable-staff';
 import { StaffListOptions } from './staff.types';
 import { ensureCredentials } from '../shared/app-credentials.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { preparePiiUpdate } from '../shared/pii-update';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listStaffs(tenantId: string, opts: StaffListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -49,7 +52,9 @@ export async function getStaffById(id: string, tenantId: string) {
  * `null`, letting the caller fail open to round-robin instead of blocking. */
 export async function getActiveStaffByStaffId(tenantId: string, staffId: string) {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  return NativeStaff.findOne({ tenantId: tid, staffId, status: 'active' })
+  // LR-C4-USER-006: a chosen doctor whose linked login is deactivated is not
+  // bookable; the booking then falls back to round-robin, as for inactive staff.
+  return NativeStaff.findOne(await excludeDeactivatedLogins({ tenantId: tid, staffId, status: 'active' }, tid))
     .select('staffId firstName lastName teamId')
     .lean();
 }
@@ -62,7 +67,7 @@ export async function createStaff(data: any) {
   return doc;
 }
 
-export async function updateStaff(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateStaff(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   // Same row-level enforcement listStaffs already applies to the list view —
   // without it, a scoped Manager could edit (or reassign onto their own
@@ -73,21 +78,25 @@ export async function updateStaff(id: string, tenantId: string, data: any, scope
     : { staffId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffId');
+  // findOneAndUpdate skips the pre('save') hook that encrypts PII on create.
   const updated = await NativeStaff.findOneAndUpdate(
-    filter,
-    data,
+    withExpectedVersion(filter, guard),
+    preparePiiUpdate(data, 'staffs', NativeStaff),
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeStaff, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'staffs', updated.toObject(), [updated.firstName, updated.lastName].filter(Boolean).join(' '));
   return updated;
 }
 
-export async function deleteStaff(id: string, tenantId: string) {
+export async function deleteStaff(id: string, tenantId: string, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { staffId: id }] }
     : { staffId: id };
-  const deleted = await NativeStaff.findOneAndDelete({ ...idFilter, tenantId: tid });
+  const filter = { ...idFilter, tenantId: tid };
+  const deleted = await NativeStaff.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeStaff, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'staffs', String(deleted._id));
   return deleted;
 }

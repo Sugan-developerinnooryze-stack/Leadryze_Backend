@@ -4,6 +4,7 @@ import { PartListOptions } from './part.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listParts(tenantId: string, opts: PartListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -42,7 +43,7 @@ export async function createPart(data: any) {
   return created;
 }
 
-export async function updatePart(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updatePart(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { partId: id }] }
@@ -50,22 +51,24 @@ export async function updatePart(id: string, tenantId: string, data: any, scope?
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativePart.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativePart, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'parts', updated.toObject(), updated.name);
   return updated;
 }
 
-export async function deletePart(id: string, tenantId: string, scope?: DataScope) {
+export async function deletePart(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { partId: id }] }
     : { partId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativePart.findOneAndDelete(filter);
+  const deleted = await NativePart.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativePart, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'parts', String(deleted._id));
   return deleted;
 }

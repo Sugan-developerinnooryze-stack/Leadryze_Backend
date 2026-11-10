@@ -1,5 +1,6 @@
 import mongoose, { Schema } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
+import { registerAssistantProvenanceHooks } from '../shared/assistant-provenance';
 
 export const callSchema = new Schema(
   {
@@ -25,9 +26,22 @@ export const callSchema = new Schema(
     // Guard so the "upcoming call" reminder cron never emails/texts twice for
     // the same call — same shape as the pre-existing Activity.reminderSentAt.
     reminderSentAt: { type: Date },
+    // CRM-assistant reminder pause (shared/assistant-provenance.ts): set only
+    // by the internal CRM assistant gateway, in the same write, when it creates
+    // the call or changes a reminder-relevant field. While the call's
+    // reminder-relevant values still match the fingerprint, the reminder cron
+    // and the on-create confirmation send nothing to the customer.
+    // Server-managed and internal: no default (absent unless paused), never
+    // selected unless asked for, and dropped from toJSON/toObject.
+    assistantChangedAt:   { type: Date, select: false },
+    assistantFingerprint: { type: String, select: false },
+    // The reminder cron already logged "not sent" for the current pause.
+    reminderSuppressedAt: { type: Date, select: false },
   },
   { timestamps: true }
 );
+
+registerAssistantProvenanceHooks(callSchema, 'call');
 
 callSchema.pre('save', async function (next) {
   if (!this.isNew || this.clientId) return next();

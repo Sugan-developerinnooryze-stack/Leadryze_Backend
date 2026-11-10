@@ -43,7 +43,10 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
-    sendCreated(res, item);
+    // LR-R2-SEC-001: the saved document holds the encrypted phone/e-mail
+    // (pre-save encryption); answer with the same PII view as getOne.
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    sendCreated(res, transformPIIResponse(item, 'staffs', req.user!.role, viewRoles));
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -53,7 +56,9 @@ export async function update(req: AuthRequest, res: Response) {
   try {
     const item = await updateStaff(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'staffs'));
     if (!item) return sendError(res, 'Staff not found', 404);
-    sendSuccess(res, item);
+    // LR-R2-SEC-001: as on create.
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    sendSuccess(res, transformPIIResponse(item, 'staffs', req.user!.role, viewRoles));
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -80,7 +85,9 @@ export async function updateLocation(req: AuthRequest, res: Response) {
       { new: true }
     );
     if (!item) return sendError(res, 'Staff not found', 404);
-    sendSuccess(res, item);
+    // LR-R2-SEC-001: the whole staff record comes back, encrypted fields included.
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    sendSuccess(res, transformPIIResponse(item, 'staffs', req.user!.role, viewRoles));
   } catch (err: any) {
     sendError(res, err.message, 500);
   }

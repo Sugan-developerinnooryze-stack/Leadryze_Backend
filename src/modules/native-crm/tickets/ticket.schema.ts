@@ -1,6 +1,7 @@
 import mongoose, { Schema } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
 import { getNextSequence } from '../shared/counter.model';
+import { registerAssistantProvenanceHooks } from '../shared/assistant-provenance';
 
 export const ticketSchema = new Schema(
   {
@@ -39,9 +40,21 @@ export const ticketSchema = new Schema(
     resolvedAt:              { type: Date, default: null },
     closedAt:                { type: Date, default: null },
     firstRespondedAt:       { type: Date, default: null },
+
+    // CRM-assistant pause (shared/assistant-provenance.ts): set only by the
+    // internal CRM assistant gateway, in the same write, when it creates the
+    // ticket or changes a confirmation-relevant field. While set and still
+    // matching, the on-create confirmation sends nothing to the customer.
+    // Tickets have no reminder, so there is no reminderSuppressedAt.
+    // Server-managed and internal: no default, never selected unless asked
+    // for, and dropped from toJSON/toObject.
+    assistantChangedAt:   { type: Date, select: false },
+    assistantFingerprint: { type: String, select: false },
   },
   { timestamps: true }
 );
+
+registerAssistantProvenanceHooks(ticketSchema, 'ticket');
 
 ticketSchema.pre('save', async function (next) {
   if (!this.isNew) return next();

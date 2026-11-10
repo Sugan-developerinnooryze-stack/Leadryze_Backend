@@ -4,6 +4,7 @@ import { CategoryListOptions } from './category.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listCategories(tenantId: string, opts: CategoryListOptions, branchId?: string | null, scope?: DataScope) {
   const tid    = new mongoose.Types.ObjectId(tenantId);
@@ -36,24 +37,26 @@ export async function createCategory(data: any) {
   return doc;
 }
 
-export async function updateCategory(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateCategory(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeCategory.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeCategory, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'categories', updated.toObject(), updated.name);
   return updated;
 }
 
-export async function deleteCategory(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteCategory(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeCategory.findOneAndDelete(filter);
+  const deleted = await NativeCategory.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeCategory, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'categories', String(deleted._id));
   return deleted;
 }

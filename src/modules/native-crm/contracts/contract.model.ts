@@ -49,6 +49,10 @@ export interface IContractVisit {
   workOrderId?: string;   // human code e.g. BADE2FF4-WO-0001
   woId?:        string;   // workorder Mongo _id
   notes?:       string;
+  /** LR-R26-SCHED-001: when a generator run claimed this visit (set to
+   * 'scheduled' before its work order is created). A claim with no work
+   * order 15 minutes later is given back (releaseStaleVisitClaims). */
+  claimedAt?:   Date;
 }
 
 export interface IPartLine {
@@ -172,6 +176,7 @@ const visitSchema = new Schema<IContractVisit>(
     workOrderId: { type: String, trim: true },
     woId:        { type: String, trim: true },
     notes:       { type: String, trim: true },
+    claimedAt:   { type: Date },   // LR-R26-SCHED-001
   },
   { _id: false }
 );
@@ -266,6 +271,7 @@ schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, customerId: 1 });
 schema.index({ tenantId: 1, 'visits.serviceDate': 1, 'visits.status': 1 });
+schema.index({ tenantId: 1, endDate: 1 }); // date-range reads (Daily Events, calendar)
 
 export const NativeContract = mongoose.model<IContractDoc>(
   'NativeContract',

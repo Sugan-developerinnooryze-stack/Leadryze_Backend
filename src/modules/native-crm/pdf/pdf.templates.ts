@@ -1,4 +1,5 @@
 import { ITemplateSections, DEFAULT_TEMPLATE_SECTIONS } from '../fs-settings/doc-template-preference.model';
+import { pdfMoney, invoicePayment } from './pdf-money';
 export { DEFAULT_TEMPLATE_SECTIONS };
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -43,6 +44,7 @@ interface Ctx {
   c:        any;    // Customer (may be null)
   cur:      string; // currency symbol
   sections: ITemplateSections;
+  paidKey?: string; // invoices: the tenant's stage tagged 'paid' (LR-R26-PDF-002)
 }
 
 // ─── Shared service table ────────────────────────────────────────────────────
@@ -103,22 +105,61 @@ function partsTableHtml(parts: any[] | undefined, cur: string): string {
 // for docTypes that store them in sync (invoice/quotation/contract, see
 // invoice.service.ts), and the only way workorder (which has no such
 // persisted fields) can ever show a nonzero total at all.
-function totalsHtml(doc: any, label: string, cur: string): string {
-  const svc  = (doc.services ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
-  const prt  = (doc.parts    ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
-  const disc = doc.discount       ?? 0;
-  const gst  = doc.gstPercentage  ?? 0;
-  const raw  = svc + prt;          // subtotal before discount
-  const discAmt = raw * (disc / 100); // disc is a percentage (0-100), not a flat amount
-  const sub  = raw - discAmt;      // after discount, before tax
-  const tot  = sub + sub * (gst / 100);
+// LR-R26-CTR-007: the same money rule as the stored totals
+// (shared/document-totals.ts): with no line rates, the header's for
+// everything (as before); when lines have their own discount or tax, each
+// line at its own rate, else the header's, and parts at the header's. The PDF
+// used the header's for every line, so it disagreed with the saved total of a
+// work order, invoice or contract whose lines have their own rates.
+// Quotations (headerOnly) keep the header-only sum their service stores.
+// LR-R26-PDF-002: the numbers come from pdf-money.ts, shared with the
+// designer's totals rows; an invoice (pass `invoice`) prints its saved totals,
+// as the invoice page does. An invoice with payments ends with Total, Amount
+// Paid and BALANCE DUE (the receipts and what is left, as the invoice page
+// shows them); one that is paid with no receipts recorded ends with TOTAL; an
+// unpaid one with the label passed in (TOTAL DUE). Every invoice used to end
+// with TOTAL DUE and the full total, even when paid.
+function totalsHtml(doc: any, label: string, cur: string, headerOnly = false, invoice?: { paidKey?: string }): string {
+  const m = pdfMoney(doc, headerOnly ? 'quotation' : invoice ? 'invoice' : 'other');
+  const raw = m.subtotal;          // subtotal before discount
+  const sub = m.afterDiscount;     // after discount, before tax
+  const tot = m.total;
+  const closing = closingTotalsRows(doc, label, tot, cur, invoice);
+  if (m.lineRates) {
+    const discAmt = m.discount;
+    const taxAmt  = tot - sub;
+    return `
+    <div class="totals-box">
+      <div class="t-row"><span class="t-lbl">Subtotal</span><span>${fmt(raw, cur)}</span></div>
+      ${discAmt > 0.004 ? `<div class="t-row"><span class="t-lbl" style="color:#dc2626">Discount</span><span style="color:#dc2626">-${fmt(discAmt, cur)}</span></div>` : ''}
+      ${taxAmt > 0.004  ? `<div class="t-row"><span class="t-lbl">Tax</span><span>${fmt(taxAmt, cur)}</span></div>` : ''}
+      ${closing}
+    </div>`;
+  }
+  const disc = m.discountPercent;
+  const gst  = m.gstPercent;
+  const discAmt = m.discount;      // disc is a percentage (0-100), not a flat amount
   return `
     <div class="totals-box">
       <div class="t-row"><span class="t-lbl">Subtotal</span><span>${fmt(raw, cur)}</span></div>
       ${disc > 0 ? `<div class="t-row"><span class="t-lbl" style="color:#dc2626">Discount (${disc}%)</span><span style="color:#dc2626">-${fmt(discAmt, cur)}</span></div>` : ''}
       ${gst > 0  ? `<div class="t-row"><span class="t-lbl">GST (${gst}%)</span><span>${fmt(tot - sub, cur)}</span></div>` : ''}
-      <div class="t-row grand"><span>${label}</span><span>${fmt(tot, cur)}</span></div>
+      ${closing}
     </div>`;
+}
+
+function closingTotalsRows(doc: any, label: string, tot: number, cur: string, invoice?: { paidKey?: string }): string {
+  const grand = (lbl: string, n: number) => `<div class="t-row grand"><span>${lbl}</span><span>${fmt(n, cur)}</span></div>`;
+  if (!invoice) return grand(label, tot);
+  const pay = invoicePayment(doc, tot, invoice.paidKey);
+  // The variant's own casing: TOTAL DUE -> TOTAL / BALANCE DUE, Total Due -> Total / Balance Due.
+  const cased = (s: string) => (label === label.toUpperCase() ? s.toUpperCase() : s);
+  if (pay.paid > 0) {
+    return `<div class="t-row" style="font-weight:700"><span>${cased('Total')}</span><span>${fmt(tot, cur)}</span></div>
+      <div class="t-row"><span class="t-lbl">Amount Paid</span><span>${fmt(pay.paid, cur)}</span></div>
+      ${grand(cased('Balance Due'), pay.balance)}`;
+  }
+  return grand(pay.settled ? cased('Total') : label, tot);
 }
 
 // ─── Signature row ───────────────────────────────────────────────────────────
@@ -184,6 +225,35 @@ const PRIORITY_BADGE:  Record<string, string> = { high: 'bd', medium: 'ba', low:
 
 function badge(map: Record<string, string>, val: string): string {
   return `<span class="badge ${map[val] ?? 'bz'}">${val.replace(/_/g, ' ').toUpperCase()}</span>`;
+}
+
+// LR-R26-PDF-002: the status badge and at most one payment badge. A paid
+// invoice (status paid, paid true) printed PAID twice. Now: the status alone
+// when it is the paid stage; otherwise PAID when it is settled, PARTIALLY PAID
+// when some but not all is paid, never the same word twice.
+function invoiceBadges(ctx: Ctx, extraStyle = ''): string {
+  const { doc, paidKey } = ctx;
+  const status = String(doc.status ?? 'draft');
+  const map = paidKey && !INVOICE_BADGE[paidKey] ? { ...INVOICE_BADGE, [paidKey]: 'bg' } : INVOICE_BADGE;
+  const pay = invoicePayment(doc, pdfMoney(doc, 'invoice').total, paidKey);
+  const style = extraStyle ? ` style="${extraStyle}"` : '';
+  const statusText = status.replace(/_/g, ' ').toUpperCase();
+  let extra = '';
+  if (!pay.paidStage) {
+    if (pay.settled && statusText !== 'PAID') extra = `<span class="badge bg"${style}>PAID</span>`;
+    else if (!pay.settled && pay.paid > 0 && statusText !== 'PARTIALLY PAID') extra = `<span class="badge ba"${style}>PARTIALLY PAID</span>`;
+  }
+  return badge(map, status) + extra;
+}
+
+// LR-R26-PDF-002: a tax invoice must name the seller's tax registration, so
+// the title says TAX INVOICE only when FS Settings has a GSTIN / tax ID, and
+// INVOICE otherwise. The seller's name falls back to the tenant's name when FS
+// Settings has none (pdf.controller.ts).
+function invoiceTitle(ctx: Ctx, upper = true): string {
+  const tax = typeof ctx.s?.gstin === 'string' && ctx.s.gstin.trim() !== '';
+  const t = tax ? 'Tax Invoice' : 'Invoice';
+  return upper ? t.toUpperCase() : t;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -553,9 +623,9 @@ function invoiceClassic(ctx: Ctx): string {
     <div>Date: ${fmtDate(doc.createdAt)}</div>
     ${doc.dueDate    ? `<div>Due: ${fmtDate(doc.dueDate)}</div>`      : ''}
     ${doc.workOrderId? `<div>Work Order: ${esc(doc.workOrderId)}</div>` : ''}
-    <div style="margin-top:6px">${badge(INVOICE_BADGE, doc.status ?? 'draft')}${doc.paid ? `<span class="badge bg">PAID</span>` : ''}</div>`;
+    <div style="margin-top:6px">${invoiceBadges(ctx)}</div>`;
   return html(CLASSIC_CSS, `<div class="page">
-    ${classicHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
+    ${classicHeader(ctx, invoiceTitle(ctx), doc.invoiceId ?? '', metaRight)}
     ${classicBillTo(ctx, doc.address)}
     ${sections.services ? `
     <p class="section-lbl">Services</p>
@@ -564,7 +634,7 @@ function invoiceClassic(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur, false, { paidKey: ctx.paidKey }) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -581,9 +651,9 @@ function invoiceModern(ctx: Ctx): string {
     <div>Date: ${fmtDate(doc.createdAt)}</div>
     ${doc.dueDate ? `<div>Due: ${fmtDate(doc.dueDate)}</div>` : ''}
     ${doc.workOrderId ? `<div>Work Order: ${esc(doc.workOrderId)}</div>` : ''}
-    <div style="margin-top:6px">${badge(INVOICE_BADGE, doc.status ?? 'draft')}${doc.paid ? `<span class="badge bg" style="margin-left:4px">PAID</span>` : ''}</div>`;
+    <div style="margin-top:6px">${invoiceBadges(ctx, 'margin-left:4px')}</div>`;
   return html(MODERN_CSS, `
-    ${modernHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
+    ${modernHeader(ctx, invoiceTitle(ctx), doc.invoiceId ?? '', metaRight)}
     ${modernBillTo(ctx, companyInfo, doc.address)}
     ${sections.services ? `
     <p class="section-lbl">Services</p>
@@ -592,7 +662,7 @@ function invoiceModern(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur, false, { paidKey: ctx.paidKey }) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -606,9 +676,9 @@ function invoiceMinimal(ctx: Ctx): string {
   const metaRight = `
     ${fmtDate(doc.createdAt)}<br>
     ${doc.dueDate ? `Due: ${fmtDate(doc.dueDate)}<br>` : ''}
-    ${badge(INVOICE_BADGE, doc.status ?? 'draft')}${doc.paid ? `<span class="badge bg">PAID</span>` : ''}`;
+    ${invoiceBadges(ctx)}`;
   return html(MINIMAL_CSS, `<div class="page">
-    ${minimalHeader(ctx, 'Tax Invoice', doc.invoiceId ?? '', metaRight)}
+    ${minimalHeader(ctx, invoiceTitle(ctx, false), doc.invoiceId ?? '', metaRight)}
     ${minimalBillTo(ctx, doc.address)}
     ${sections.services ? `
     <p class="section-lbl">Services</p>
@@ -617,7 +687,7 @@ function invoiceMinimal(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'Total Due', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'Total Due', cur, false, { paidKey: ctx.paidKey }) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -632,9 +702,9 @@ function invoiceElegant(ctx: Ctx): string {
     <div>Date: ${fmtDate(doc.createdAt)}</div>
     ${doc.dueDate    ? `<div>Due: ${fmtDate(doc.dueDate)}</div>`      : ''}
     ${doc.workOrderId? `<div>Work Order: ${esc(doc.workOrderId)}</div>` : ''}
-    <div style="margin-top:6px">${badge(INVOICE_BADGE, doc.status ?? 'draft')}${doc.paid ? `<span class="badge bg">PAID</span>` : ''}</div>`;
+    <div style="margin-top:6px">${invoiceBadges(ctx)}</div>`;
   return html(ELEGANT_CSS, `<div class="page">
-    ${elegantHeader(ctx, 'TAX INVOICE', doc.invoiceId ?? '', metaRight)}
+    ${elegantHeader(ctx, invoiceTitle(ctx), doc.invoiceId ?? '', metaRight)}
     ${elegantBillTo(ctx, doc.address)}
     ${sections.services ? `
     <p class="section-lbl">Services</p>
@@ -643,7 +713,7 @@ function invoiceElegant(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL DUE', cur, false, { paidKey: ctx.paidKey }) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -673,7 +743,7 @@ function quotationClassic(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur, true) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -701,7 +771,7 @@ function quotationModern(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur, true) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -727,7 +797,7 @@ function quotationMinimal(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'Total', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'Total', cur, true) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -753,7 +823,7 @@ function quotationElegant(ctx: Ctx): string {
       <tbody>${svcRows(doc.services ?? [], true, cur)}</tbody>
     </table>` : ''}
     ${sections.parts ? partsTableHtml(doc.parts, cur) : ''}
-    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur) : ''}
+    ${sections.totals ? totalsHtml(doc, 'TOTAL', cur, true) : ''}
     ${sections.notes ? richBox('Notes', doc.notes) : ''}
     ${sections.terms ? richBox('Terms &amp; Conditions', doc.termsAndConditions) : ''}
     ${bankHtml(s, cur)}
@@ -1099,15 +1169,22 @@ function workorderElegant(ctx: Ctx): string {
 // ─── PUBLIC API — one function per document type ───────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function buildCtx(doc: any, settings: any, customer: any, sections?: Partial<ITemplateSections>): Ctx {
+/** Per-render facts the caller looks up (pdf.controller.ts). */
+export interface TemplateExtras {
+  /** Invoices: the tenant's stage key tagged 'paid'; 'paid' when not given. */
+  invoicePaidKey?: string;
+}
+
+function buildCtx(doc: any, settings: any, customer: any, sections?: Partial<ITemplateSections>, extras?: TemplateExtras): Ctx {
   return {
     doc, s: settings ?? {}, c: customer ?? null, cur: currencySymbol(settings?.currency),
     sections: { ...DEFAULT_TEMPLATE_SECTIONS, ...(sections ?? {}) },
+    paidKey: extras?.invoicePaidKey,
   };
 }
 
-export function invoiceTemplate(doc: any, settings?: any, customer?: any, variant = 'classic', sections?: Partial<ITemplateSections>): string {
-  const ctx = buildCtx(doc, settings, customer, sections);
+export function invoiceTemplate(doc: any, settings?: any, customer?: any, variant = 'classic', sections?: Partial<ITemplateSections>, extras?: TemplateExtras): string {
+  const ctx = buildCtx(doc, settings, customer, sections, extras);
   if (variant === 'modern')  return invoiceModern(ctx);
   if (variant === 'minimal') return invoiceMinimal(ctx);
   if (variant === 'elegant') return invoiceElegant(ctx);

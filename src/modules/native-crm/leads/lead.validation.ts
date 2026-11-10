@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { customFields } from '../../../utils/common.schemas';
+import { isMaskedPiiValue } from '../shared/pii-update';
 
 // Stage keys are tenant-configurable (native-crm/pipeline-config), so this is
 // no longer a fixed enum — validity against the tenant's own stage list is
@@ -99,19 +100,18 @@ export const createLeadSchema = z.object({
 });
 
 // LR-C4-LEAD-003: If a role with masked PII views a record, the client may submit
-// masked values (e.g. qa****@q****.com or 65XXXXXX11). On update, allow masked strings
-// so validation does not fail with 400.
-const isMaskedPiiString = (v: string) => typeof v === 'string' && (v.includes('*') || /X{2,}/.test(v));
-
+// masked values (e.g. qa****@q****.com, 65XXXXXX11, or 12X45 for a 5-digit phone).
+// On update, allow masked strings so validation does not fail with 400; updateLead
+// then drops them. Same test as the service (shared/pii-update.ts).
 const updateEmailSchema = z.string().trim().refine(
-  (v) => !v || isMaskedPiiString(v) || z.string().email().safeParse(v).success,
+  (v) => !v || isMaskedPiiValue('email', v) || z.string().email().safeParse(v).success,
   { message: 'Invalid email address' }
 ).optional().or(z.literal(''));
 
 const updatePhoneSchema = z.preprocess(
   (val) => (val != null && typeof val === 'number' ? String(val) : val),
   z.string().trim().refine(
-    (v) => !v || isMaskedPiiString(v) || PHONE_FORMAT_REGEX.test(v),
+    (v) => !v || isMaskedPiiValue('phone', v) || PHONE_FORMAT_REGEX.test(v),
     { message: 'Enter a valid phone number' }
   ).optional().or(z.literal(''))
 );
@@ -130,6 +130,12 @@ export const updateLeadSchema = createLeadSchema.partial().extend({
   __v: z.number().optional(),
 });
 
+// LR-NEG-001: the stage move is version-checked like a save (updateLeadStage),
+// so its token must survive validation; without these keys Zod stripped them
+// and every Kanban drag was refused as "changed by someone else".
 export const updateStageSchema = z.object({
   status: statusSchema,
+  updatedAt: z.string().optional(),
+  __v: z.number().optional(),
+  version: z.number().optional(),
 });

@@ -5,7 +5,7 @@
 
 import { zonedTimeToUtc, todayInTimezone } from './timezone';
 
-export type DateRangeKey = 'today' | 'week' | 'month' | 'this_month' | '3months' | '6months' | '1year' | 'custom';
+export type DateRangeKey = 'today' | 'week' | 'month' | 'this_month' | '3months' | '6months' | '1year' | 'custom' | 'exact';
 
 export interface ResolvedDateRange {
   start: Date;
@@ -24,6 +24,19 @@ const ROLLING_MONTHS: Record<string, number> = { '3months': 3, '6months': 6, '1y
  * treat null as "don't filter," so a malformed custom range degrades to
  * "show everything" rather than a 500. */
 export function resolveDateRange(range?: string, customFrom?: string, customTo?: string): ResolvedDateRange | null {
+  // 'exact': customFrom/customTo are full ISO instants used as given, with
+  // no server-local midnight rounding. Only the internal CRM assistant
+  // gateway sends it (its tenant-timezone windows are computed by
+  // resolveTenantDateWindow below), so every existing key still behaves
+  // exactly as before. Invalid or incomplete input means no filter, the
+  // same as 'custom'.
+  if (range === 'exact') {
+    if (!customFrom || !customTo) return null;
+    const start = new Date(customFrom);
+    const end = new Date(customTo);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) return null;
+    return { start, end };
+  }
   if (!range || !RANGE_KEYS.includes(range)) return null;
 
   const now = new Date();
@@ -78,7 +91,7 @@ export function resolveDateRange(range?: string, customFrom?: string, customTo?:
  * "prior period" to compare against. */
 export function resolvePriorDateRange(range?: string, customFrom?: string, customTo?: string): ResolvedDateRange | null {
   const current = resolveDateRange(range, customFrom, customTo);
-  if (!current || range === 'custom') return null;
+  if (!current || range === 'custom' || range === 'exact') return null;
 
   if (range === 'today') {
     const start = new Date(current.start);
@@ -130,6 +143,111 @@ export function resolveDateRangeForTenant(timeZone: string): ResolvedDateRange {
   // separate end-of-day helper.
   const end = new Date(zonedTimeToUtc(year, month0, day, 23, 59, timeZone).getTime() + 59_999);
   return { start, end };
+}
+
+/** Named date windows the internal CRM assistant gateway accepts
+ * (GET /api/internal/crm-list and /crm-count). */
+export const TENANT_WINDOW_RANGES = ['today', 'this_week', 'this_month', 'last_7_days', 'next_7_days', 'custom'] as const;
+export type TenantWindowRange = typeof TENANT_WINDOW_RANGES[number];
+
+/** True when `timeZone` is an IANA zone this runtime understands. */
+export function isValidTimeZone(timeZone: string | undefined | null): timeZone is string {
+  if (!timeZone) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Strict YYYY-MM-DD that is also a real calendar date (no 2026-02-30). */
+export function parseIsoCalendarDate(value: string | undefined | null): { year: number; month0: number; day: number } | null {
+  if (typeof value !== 'string') return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month0 = Number(m[2]) - 1;
+  const day = Number(m[3]);
+  const probe = new Date(Date.UTC(year, month0, day));
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month0 || probe.getUTCDate() !== day) return null;
+  return { year, month0, day };
+}
+
+/** Calendar-day arithmetic that never touches the server's own timezone. */
+function shiftCalendarDay(d: { year: number; month0: number; day: number }, deltaDays: number) {
+  const t = new Date(Date.UTC(d.year, d.month0, d.day + deltaDays));
+  return { year: t.getUTCFullYear(), month0: t.getUTCMonth(), day: t.getUTCDate() };
+}
+
+function startOfLocalDay(d: { year: number; month0: number; day: number }, timeZone: string): Date {
+  return zonedTimeToUtc(d.year, d.month0, d.day, 0, 0, timeZone);
+}
+
+/** 23:59:59.999 local = one millisecond before the next local midnight,
+ * which stays correct on a day that is 23 or 25 hours long (DST). */
+function endOfLocalDay(d: { year: number; month0: number; day: number }, timeZone: string): Date {
+  return new Date(startOfLocalDay(shiftCalendarDay(d, 1), timeZone).getTime() - 1);
+}
+
+/** Full calendar periods in the TENANT's timezone, as exact UTC instants —
+ * used by the internal CRM assistant gateway only. Additive: nothing that
+ * calls resolveDateRange (server-local) changes. An unknown/invalid
+ * timeZone falls back to UTC; the zone actually used is returned so the
+ * caller can report it.
+ *   today        local 00:00 -> 23:59:59.999
+ *   this_week    Monday 00:00 -> Sunday 23:59:59.999
+ *   this_month   1st 00:00 -> last day 23:59:59.999
+ *   last_7_days  (today-6) 00:00 -> today 23:59:59.999
+ *   next_7_days  today 00:00 -> (today+6) 23:59:59.999
+ *   custom       dateFrom 00:00 -> dateTo 23:59:59.999 (YYYY-MM-DD, from <= to)
+ * Returns null for an unknown range or an invalid/reversed custom pair. */
+export function resolveTenantDateWindow(
+  range: string,
+  timeZone: string | undefined | null,
+  dateFrom?: string,
+  dateTo?: string,
+  now: Date = new Date(),
+): (ResolvedDateRange & { timeZone: string }) | null {
+  const tz = isValidTimeZone(timeZone) ? timeZone : 'UTC';
+  const today = todayInTimezone(tz, now);
+  let first: { year: number; month0: number; day: number };
+  let last: { year: number; month0: number; day: number };
+
+  switch (range) {
+    case 'today':
+      first = today; last = today;
+      break;
+    case 'this_week': {
+      const dow = new Date(Date.UTC(today.year, today.month0, today.day)).getUTCDay(); // 0=Sun..6=Sat
+      first = shiftCalendarDay(today, -((dow + 6) % 7));
+      last = shiftCalendarDay(first, 6);
+      break;
+    }
+    case 'this_month': {
+      first = { year: today.year, month0: today.month0, day: 1 };
+      const lastDay = new Date(Date.UTC(today.year, today.month0 + 1, 0)).getUTCDate();
+      last = { year: today.year, month0: today.month0, day: lastDay };
+      break;
+    }
+    case 'last_7_days':
+      first = shiftCalendarDay(today, -6); last = today;
+      break;
+    case 'next_7_days':
+      first = today; last = shiftCalendarDay(today, 6);
+      break;
+    case 'custom': {
+      const from = parseIsoCalendarDate(dateFrom);
+      const to = parseIsoCalendarDate(dateTo);
+      if (!from || !to) return null;
+      if (Date.UTC(from.year, from.month0, from.day) > Date.UTC(to.year, to.month0, to.day)) return null;
+      first = from; last = to;
+      break;
+    }
+    default:
+      return null;
+  }
+  return { start: startOfLocalDay(first, tz), end: endOfLocalDay(last, tz), timeZone: tz };
 }
 
 /** Applies a resolved range to a Mongo filter object in place — a no-op

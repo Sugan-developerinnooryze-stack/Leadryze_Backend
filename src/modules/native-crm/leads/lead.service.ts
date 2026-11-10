@@ -9,7 +9,9 @@ import { customFieldsSearchExpr } from '../shared/custom-field-query';
 import { conditionsToMongoFilter } from '../automation-rules/automation-rule.service';
 import { IFlowCondition } from '../automation-rules/automation-rule.model';
 import { hashEmail } from '../../../platform/pii/pii.service';
+import { isMaskedPiiValue, LEAD_MASKABLE_FIELDS } from '../shared/pii-update';
 import { NativeStaff } from '../staffs/staff.model';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 function leadDisplayName(l: any): string {
   return [l.firstName, l.lastName].filter(Boolean).join(' ') || l.company || l.leadId;
@@ -221,12 +223,13 @@ export async function updateLead(id: string, tenantId: string, data: any, scope?
 
   const { updatedAt: _u, __v: _v, version: _ver, ...cleanData } = data;
 
-  // LR-C4-LEAD-003: If email or phone contains masking characters (* or X),
-  // never overwrite real stored PII with the masked string
-  const PII_FIELDS = ['email', 'secondaryEmail', 'phone', 'mobile', 'whatsapp', 'alternatePhone'];
-  for (const f of PII_FIELDS) {
+  // LR-C4-LEAD-003: a role the tenant hides lead PII from edits the masked
+  // display values (masking.service.ts). Never write one back over the real
+  // data: every maskable lead field, the address included, with the same
+  // test preparePiiUpdate uses (a 5-digit phone masks to "12X45").
+  for (const f of LEAD_MASKABLE_FIELDS) {
     const val = (cleanData as any)[f];
-    if (typeof val === 'string' && (val.includes('*') || /X{2,}/.test(val))) {
+    if (typeof val === 'string' && isMaskedPiiValue(f, val)) {
       delete (cleanData as any)[f];
     }
   }
@@ -281,11 +284,12 @@ export async function updateLeadStage(
   return lead;
 }
 
-export async function deleteLead(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteLead(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'leadOwnerStaffId', undefined, undefined, 'createdBy');
-  const deleted = await Lead.findOneAndDelete(filter);
+  const deleted = await Lead.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(Lead, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'leads', String(deleted._id));
   return deleted;
 }

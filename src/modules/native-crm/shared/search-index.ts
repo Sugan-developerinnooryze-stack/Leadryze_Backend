@@ -1,4 +1,5 @@
 import { indexCRMRecords, removeMeiliRecords, buildMeiliId } from '../../../services/meilisearch.service';
+import { withoutAssistantMarkers } from './assistant-provenance';
 
 /** The three namespaces this file's callers use — distinct from every
  * connector `channel` value (always a real connector type) and from
@@ -36,7 +37,10 @@ export function indexNativeSearchRecord(
     tenantId, channel, module,
     externalId: String(_id),
     displayName: displayName || 'Untitled',
-    data: rest,
+    // The CRM-assistant reminder-pause markers are internal bookkeeping and
+    // never searchable. Callers already pass marker-free objects (toObject
+    // drops them; lean reads don't select them). This is the second layer.
+    data: withoutAssistantMarkers(rest),
   }]);
 }
 

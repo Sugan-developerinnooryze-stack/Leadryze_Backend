@@ -30,9 +30,11 @@ export function zonedTimeToUtc(year: number, month0: number, day: number, hour: 
  * can be on a different date than a tenant in Asia/Kolkata near midnight.
  * `month0` is zero-based (JS Date convention), matching zonedTimeToUtc's
  * own parameter. */
-export function todayInTimezone(timeZone: string): { year: number; month0: number; day: number } {
+export function todayInTimezone(timeZone: string, now: Date = new Date()): { year: number; month0: number; day: number } {
+  // `now` is optional and defaults to the real current time, so every
+  // existing caller is unchanged; passing it lets tests pin the clock.
   const fmt = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
-  const parts = fmt.formatToParts(new Date());
+  const parts = fmt.formatToParts(now);
   const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
   return { year: get('year'), month0: get('month') - 1, day: get('day') };
 }

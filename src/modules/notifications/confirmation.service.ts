@@ -8,6 +8,13 @@ import { sendSmsNow } from '../messages/twilio.service';
 import { Tenant } from '../tenants/tenant.model';
 import { FSSettings } from '../native-crm/fs-settings/fs-settings.model';
 import { Branch } from '../native-crm/branches/branch.model';
+import {
+  evaluateAssistantPause, assistantMarkerSelect, assistantPauseInCurrentWrite, AssistantPauseState,
+  ASSISTANT_CONFIRMATION_SKIP_REASON, ASSISTANT_MARKER_KEYS, ASSISTANT_CHANGED_AT, ASSISTANT_FINGERPRINT,
+} from '../native-crm/shared/assistant-provenance';
+import { Call } from '../native-crm/calls/call.model';
+import { Ticket } from '../native-crm/tickets/ticket.model';
+import type { Model } from 'mongoose';
 // This module only ever handles the 4 "scheduled item" sources — the wider
 // EmailLogSourceModule (which also covers automation-rule sources like
 // 'lead'/'deal'/'quotation') is a storage-level type, not this file's scope.
@@ -133,6 +140,50 @@ export function isPastOrInactiveStatus(sourceModule: ConfirmationSourceModule, r
   return false;
 }
 
+/** Models whose records can carry the CRM-assistant pause markers and get an
+ * on-create confirmation. Task never gets one (see below). Meeting is not
+ * assistant-writable and has no markers. */
+const PAUSE_MARKER_MODELS: Partial<Record<ConfirmationSourceModule, Model<any>>> = { call: Call, ticket: Ticket };
+
+function markersOf(source: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of ASSISTANT_MARKER_KEYS) if (source && source[key] !== undefined) out[key] = source[key];
+  return out;
+}
+
+/** The CRM-assistant pause for a record about to be confirmed
+ * (shared/assistant-provenance.ts), using the same fingerprint rule as the
+ * reminder cron. The record's own values are compared with the markers
+ * STORED for it. The services pass `created.toObject()`, which never
+ * carries the (select:false, toObject-hidden) markers, so the stored markers
+ * come from one of two places:
+ * - the assistant write in progress, when it just created this record
+ *   (the gateway create path), or
+ * - one `_id` read of the markers.
+ * If that read fails or finds nothing, the record's own marker keys are
+ * used (normally none, so the confirmation is sent as before). */
+async function assistantPauseForConfirmation(sourceModule: ConfirmationSourceModule, record: SourceRecord): Promise<AssistantPauseState> {
+  const inThisWrite = assistantPauseInCurrentWrite(sourceModule, String(record._id));
+  let stored: Record<string, unknown> | null = inThisWrite
+    ? { [ASSISTANT_CHANGED_AT]: inThisWrite.at, [ASSISTANT_FINGERPRINT]: inThisWrite.fingerprint }
+    : null;
+  const model = PAUSE_MARKER_MODELS[sourceModule];
+  if (!stored && model) {
+    try {
+      const doc = await model.findById(record._id).select(assistantMarkerSelect(model.schema)).lean() as Record<string, unknown> | null;
+      if (doc) stored = markersOf(doc);
+    } catch (err) {
+      logger.warn('On-create confirmation: could not read the CRM-assistant pause markers', { sourceModule, recordId: String(record._id), error: (err as Error).message });
+    }
+  }
+  // A Mongoose document is read through toObject(). A spread would miss its
+  // field getters. Its own markers still come from the getters (markersOf).
+  const asDocument = record as { toObject?: () => Record<string, unknown> };
+  const values: Record<string, unknown> = typeof asDocument.toObject === 'function' ? asDocument.toObject() : { ...record };
+  for (const key of ASSISTANT_MARKER_KEYS) delete values[key];
+  return evaluateAssistantPause(sourceModule, { ...values, ...(stored ?? markersOf(record)) });
+}
+
 /**
  * Fires an immediate "you have a new X scheduled" confirmation when a
  * Call/Meeting/Task/Ticket is created linked to a resolvable Customer/
@@ -159,6 +210,20 @@ export async function sendOnCreateConfirmation(
     const relatedLabel = record.relatedLabel ?? undefined;
 
     const sourceId = String(record._id);
+    // Backstop: a record whose confirmation data is still exactly what the
+    // internal CRM assistant wrote never gets a customer confirmation. Today
+    // that is every record the gateway creates (see
+    // native-crm/shared/assistant-provenance.ts). Decided before any
+    // recipient is resolved or content rendered, and logged so history stays
+    // complete. Nothing retries these rows.
+    if ((await assistantPauseForConfirmation(sourceModule, record)).paused) {
+      await writeLog({
+        tenantId, channel: 'email', kind: 'on_create_confirmation', sourceModule, sourceId,
+        relatedModule, relatedId, relatedLabel,
+        status: 'skipped', errorMessage: ASSISTANT_CONFIRMATION_SKIP_REASON,
+      });
+      return;
+    }
     const recipient = await resolveRecipient(tenantId, relatedModule, relatedId);
     const title = titleOf(sourceModule, record);
     const noun = NOUN[sourceModule];

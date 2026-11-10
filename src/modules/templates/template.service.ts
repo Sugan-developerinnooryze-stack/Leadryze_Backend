@@ -9,6 +9,7 @@ import { sendEmailNow } from '../messages/brevo.service';
 import { sendSmsNow } from '../messages/twilio.service';
 import { sendWhatsAppNow } from '../messages/whatsapp.service';
 import { Tenant } from '../tenants/tenant.model';
+import { resolveTenantReplyTo, REPLY_TO_MISSING_MESSAGE } from '../messages/tenant-reply-to';
 import { config } from '../../config';
 
 function extractVariables(body: string): string[] {
@@ -264,7 +265,9 @@ export async function testSendTemplate(tenantId: string, id: string, to: string)
   if (template.type === 'email') {
     const subject = template.subject ? renderTemplate(template.subject, variables) : 'Test message';
     const senderName = tenant?.branding?.companyName || tenant?.name || config.brevo.senderName;
-    const replyTo = tenant?.branding?.contactEmail || undefined;
+    // LR-PL-CAMP-003: not sent without the tenant's own reply address.
+    const replyTo = await resolveTenantReplyTo(tenantId, tenant);
+    if (!replyTo) return { sent: false, reason: REPLY_TO_MISSING_MESSAGE };
     try {
       const messageId = await sendEmailNow({
         to,

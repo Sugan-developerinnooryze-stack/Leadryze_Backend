@@ -4,6 +4,7 @@ import { ServiceListOptions } from './service.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listServices(tenantId: string, opts: ServiceListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -44,7 +45,7 @@ export async function createService(data: any) {
   return doc;
 }
 
-export async function updateService(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateService(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { serviceId: id }] }
@@ -52,22 +53,24 @@ export async function updateService(id: string, tenantId: string, data: any, sco
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeService.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeService, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'services', updated.toObject(), updated.name);
   return updated;
 }
 
-export async function deleteService(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteService(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { serviceId: id }] }
     : { serviceId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeService.findOneAndDelete(filter);
+  const deleted = await NativeService.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeService, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'services', String(deleted._id));
   return deleted;
 }

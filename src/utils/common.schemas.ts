@@ -14,6 +14,13 @@ export const pageQuery = z.object({
 
 export const customFields = z.record(z.unknown()).optional();
 
+// LR-R2-ACT-001: a timezone name the runtime knows ("Asia/Singapore"), as the
+// browser reports it. Confirmation and reminder e-mails format times in it,
+// so anything else would break them.
+export const ianaTimezone = z.string().trim().max(64).refine((tz) => {
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
+}, { message: 'timezone must be a timezone name such as Asia/Singapore' });
+
 // For optional fields that map to a Mongoose ObjectId ref — an unselected
 // dropdown sends "" rather than omitting the key, which Mongoose can't cast.
 export const optionalObjectId = z

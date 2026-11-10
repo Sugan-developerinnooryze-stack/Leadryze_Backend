@@ -10,6 +10,13 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { hashEmail } from '../../../platform/pii/pii.service';
 import { decrypt, isEncrypted } from '../../../utils/crypto';
 import { User } from '../../auth/auth.model';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
+
+/** LR-C4-DEL-002: an id that is not an ObjectId matches no record. It was
+ * looked up as clientId, but clientId here is the tenant's prefix, the same
+ * on every record, so GET, PUT or DELETE with the prefix as the id reached an
+ * arbitrary record of the tenant (DELETE deleted one). */
+const NO_RECORD = { _id: { $in: [] as mongoose.Types.ObjectId[] } };
 
 // LR-UX-010: mirrors lead.service.ts's resolveLeadSort exactly — Contacts
 // never had a server-side sort at all before this (always hardcoded
@@ -23,25 +30,33 @@ function resolveContactSort(opts: ListOptions): Record<string, 1 | -1> {
   return { [opts.sortBy]: dir };
 }
 
+/** The values a contact's contactOwner may hold for this user: the userId,
+ * the user's "First Last" and User.name (contacts store any of them). Used
+ * by listContacts and by the CRM assistant's contact scope, so both match
+ * the same contacts. */
+export async function contactOwnerValues(userId?: string): Promise<string[]> {
+  const owners: string[] = [];
+  if (!userId) return owners;
+  owners.push(userId);
+  if (mongoose.isValidObjectId(userId)) {
+    try {
+      const userDoc = await User.findById(userId).select('firstName lastName name').lean();
+      if (userDoc) {
+        const fullName = [userDoc.firstName, userDoc.lastName].filter(Boolean).join(' ').trim();
+        if (fullName) owners.push(fullName);
+        if ((userDoc as any).name) owners.push((userDoc as any).name);
+      }
+    } catch {}
+  }
+  return owners;
+}
+
 export async function listContacts(tenantId: string, opts: ListOptions = {}, branchId?: string | null, scope?: DataScope, userId?: string): Promise<PaginatedResult<unknown>> {
   const { page = 1, limit = 20, search, status, ownerTab } = opts;
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
   if (branchId) filter.branchId = new mongoose.Types.ObjectId(branchId);
-  let possibleOwners: string[] = [];
-  if (userId) {
-    possibleOwners.push(userId);
-    if (mongoose.isValidObjectId(userId)) {
-      try {
-        const userDoc = await User.findById(userId).select('firstName lastName name').lean();
-        if (userDoc) {
-          const fullName = [userDoc.firstName, userDoc.lastName].filter(Boolean).join(' ').trim();
-          if (fullName) possibleOwners.push(fullName);
-          if ((userDoc as any).name) possibleOwners.push((userDoc as any).name);
-        }
-      } catch {}
-    }
-  }
+  const possibleOwners = await contactOwnerValues(userId);
 
   // LR-C4-PERM-003: Scoping checks both createdBy and contactOwner so records
   // assigned to a Manager/Agent are visible even if created by Admin.
@@ -116,30 +131,51 @@ export async function listContacts(tenantId: string, opts: ListOptions = {}, bra
   return { items, total, page, pages: Math.ceil(total / limit) };
 }
 
-export async function getContactById(tenantId: string, id: string, scope?: DataScope) {
+/* getContactById, updateContact, deleteContact and getContactStats take an
+ * optional extraOwnerValues: the caller's owner values (contactOwnerValues:
+ * their userId, "First Last" and User.name). With it, a contact owned by the
+ * caller's name, which listContacts shows them, is found too. The Contacts
+ * screens pass it for all four (LR-C4-PERM-003, approved rule: a contact the
+ * list shows opens, saves and deletes the same way); the CRM assistant passes
+ * it for its record reads only, so a contact owned only by a name is still
+ * not changed from chat. Without it, these match ids only, as before. */
+
+export async function getContactById(tenantId: string, id: string, scope?: DataScope, extraOwnerValues?: string[]) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
-    : { clientId: id };
+    : NO_RECORD;
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
-  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner');
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner', extraOwnerValues);
   return Contact.findOne(filter).select('-emailSearch -phoneSearch -emailDomain').lean();
+}
+
+/** LR-R26-USER-007: a contact owner given as a user id must be an active user
+ * of this tenant (the Contact owner list offered deactivated users, and the
+ * API took any value). An empty owner or an older free-text name is left as
+ * it is; on update this is only checked when the owner changes, so a contact
+ * whose owner was deactivated later can still be saved. */
+async function assertActiveContactOwner(tenantId: string, owner: unknown): Promise<void> {
+  if (typeof owner !== 'string' || !mongoose.isValidObjectId(owner)) return;
+  const active = await User.exists({ _id: new mongoose.Types.ObjectId(owner), tenantId: new mongoose.Types.ObjectId(tenantId), isActive: { $ne: false } });
+  if (!active) throw Object.assign(new Error('Contact owner must be an active user'), { statusCode: 400 });
 }
 
 export async function createContact(tenantId: string, dto: CreateContactDTO & { createdBy?: string }) {
   const tid = new mongoose.Types.ObjectId(tenantId);
+  await assertActiveContactOwner(tenantId, (dto as any).contactOwner);
   const created = await Contact.create({ tenantId: tid, ...dto });
   indexNativeSearchRecord(tenantId, 'native', 'contacts', created.toObject(), `${created.firstName} ${created.lastName}`.trim());
   return created;
 }
 
-export async function updateContact(tenantId: string, id: string, dto: UpdateContactDTO, scope?: DataScope) {
+export async function updateContact(tenantId: string, id: string, dto: UpdateContactDTO, scope?: DataScope, extraOwnerValues?: string[]) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
-    : { clientId: id };
+    : NO_RECORD;
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
-  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner');
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner', extraOwnerValues);
   // LR-CONTACT-004: findOneAndUpdate() bypasses the pre('save') hook that
   // encrypts email/phone and derives the blind-index search fields — load
   // then save so an edited contact is encrypted exactly like a newly
@@ -170,6 +206,10 @@ export async function updateContact(tenantId: string, id: string, dto: UpdateCon
   }
 
   const { updatedAt: _u, __v: _v, version: _ver, ...cleanDto } = dto as any;
+  // LR-R26-USER-007: only a changed owner is checked (see assertActiveContactOwner).
+  if ('contactOwner' in cleanDto && String(cleanDto.contactOwner ?? '') !== String((doc as any).contactOwner ?? '')) {
+    await assertActiveContactOwner(tenantId, cleanDto.contactOwner);
+  }
 
   // LR-C4-LEAD-003: If email or phone contains masking characters (* or X),
   // never overwrite real stored PII with the masked string
@@ -188,13 +228,13 @@ export async function updateContact(tenantId: string, id: string, dto: UpdateCon
   return updated;
 }
 
-export async function deleteContact(tenantId: string, id: string, scope?: DataScope): Promise<boolean> {
+export async function deleteContact(tenantId: string, id: string, scope?: DataScope, guard?: WriteGuard, extraOwnerValues?: string[]): Promise<boolean> {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
-    : { clientId: id };
+    : NO_RECORD;
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
-  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner');
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner', extraOwnerValues);
   const existing = await Contact.findOne(filter);
   if (!existing) return false;
 
@@ -218,15 +258,16 @@ export async function deleteContact(tenantId: string, id: string, scope?: DataSc
     );
   }
 
-  const res = await Contact.findOneAndDelete(filter);
+  const res = await Contact.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!res) await throwIfStale(Contact, filter, guard);
   if (res) removeNativeSearchRecord(tenantId, 'native', 'contacts', String(res._id));
   return !!res;
 }
 
-export async function getContactStats(tenantId: string, scope?: DataScope) {
+export async function getContactStats(tenantId: string, scope?: DataScope, extraOwnerValues?: string[]) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid };
-  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner');
+  applyDataScopeToCreatedByFilter(filter, scope, 'createdBy', undefined, undefined, 'contactOwner', extraOwnerValues);
   const [total, byStatus] = await Promise.all([
     Contact.countDocuments(filter),
     Contact.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),

@@ -17,6 +17,9 @@ export interface IReceiptDoc extends Document {
   status:         'pending' | 'completed' | 'refunded';
   customFields?: Record<string, any>;
   createdBy?:     string;
+  /** LR-C4-RCPT-005: the client's key for this payment, and a hash of its details. */
+  idempotencyKey?: string;
+  requestHash?:    string;
   createdAt:      Date;
   updatedAt:      Date;
 }
@@ -45,6 +48,9 @@ const schema = new Schema<IReceiptDoc>(
     },
     customFields: { type: Schema.Types.Mixed, default: {} },
     createdBy: { type: String },
+    // LR-C4-RCPT-005
+    idempotencyKey: { type: String, trim: true },
+    requestHash:    { type: String },
   },
   { timestamps: true }
 );
@@ -63,6 +69,12 @@ schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, invoiceId: 1 });
 schema.index({ tenantId: 1, receiptId: 1 }, { unique: true, sparse: true });
 schema.index({ tenantId: 1, numId: 1 }, { unique: true, sparse: true });
+// LR-C4-RCPT-005: one receipt per key in a tenant, on every server. Receipts
+// without a key are not in the index.
+schema.index(
+  { tenantId: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } },
+);
 
 export const NativeReceipt = mongoose.model<IReceiptDoc>(
   'NativeReceipt',

@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { Meeting } from './meeting.model';
 import { Tenant } from '../../tenants/tenant.model';
 import { NativeStaff } from '../staffs/staff.model';
+import { excludeDeactivatedLogins } from '../staffs/bookable-staff';
 import { zonedTimeToUtc } from '../shared/timezone';
 
 export interface AvailableSlot {
@@ -150,7 +151,9 @@ export async function computeTeamAvailableSlots(
   opts: { fromIso?: string; forDate?: string; days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; limit?: number } = {}
 ): Promise<AvailableSlot[]> {
   const tid = new mongoose.Types.ObjectId(tenantId);
-  const roster = await NativeStaff.find({ tenantId: tid, teamId: new mongoose.Types.ObjectId(teamId), status: 'active' })
+  // LR-C4-USER-006: staff linked to a deactivated login offer no slots.
+  const rosterFilter = await excludeDeactivatedLogins({ tenantId: tid, teamId: new mongoose.Types.ObjectId(teamId), status: 'active' }, tid);
+  const roster = await NativeStaff.find(rosterFilter)
     .select('staffId')
     .sort({ _id: 1 })
     .lean();

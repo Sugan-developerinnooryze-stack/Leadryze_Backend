@@ -16,7 +16,8 @@
     "fix-user": "ts-node --transpile-only src/fix-user.ts",
     "lint": "eslint src --ext .ts",
     "test": "jest --testPathPatterns=security.test.ts",
-    "test:all": "jest"
+    "test:all": "jest",
+    "verify:crm-assist-contract": "ts-node --transpile-only src/scripts/verify-crm-assist-contract-sync.ts"
   },
   "engines": {
     "node": ">=20.0.0"

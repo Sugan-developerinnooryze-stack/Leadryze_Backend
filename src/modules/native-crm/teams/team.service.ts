@@ -8,6 +8,7 @@ import { Lead } from '../leads/lead.model';
 import { Meeting } from '../meetings/meeting.model';
 import { NativeCustomer } from '../customers/customer.model';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listTeams(tenantId: string, opts: TeamListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -54,7 +55,7 @@ export async function createTeam(data: any) {
   return doc;
 }
 
-export async function updateTeam(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateTeam(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { teamId: id }] }
@@ -68,21 +69,25 @@ export async function updateTeam(id: string, tenantId: string, data: any, scope?
   // same as create() already is.
   if (scope && scope.kind !== 'all' && !scope.teamIds.includes(id)) return null;
   if (data.name) await assertUniqueTeamName(tid, data.name, id);
+  const filter = { ...idFilter, tenantId: tid };
   const updated = await NativeTeam.findOneAndUpdate(
-    { ...idFilter, tenantId: tid },
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeTeam, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'teams', updated.toObject(), updated.name);
   return updated;
 }
 
-export async function deleteTeam(id: string, tenantId: string) {
+export async function deleteTeam(id: string, tenantId: string, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { teamId: id }] }
     : { teamId: id };
-  const deleted = await NativeTeam.findOneAndDelete({ ...idFilter, tenantId: tid });
+  const filter = { ...idFilter, tenantId: tid };
+  const deleted = await NativeTeam.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeTeam, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'teams', String(deleted._id));
   return deleted;
 }

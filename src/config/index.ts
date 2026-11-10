@@ -1,6 +1,30 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+/** The CRM assistant's new answer engine (CRM_ASSIST_ENGINE):
+ *  - 'off'    the existing assistant only (the default everywhere);
+ *  - 'shadow' the engine reads every message and logs what it would have
+ *             answered, but the staff member still gets the existing
+ *             assistant's reply (no extra AI call);
+ *  - 'on'     the engine answers what it understands (lists, counts, record
+ *             numbers) with no AI call and hands everything else to the
+ *             existing assistant. */
+export type CrmAssistEngineMode = 'off' | 'shadow' | 'on';
+const CRM_ASSIST_ENGINE_MODES: readonly CrmAssistEngineMode[] = ['off', 'shadow', 'on'];
+
+function parseCrmAssistEngine(raw: string | undefined): CrmAssistEngineMode {
+  const value = (raw ?? '').trim().toLowerCase();
+  if (!value) return 'off';
+  if ((CRM_ASSIST_ENGINE_MODES as readonly string[]).includes(value)) return value as CrmAssistEngineMode;
+  // The logger reads this config, so it can't be used here.
+  console.warn(`[CONFIG] CRM_ASSIST_ENGINE="${value.slice(0, 20)}" is not off, shadow or on; using off.`);
+  return 'off';
+}
+
+function parseCrmAssistEngineTenants(raw: string | undefined): string[] {
+  return (raw ?? '').split(',').map((t) => t.trim()).filter(Boolean);
+}
+
 export const config = {
   app: {
     env: process.env.NODE_ENV || 'development',
@@ -75,6 +99,13 @@ export const config = {
     // of the ai/ service's Redis rate limiter, which fails open if Redis is down.
     maxTemplateAnalysesPerDay: parseInt(process.env.MAX_TEMPLATE_ANALYSES_PER_DAY || '20', 10),
   },
+  /** See CrmAssistEngineMode above. engineTenants (CRM_ASSIST_ENGINE_TENANTS,
+   * comma-separated tenant ids): when set, only those tenants get `engine`
+   * and every other tenant is 'off'. */
+  crmAssist: {
+    engine: parseCrmAssistEngine(process.env.CRM_ASSIST_ENGINE),
+    engineTenants: parseCrmAssistEngineTenants(process.env.CRM_ASSIST_ENGINE_TENANTS),
+  },
   rateLimit: {
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10),
     max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
@@ -98,6 +129,16 @@ export const config = {
     backendUrl: process.env.BACKEND_URL           || 'http://localhost:5000',
   },
 };
+
+/** The engine mode for one tenant's requests, decided by the backend on
+ * every CRM assistant turn: CRM_ASSIST_ENGINE, narrowed to the canary
+ * tenants in CRM_ASSIST_ENGINE_TENANTS when that list is set. */
+export function engineModeFor(tenantId: string | null | undefined): CrmAssistEngineMode {
+  const { engine, engineTenants } = config.crmAssist;
+  if (engine === 'off') return 'off';
+  if (engineTenants.length > 0 && !engineTenants.includes(String(tenantId ?? ''))) return 'off';
+  return engine;
+}
 
 // Crash on startup in production if any secret is still using its insecure default value
 if (config.app.env === 'production') {

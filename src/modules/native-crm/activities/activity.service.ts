@@ -4,6 +4,7 @@ import { ActivityListOptions } from './activity.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listActivities(tenantId: string, opts: ActivityListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -41,24 +42,26 @@ export async function createActivity(data: any) {
   return created;
 }
 
-export async function updateActivity(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateActivity(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeActivity.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeActivity, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'activities', updated.toObject(), (updated as any).subject);
   return updated;
 }
 
-export async function deleteActivity(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteActivity(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: any = { _id: id, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeActivity.findOneAndDelete(filter);
+  const deleted = await NativeActivity.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeActivity, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'activities', String(deleted._id));
   return deleted;
 }

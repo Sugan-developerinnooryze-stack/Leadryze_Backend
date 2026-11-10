@@ -4,10 +4,12 @@ import jwt from 'jsonwebtoken';
 import { authenticate, authorize, requirePermission } from '../../middlewares/auth.middleware';
 import { requireTenant } from '../../middlewares/tenant.middleware';
 import { resolveBranch } from '../../middlewares/branch.middleware';
+import { requireModuleEnabled } from '../../middlewares/module-access.middleware';
 import { uploadAudio } from '../../middlewares/upload.middleware';
 import { AuthRequest } from '../../types';
 import { sendSuccess, sendError } from '../../utils/response';
 import { config } from '../../config';
+import { aiServiceFailure, sendAiServiceFailure } from './ai-service-error';
 
 const router = Router();
 
@@ -43,7 +45,12 @@ const AI_URL = config.app.aiServiceUrl;
  *     responses:
  *       200: { description: AI response with captured lead data }
  */
-router.post('/chat', async (req: AuthRequest, res: Response, next: NextFunction) => {
+// LR-PL-AI-001: the same gates as the in-app assistant (/crm-chat): the
+// 'bot.use' permission and the tenant's assistant switch (bot_enabled).
+// No screen calls this route (the website widget has its own,
+// public-widget.controller.ts), but it reached the AI with the assistant
+// switched off.
+router.post('/chat', requirePermission('bot.use'), requireModuleEnabled('bot_enabled'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     // Signed, short-lived identity assertion for the internal CRM-search
     // path (base.agent.ts -> backend.client.ts -> /api/internal/crm-search)
@@ -69,6 +76,10 @@ router.post('/chat', async (req: AuthRequest, res: Response, next: NextFunction)
     );
     sendSuccess(res, response.data.data, 'AI response generated');
   } catch (err) {
+    // LR-PL-AI-001: a failed or busy AI service is a clear 503/504/502 reply,
+    // never a bare 500 with axios's text ("Request failed with status code 429").
+    const failure = aiServiceFailure(err);
+    if (failure) { sendAiServiceFailure(res, failure, 'chat', req.tenantId); return; }
     next(err);
   }
 });

@@ -8,6 +8,8 @@
  * Built module-agnostic on purpose so the other document modules (Quotations,
  * Contracts, Invoices) can reuse it the same way once Work Orders proves it out. */
 
+import { escapeRegex } from '../../../utils/escape-regex';
+
 export type FilterFieldType = 'text' | 'number' | 'date' | 'select' | 'boolean' | 'multi';
 
 export interface FilterFieldDef {
@@ -47,10 +49,6 @@ const OPERATORS_BY_TYPE: Record<FilterFieldType, string[]> = {
   boolean: ['eq'],
   multi:   ['contains_any'],
 };
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 function buildLeaf(type: FilterFieldType, path: string, operator: string, value: unknown, value2: unknown): Record<string, unknown> | null {
   switch (type) {
@@ -181,4 +179,79 @@ export function customFieldFilterType(fieldType: string): FilterFieldType | null
     default:
       return null; // image/images/video/videos/custom_form
   }
+}
+
+/** Why compileConditionsStrict refused one condition. */
+export type StrictConditionReason =
+  | 'not_a_list'           // the conditions are not an array
+  | 'too_many'             // beyond the first MAX_STRICT_CONDITIONS
+  | 'malformed'            // not an object, or field / operator not a string
+  | 'unknown_field'        // no catalog entry with that key
+  | 'unsupported_operator' // the field type doesn't take that operator
+  | 'invalid_value';       // the value doesn't fit the field (or the builder refused it)
+
+export interface StrictConditionRejection {
+  /** Position in the given list (-1 when the list itself was refused). */
+  index: number;
+  field?: string;
+  operator?: string;
+  reason: StrictConditionReason;
+}
+
+/** The same cap applyDynamicFilters applies (it silently keeps the first 20). */
+const MAX_STRICT_CONDITIONS = 20;
+
+const isNumberLike = (v: unknown) =>
+  (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v));
+
+/** Values the shared builder would silently coerce (Number('') is 0, any
+ * non-true value is false) or never checks (select values against the
+ * catalog's options): refused here instead. */
+function strictValueOk(def: FilterFieldDef, cond: FilterCondition): boolean {
+  const options = def.options?.map((o) => o.value);
+  const inOptions = (v: unknown) => typeof v === 'string' && (!options || options.includes(v));
+  switch (def.type) {
+    case 'number':
+      return isNumberLike(cond.value) && (cond.operator !== 'between' || isNumberLike(cond.value2));
+    case 'boolean':
+      return cond.value === true || cond.value === false || cond.value === 'true' || cond.value === 'false';
+    case 'select':
+      return cond.operator === 'in'
+        ? Array.isArray(cond.value) && cond.value.length > 0 && cond.value.every(inOptions)
+        : inOptions(cond.value);
+    case 'multi':
+      return Array.isArray(cond.value) && cond.value.length > 0 && cond.value.every((v) => typeof v === 'string' && v.length > 0);
+    default:
+      return true;
+  }
+}
+
+/** The strict twin of applyDynamicFilters (which stays unchanged for the
+ * screens): compiles client- or planner-sent conditions against `catalog`
+ * with the same private builder, and reports every condition it refuses with
+ * the reason, instead of dropping it silently. Never writes into a filter:
+ * the caller places each fragment (an $and member) itself. */
+export function compileConditionsStrict(
+  conditions: unknown,
+  catalog: FilterFieldDef[],
+): { fragments: Record<string, unknown>[]; rejected: StrictConditionRejection[] } {
+  const fragments: Record<string, unknown>[] = [];
+  const rejected: StrictConditionRejection[] = [];
+  if (!Array.isArray(conditions)) return { fragments, rejected: [{ index: -1, reason: 'not_a_list' }] };
+
+  const byKey = new Map(catalog.map((d) => [d.key, d]));
+  conditions.forEach((raw, index) => {
+    const cond = raw as FilterCondition;
+    const named = cond && typeof cond === 'object' && typeof cond.field === 'string' && typeof cond.operator === 'string';
+    const where = named ? { field: cond.field, operator: cond.operator } : {};
+    if (index >= MAX_STRICT_CONDITIONS) { rejected.push({ index, ...where, reason: 'too_many' }); return; }
+    if (!named) { rejected.push({ index, reason: 'malformed' }); return; }
+    const def = byKey.get(cond.field);
+    if (!def) { rejected.push({ index, ...where, reason: 'unknown_field' }); return; }
+    if (!OPERATORS_BY_TYPE[def.type].includes(cond.operator)) { rejected.push({ index, ...where, reason: 'unsupported_operator' }); return; }
+    const fragment = strictValueOk(def, cond) ? buildCondition(def, cond) : null;
+    if (!fragment) { rejected.push({ index, ...where, reason: 'invalid_value' }); return; }
+    fragments.push(fragment);
+  });
+  return { fragments, rejected };
 }

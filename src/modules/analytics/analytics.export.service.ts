@@ -22,7 +22,7 @@ import { Connector } from '../connectors/connector.model';
 import { Campaign } from '../campaigns/campaign.model';
 import { Tenant } from '../tenants/tenant.model';
 import { Branch } from '../native-crm/branches/branch.model';
-import { parseDateRange, getDateMatch, getDateMatchWithFallback, DateRangeFilter, ParsedDateRange } from './analytics.service';
+import { parseDateRange, getDateMatch, getDateMatchWithFallback, DateRangeFilter, ParsedDateRange, resolveDealDefaultCurrency, currencyAmounts } from './analytics.service';
 import { decrypt, isEncrypted } from '../../utils/crypto';
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -252,8 +252,11 @@ async function fetchAuthorizedData(tenantId: string, branchId?: string, range?: 
   customersList.forEach((c) => {
     if (c.customerId) customerMap[c.customerId] = safeDecryptValue(c.name);
   });
+  // LR-PL-ANALYTICS-001: the currency of a deal saved without one.
+  const defaultCurrency = await resolveDealDefaultCurrency(tenantId, branchId);
 
   return {
+    defaultCurrency,
     tenantDoc,
     branchDoc,
     leadsList,
@@ -358,8 +361,13 @@ export async function generateAnalyticsWorkbook(
   const wonDeals = data.dealsList.filter((d) => ['won', 'closed_won'].includes(d.stage));
   const lostDeals = data.dealsList.filter((d) => ['lost', 'closed_lost'].includes(d.stage));
   const openDeals = data.dealsList.filter((d) => !['won', 'closed_won', 'lost', 'closed_lost'].includes(d.stage));
-  const openPipelineValue = openDeals.reduce((sum, d) => sum + ((d as any).amount || 0), 0);
-  const wonRevenue = wonDeals.reduce((sum, d) => sum + ((d as any).amount || 0), 0);
+  // LR-PL-ANALYTICS-001: deal money per currency, never added across
+  // currencies (it was one SUM(amount): INR and USD added as one number).
+  const dealCurrency = (d: any) => String(d?.currency ?? '').trim().toUpperCase() || data.defaultCurrency;
+  const moneyByCurrency = (deals: any[]) =>
+    currencyAmounts(deals.map((d) => [dealCurrency(d), Number(d.amount) || 0] as [string, number]), data.defaultCurrency);
+  const openByCurrency = moneyByCurrency(openDeals);
+  const wonByCurrency = moneyByCurrency(wonDeals);
   const closedDealsCount = wonDeals.length + lostDeals.length;
 
   const convertedLeads = data.leadsList.filter((l) => l.isConverted);
@@ -410,9 +418,11 @@ export async function generateAnalyticsWorkbook(
     [1, 'Acquisition', 'Total Leads Captured', data.leadsList.length, data.prevLeadsCount, leadsAbsChange, leadsPctChange, `${data.leadsList.length} total leads`, 'Count of inbound leads in period', 'Leads', formatZonedDate(now, tz), 'Verified'],
     [2, 'Acquisition', 'Lead Conversion Rate', leadConvRateNum !== null ? leadConvRateNum : 'N/A', 'N/A', 'N/A', 'N/A', `${convertedLeads.length} of ${data.leadsList.length} converted`, 'Converted Leads / Total New Leads in Period', 'Leads', formatZonedDate(now, tz), leadConvRateNum !== null ? 'Verified' : 'No Data'],
     [3, 'Sales Pipeline', 'Active Open Deals', openDeals.length, 'N/A', 'N/A', 'N/A', `${openDeals.length} open pipeline opportunities`, 'Count of deals in active pipeline stages', 'Deals', formatZonedDate(now, tz), 'Verified'],
-    [4, 'Sales Pipeline', 'Open Pipeline Value', openPipelineValue, 'N/A', 'N/A', 'N/A', `${openDeals.length} active open deals`, 'SUM(amount) for deals in open stages', 'Deals', formatZonedDate(now, tz), 'Verified'],
+    ...(openByCurrency.length ? openByCurrency : [{ currency: data.defaultCurrency, value: 0 }]).map((e) =>
+      [0, 'Sales Pipeline', `Open Pipeline Value (${e.currency})`, e.value, 'N/A', 'N/A', 'N/A', `${openDeals.length} active open deals`, 'SUM(amount) for deals in open stages, per currency', 'Deals', formatZonedDate(now, tz), 'Verified']),
     [5, 'Sales Pipeline', 'Won Deals Count', wonDeals.length, data.prevWonDeals, wonDealsAbsChange, wonDealsPctChange, `${wonDeals.length} won`, 'COUNT(Deals with stage in [won, closed_won])', 'Deals', formatZonedDate(now, tz), 'Verified'],
-    [6, 'Sales Pipeline', 'Won Revenue', wonRevenue, 'N/A', 'N/A', 'N/A', `${wonDeals.length} won opportunities`, 'SUM(amount) for closed won deals', 'Deals', formatZonedDate(now, tz), 'Verified'],
+    ...(wonByCurrency.length ? wonByCurrency : [{ currency: data.defaultCurrency, value: 0 }]).map((e) =>
+      [0, 'Sales Pipeline', `Won Revenue (${e.currency})`, e.value, 'N/A', 'N/A', 'N/A', `${wonDeals.length} won opportunities`, 'SUM(amount) for closed won deals, per currency', 'Deals', formatZonedDate(now, tz), 'Verified']),
     [7, 'Sales Pipeline', 'Deal Win Rate', dealWinRateNum !== null ? dealWinRateNum : 'N/A', 'N/A', 'N/A', 'N/A', `${wonDeals.length} won / ${closedDealsCount} closed`, 'Won Deals / (Won Deals + Lost Deals)', 'Deals', formatZonedDate(now, tz), dealWinRateNum !== null ? 'Verified' : 'No Closed Deals'],
     [8, 'Support', 'Total Support Tickets', data.ticketsList.length, 'N/A', 'N/A', 'N/A', `${data.ticketsList.length} total tickets`, 'COUNT(Tickets recorded in scope)', 'Tickets', formatZonedDate(now, tz), 'Verified'],
     [9, 'Support', 'Open & Working Tickets', openTickets.length, 'N/A', 'N/A', 'N/A', `${openTickets.length} active tickets`, 'COUNT(Tickets with status NOT IN [resolved, closed])', 'Tickets', formatZonedDate(now, tz), 'Verified'],
@@ -431,6 +441,8 @@ export async function generateAnalyticsWorkbook(
     [22, 'Automation', 'Total Automation Executions', data.automationRunsList.length, 'N/A', 'N/A', 'N/A', `${data.automationRunsList.length} executions in period`, 'COUNT(native_automation_flow_runs in period)', 'Automation', formatZonedDate(now, tz), 'Verified'],
     [23, 'Automation', 'Automation Success Rate', autoSuccessRateNum !== null ? autoSuccessRateNum : 'N/A', 'N/A', 'N/A', 'N/A', `${completedAutoRuns.length} of ${data.automationRunsList.length} succeeded`, 'Completed Runs / Total Runs (N/A when 0)', 'Automation', formatZonedDate(now, tz), autoSuccessRateNum !== null ? 'Verified' : 'No Executions'],
   ];
+  // Number the KPI rows after the header (the money rows above are one per currency).
+  for (let i = 4; i < execRows.length; i++) execRows[i][0] = i - 3;
 
   const wsExec = XLSX.utils.aoa_to_sheet(execRows);
   applySharedWorksheetStyles(wsExec, {
@@ -593,7 +605,7 @@ export async function generateAnalyticsWorkbook(
       sanitizeText(d.title || d.name),
       sanitizeText(d.stage),
       typeof d.amount === 'number' ? d.amount : 0,
-      sanitizeText(d.currency || 'USD'),
+      sanitizeText(d.currency || data.defaultCurrency),   // LR-PL-ANALYTICS-001: as on the Deals board, not USD
       sanitizeText(d.dealStatus || d.stage),
       sanitizeText(safeDecryptValue(d.companyName || d.contactName || '')),
       sanitizeText(d.assignedStaffId || 'Unassigned'),
@@ -1034,9 +1046,9 @@ export async function generateAnalyticsWorkbook(
     ['Acquisition', 'Total Leads Captured', 'COUNT(Leads)', 'Leads', 'createdAt', 'All statuses', 'None', `${tz} calendar date boundaries converted to UTC`, 'Counts individual inbound records created in period.'],
     ['Acquisition', 'Lead Conversion Rate', '(Converted Leads / Total New Leads) * 100', 'Leads', 'createdAt', 'isConverted == true', 'None', `${tz} calendar date boundaries converted to UTC`, 'Evaluates only leads arriving in the selected interval. Returns N/A if 0 total leads.'],
     ['Sales Pipeline', 'Active Open Deals', 'COUNT(Deals in open stages)', 'Deals', 'createdAt', 'Stages: qualified, proposal, negotiation, etc.', 'won, closed_won, lost, closed_lost', 'All time snapshot of current pipeline', 'Excludes closed won and closed lost opportunities.'],
-    ['Sales Pipeline', 'Open Pipeline Value', 'SUM(amount)', 'Deals', 'createdAt', 'Open stages', 'Closed stages', 'All time snapshot of current pipeline', 'Monetary estimation of unclosed pipeline deals.'],
+    ['Sales Pipeline', 'Open Pipeline Value', 'SUM(amount) per currency (one row each; currencies are never added together)', 'Deals', 'createdAt', 'Open stages', 'Closed stages', 'All time snapshot of current pipeline', 'Monetary estimation of unclosed pipeline deals.'],
     ['Sales Pipeline', 'Won Deals Count', 'COUNT(Won Deals)', 'Deals', 'createdAt', 'won, closed_won', 'Open and lost deals', `${tz} calendar date boundaries converted to UTC`, 'Closed won opportunities.'],
-    ['Sales Pipeline', 'Won Revenue', 'SUM(amount)', 'Deals', 'createdAt', 'won, closed_won', 'Open and lost deals', `${tz} calendar date boundaries converted to UTC`, 'Closed won deal values in recorded transaction currency.'],
+    ['Sales Pipeline', 'Won Revenue', 'SUM(amount) per currency (one row each; currencies are never added together)', 'Deals', 'createdAt', 'won, closed_won', 'Open and lost deals', `${tz} calendar date boundaries converted to UTC`, 'Closed won deal values in recorded transaction currency.'],
     ['Sales Pipeline', 'Deal Win Rate', 'Won Deals / (Won Deals + Lost Deals)', 'Deals', 'createdAt', 'won, closed_won, lost, closed_lost', 'Open pipeline deals', `${tz} calendar date boundaries converted to UTC`, 'Evaluates only officially closed opportunities. Excludes active pipeline. Returns N/A when 0 closed deals.'],
     ['Customer Support', 'Total Support Tickets', 'COUNT(Tickets)', 'Tickets', 'createdAt', 'All statuses', 'None', `${tz} calendar date boundaries converted to UTC`, 'All customer requests lodged.'],
     ['Customer Support', 'Open Tickets', 'COUNT(Unresolved Tickets)', 'Tickets', 'createdAt', 'open, new, in_progress, working, pending', 'resolved, closed', 'Current snapshot in workspace', 'Backlog tickets awaiting resolution.'],
@@ -1165,7 +1177,7 @@ export async function generateAnalyticsCsv(
         d.title || d.name,
         d.stage,
         d.amount || 0,
-        d.currency || 'USD',
+        d.currency || data.defaultCurrency,   // LR-PL-ANALYTICS-001
         d.dealStatus || d.stage,
         d.assignedStaffId || 'Unassigned',
         formatZonedDate(d.closeDate, tz, false),
@@ -1281,7 +1293,7 @@ export async function generateAnalyticsCsv(
       d.title || d.name,
       d.stage,
       d.amount || 0,
-      d.currency || 'USD',
+      d.currency || data.defaultCurrency,   // LR-PL-ANALYTICS-001
       d.dealStatus || d.stage,
       d.assignedStaffId || 'Unassigned',
       formatZonedDate(d.closeDate, tz, false),

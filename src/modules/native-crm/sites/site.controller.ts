@@ -41,7 +41,10 @@ export async function create(req: AuthRequest, res: Response) {
       branchId:  req.body.branchId ?? req.branchId ?? null,
       createdBy: req.user?.userId,
     });
-    sendCreated(res, item);
+    // LR-R2-SEC-001: the saved document holds the encrypted address/phone
+    // (pre-save encryption); answer with the same PII view as getOne.
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    sendCreated(res, transformPIIResponse(item, 'sites', req.user!.role, viewRoles));
   } catch (err: any) {
     sendError(res, err.message, 400);
   }
@@ -51,7 +54,9 @@ export async function update(req: AuthRequest, res: Response) {
   try {
     const item = await updateSite(req.params.id, req.tenantId!, req.body, resolveEffectiveScope(req, 'sites'));
     if (!item) return sendError(res, 'Site not found', 404);
-    sendSuccess(res, item);
+    // LR-R2-SEC-001: as on create (the update writes encrypted values).
+    const viewRoles = await getPIIViewRoles(req.tenantId!, req.branchId);
+    sendSuccess(res, transformPIIResponse(item, 'sites', req.user!.role, viewRoles));
   } catch (err: any) {
     sendError(res, err.message, 400);
   }

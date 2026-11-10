@@ -14,8 +14,16 @@ import { NativeStaff } from '../staffs/staff.model';
 import { Contact } from '../contacts/contact.model';
 import { Company } from '../companies/company.model';
 import { getSettings } from '../fs-settings/fs-settings.service';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
+import { resolveDealDefaultCurrency, dealCurrencyExpr, currencyAmounts, amountIn } from '../shared/deal-currency';
 
-async function enrichDealsWithContactAndCompany(tenantId: mongoose.Types.ObjectId, deals: any[]): Promise<any[]> {
+/** LR-C4-DEL-002: an id that is not an ObjectId matches no record. It was
+ * looked up as clientId, but clientId here is the tenant's prefix, the same
+ * on every record, so GET, PUT or DELETE with the prefix as the id reached an
+ * arbitrary record of the tenant (DELETE deleted one). */
+const NO_RECORD = { _id: { $in: [] as mongoose.Types.ObjectId[] } };
+
+export async function enrichDealsWithContactAndCompany(tenantId: mongoose.Types.ObjectId, deals: any[]): Promise<any[]> {
   if (!deals || deals.length === 0) return deals;
 
   const contactIdsToFetch = new Set<string>();
@@ -135,7 +143,7 @@ export async function getDealById(tenantId: string, id: string, scope?: DataScop
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
-    : { clientId: id };
+    : NO_RECORD;
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   const deal = await Deal.findOne(filter).lean();
@@ -187,7 +195,7 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
-    : { clientId: id };
+    : NO_RECORD;
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
   // LR-NEG-001: load-then-save instead of findOneAndUpdate() gets Mongoose's
@@ -247,14 +255,15 @@ export async function updateDeal(tenantId: string, id: string, dto: UpdateDealDT
   return updated;
 }
 
-export async function deleteDeal(tenantId: string, id: string, scope?: DataScope) {
+export async function deleteDeal(tenantId: string, id: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { clientId: id }] }
-    : { clientId: id };
+    : NO_RECORD;
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId', undefined, undefined, 'createdBy');
-  const deleted = await Deal.findOneAndDelete(filter).lean();
+  const deleted = await Deal.findOneAndDelete(withExpectedVersion(filter, guard)).lean();
+  if (!deleted) await throwIfStale(Deal, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native', 'deals', String(deleted._id));
   return deleted;
 }
@@ -298,27 +307,43 @@ export async function getDealStats(tenantId: string, scope?: DataScope, range?: 
   const priorActiveFilter = { ...priorFilter, stage: { $nin: closedKeys } };
   const sparklineActiveFilter = { ...sparklineFilter, stage: { $nin: closedKeys } };
 
+  // LR-C4-DEAL-001: won value per currency (shared/deal-currency.ts). It was one
+  // sum of every won deal, so a won USD deal was added into the ₹ revenue on
+  // the dashboard's Revenue tile. Each old number is now the default
+  // currency's part; the ...ByCurrency lists have every currency.
+  const defaultCurrency = await resolveDealDefaultCurrency(tenantId);
+  const perCurrency = { $group: { _id: dealCurrencyExpr(defaultCurrency), total: { $sum: '$amount' } } };
+
   const [total, allTimeTotal, byStage, totalValue, allTimeTotalValue, priorTotal, priorTotalValue, dailyRaw] = await Promise.all([
     Deal.countDocuments(activeFilter),
     Deal.countDocuments(allTimeFilter),
     Deal.aggregate([{ $match: filter }, { $group: { _id: '$stage', count: { $sum: 1 } } }]),
-    Deal.aggregate([{ $match: revenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-    Deal.aggregate([{ $match: allTimeRevenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Deal.aggregate([{ $match: revenueFilter }, perCurrency]),
+    Deal.aggregate([{ $match: allTimeRevenueFilter }, perCurrency]),
     priorRange ? Deal.countDocuments(priorActiveFilter) : Promise.resolve(null),
-    priorRange ? Deal.aggregate([{ $match: priorRevenueFilter }, { $group: { _id: null, total: { $sum: '$amount' } } }]) : Promise.resolve(null),
+    priorRange ? Deal.aggregate([{ $match: priorRevenueFilter }, perCurrency]) : Promise.resolve(null),
     Deal.aggregate([
       { $match: sparklineActiveFilter },
       { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
     ]),
   ]);
+  const perCurrencyList = (rows: any[] | null) =>
+    currencyAmounts((rows ?? []).map((r: any) => [r._id, r.total] as [string, unknown]), defaultCurrency);
+  const totalByCurrency = perCurrencyList(totalValue);
+  const allTimeByCurrency = perCurrencyList(allTimeTotalValue);
+  const priorByCurrency = priorTotalValue ? perCurrencyList(priorTotalValue) : null;
   return {
     total,
     allTimeTotal,
     byStatus: Object.fromEntries(byStage.map((r) => [r._id as string, r.count as number])),
-    totalValue: totalValue[0]?.total ?? 0,
-    allTimeTotalValue: allTimeTotalValue[0]?.total ?? 0,
+    totalValue: amountIn(totalByCurrency, defaultCurrency),
+    allTimeTotalValue: amountIn(allTimeByCurrency, defaultCurrency),
     priorTotal,
-    priorTotalValue: priorTotalValue ? (priorTotalValue[0]?.total ?? 0) : null,
+    priorTotalValue: priorByCurrency ? amountIn(priorByCurrency, defaultCurrency) : null,
+    currency: defaultCurrency,
+    totalValueByCurrency: totalByCurrency,
+    allTimeTotalValueByCurrency: allTimeByCurrency,
+    priorTotalValueByCurrency: priorByCurrency,
     daily: fillDailySeries(dailyRaw as any[], SPARKLINE_DAYS),
   };
 }

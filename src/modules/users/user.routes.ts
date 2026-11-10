@@ -17,6 +17,8 @@ import { Tenant } from '../tenants/tenant.model';
 import { reserveUserSeat, releaseUserSeat } from '../tenants/tenant.service';
 import { getSettings } from '../native-crm/fs-settings/fs-settings.service';
 import { transformPIIResponse } from '../../platform/pii/pii.service';
+import { ADMIN_ROLES } from '../../platform/pii/constants';
+import { escapeRegex } from '../../utils/escape-regex';
 
 const router = Router();
 
@@ -40,9 +42,18 @@ router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, n
       role: { $ne: 'SUPER_ADMIN' },
     };
 
+    // LR-C4-PERM-005: a caller who sees staff e-mails masked searches names
+    // only, plus an e-mail typed in full. Matching any part of the real
+    // e-mail let them work a hidden address out letter by letter.
+    const viewRoles = await getPIIViewRoles(tenantId, (req as any).branchId);
+    const role = req.user!.role;
+    const seesStaffPII = ADMIN_ROLES.includes(role) || viewRoles.includes(role);
     if (req.query.search) {
-      const re = new RegExp(String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      filter.$or = [{ firstName: re }, { lastName: re }, { email: re }];
+      const term = String(req.query.search);
+      const re = new RegExp(escapeRegex(term), 'i');
+      filter.$or = seesStaffPII
+        ? [{ firstName: re }, { lastName: re }, { email: re }]
+        : [{ firstName: re }, { lastName: re }, { email: new RegExp(`^${escapeRegex(term.trim())}$`, 'i') }];
     }
 
     if (req.query.role) filter.role = req.query.role;
@@ -70,8 +81,7 @@ router.get('/', requirePermission('users.view'), async (req: AuthRequest, res, n
       User.countDocuments({ tenantId: new mongoose.Types.ObjectId(tenantId), role: { $ne: 'SUPER_ADMIN' }, isActive: true }),
     ]);
 
-    const viewRoles = await getPIIViewRoles(tenantId, (req as any).branchId);
-    const safeUsers = transformPIIResponse(users, 'staffs', req.user!.role, viewRoles);
+    const safeUsers = transformPIIResponse(users, 'staffs', role, viewRoles);
 
     return sendSuccess(res, safeUsers, 'Success', 200, {
       page, limit, total, totalPages: Math.ceil(total / limit),
@@ -290,12 +300,7 @@ router.put('/:id', requirePermission('users.edit'), async (req: AuthRequest, res
         { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
         { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
       );
-      if (deactivating) {
-        logAuditEvent('user.removed',
-          { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-          { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
-        );
-      }
+      // LR-UX-003: no second 'user.removed' row (the same deactivation twice).
     }
 
     const userObj = user.toObject() as unknown as Record<string, unknown>;
@@ -339,10 +344,9 @@ router.delete('/:id', requirePermission('users.delete'), async (req: AuthRequest
       { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
       { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
     );
-    logAuditEvent('user.removed',
-      { id: req.user!.userId, email: req.user!.email, role: req.user!.role, ip: req.ip, userAgent: req.headers['user-agent'] as string | undefined },
-      { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}`, role: user.role } },
-    );
+    // LR-UX-003: one audit row per deactivation. It also wrote a second
+    // 'user.removed' row with the same content (the user is deactivated, never
+    // deleted), so each deactivation showed twice in Security Center.
 
     return sendSuccess(res, null, 'User deactivated');
   } catch (err) {
@@ -373,6 +377,9 @@ router.post('/:id/reset-password', requirePermission('users.edit'), async (req: 
 
     user.password = password;
     user.set('refreshToken', undefined); // invalidate existing sessions
+    // LR-R26-SEC-002: the admin knows this password, so the user must
+    // replace it at the next login (as with a temporary password).
+    user.mustChangePassword = true;
     await user.save();
 
     logAuditEvent('user.password_reset',
@@ -380,7 +387,7 @@ router.post('/:id/reset-password', requirePermission('users.edit'), async (req: 
       { tenantId, target: 'User', targetId: user.loginId ?? user._id.toString(), detail: { userEmail: user.email, name: `${user.firstName} ${user.lastName}` } },
     );
 
-    return sendSuccess(res, null, 'Password reset successfully');
+    return sendSuccess(res, null, 'Password reset. The user must change it at the next login.');
   } catch (err) {
     next(err);
   }

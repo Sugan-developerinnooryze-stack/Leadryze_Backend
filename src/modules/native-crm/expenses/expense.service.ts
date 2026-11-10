@@ -4,6 +4,7 @@ import { ExpenseListOptions } from './expense.types';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listExpenses(tenantId: string, opts: ExpenseListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -43,7 +44,7 @@ export async function createExpense(data: any) {
   return created;
 }
 
-export async function updateExpense(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateExpense(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { expenseId: id }] }
@@ -51,22 +52,24 @@ export async function updateExpense(id: string, tenantId: string, data: any, sco
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
   const updated = await NativeExpense.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeExpense, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'expenses', updated.toObject(), (updated as any).title);
   return updated;
 }
 
-export async function deleteExpense(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteExpense(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { expenseId: id }] }
     : { expenseId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeExpense.findOneAndDelete(filter);
+  const deleted = await NativeExpense.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeExpense, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'expenses', String(deleted._id));
   return deleted;
 }

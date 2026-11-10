@@ -38,6 +38,7 @@ import { resolveTeamFromStaffId, resolveSupervisorName } from '../shared/team-re
 import { resolveEffectiveScope } from '../shared/data-scope';
 import { resolveDateRange, resolvePriorDateRange, applyDateRangeToFilter, fillDailySeries, sparklineWindowStart, SPARKLINE_DAYS } from '../shared/date-range';
 import { findDuplicateContact } from '../shared/duplicate-check';
+import { isMaskedPiiValue, LEAD_MASKABLE_FIELDS } from '../shared/pii-update';
 
 export async function list(req: AuthRequest, res: Response) {
   try {
@@ -230,8 +231,14 @@ export async function update(req: AuthRequest, res: Response) {
 
     if (prev) {
       const prevObj = (prev as any).toObject ? (prev as any).toObject() : prev;
+      // LR-C4-LEAD-003: a masked display value is not written (updateLead
+      // drops it), so it is no change; and a PII field is named without its
+      // old or new value, because the timeline is shown unmasked to every
+      // role that may view it.
+      const maskable = new Set(LEAD_MASKABLE_FIELDS);
       for (const [k, v] of Object.entries(req.body)) {
         if (IGNORE_FIELDS.has(k) || v === undefined) continue;
+        if (maskable.has(k) && typeof v === 'string' && isMaskedPiiValue(k, v)) continue;
 
         let prevVal = prevObj[k];
         if (typeof prevVal === 'string' && isEncrypted(prevVal)) {
@@ -282,8 +289,8 @@ export async function update(req: AuthRequest, res: Response) {
 
         if (isChanged) {
           changedFields.push(k);
-          singleOldVal = oldStr;
-          singleNewVal = newStr;
+          singleOldVal = maskable.has(k) ? '' : oldStr;
+          singleNewVal = maskable.has(k) ? '' : newStr;
         }
       }
     }

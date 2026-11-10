@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { customFields } from '../../../utils/common.schemas';
+import { customFields, ianaTimezone } from '../../../utils/common.schemas';
 
 export const createCallSchema = z.object({
   contactName: z.string().trim().min(1).max(200),
@@ -9,6 +9,10 @@ export const createCallSchema = z.object({
   duration:    z.coerce.number().min(0).optional(),
   callStatus:  z.enum(['planned','completed','missed','cancelled']).optional(),
   date:        z.string().optional(),
+  // LR-R2-ACT-001: the zone the time was entered in (the form sends the
+  // browser's). It was stripped here, so the e-mails fell back to the
+  // tenant's stored zone.
+  timezone:    ianaTimezone.optional(),
   notes:       z.string().optional(),
   tags:        z.array(z.string()).optional(),
   // Plain optional strings (not optionalObjectId's empty->undefined transform:

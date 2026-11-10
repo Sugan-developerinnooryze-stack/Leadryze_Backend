@@ -232,11 +232,16 @@ export async function verifyEmail(token: string, email: string): Promise<LoginRe
     };
   }
 
+  // Same claim set as finalizeSuccessfulLogin and refreshTokens, roleId
+  // included (the CRM assistant refuses writes from a token without one).
   const payload: Omit<JwtPayload, 'iat' | 'exp'> = {
     userId: (user._id as mongoose.Types.ObjectId).toString(),
     tenantId: user.tenantId.toString(),
     role: user.role,
     email: user.email,
+    roleId: user.roleId?.toString(),
+    // LR-R26-SEC-002: marks a session that must change its password first.
+    ...(user.mustChangePassword ? { mustChangePassword: true as const } : {}),
   };
 
   const tokens = generateTokens(payload);
@@ -443,6 +448,8 @@ async function finalizeSuccessfulLogin(user: IUser, ctx?: { ip?: string; userAge
     role:     user.role,
     email:    user.email,
     roleId,
+    // LR-R26-SEC-002: marks a session that must change its password first.
+    ...(user.mustChangePassword ? { mustChangePassword: true as const } : {}),
   };
 
   const tokens = generateTokens(payload);
@@ -595,11 +602,18 @@ export async function refreshTokens(token: string): Promise<{ accessToken: strin
     throw Object.assign(new Error('Invalid refresh token'), { statusCode: 401 });
   }
 
+  // Same claim set as finalizeSuccessfulLogin. Without roleId a refreshed
+  // session lost its permissions (requirePermission 403s every non-admin
+  // role, and the CRM assistant refuses writes from a token with no roleId).
+  // Read from the user record, like role.
   const newPayload: Omit<JwtPayload, 'iat' | 'exp'> = {
     userId: (user._id as mongoose.Types.ObjectId).toString(),
     tenantId: user.tenantId.toString(),
     role: user.role,
     email: user.email,
+    roleId: user.roleId?.toString(),
+    // LR-R26-SEC-002: marks a session that must change its password first.
+    ...(user.mustChangePassword ? { mustChangePassword: true as const } : {}),
   };
 
   const tokens = generateTokens(newPayload);

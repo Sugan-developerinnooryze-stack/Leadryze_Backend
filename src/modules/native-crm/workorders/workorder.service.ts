@@ -15,6 +15,7 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { applyDynamicFilters } from '../shared/dynamic-filter';
 import { getWorkorderFilterCatalog } from './workorder.filter-catalog';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -158,20 +159,23 @@ export async function createWorkorder(data: any) {
     // else-if, a Contract with an upstream Quotation reference never got
     // marked complete when a WorkOrder was created from it, because the
     // quotationId branch "won" and the contractId branch never ran.
+    // The source id comes from the caller (screen, chat or automation) and
+    // is not otherwise checked against this tenant, so each source lookup is
+    // scoped to this work order's own tenant.
     if (data.quotationId) {
-      const src = await NativeQuotation.findOne({ quotationId: data.quotationId }).select('_id').lean();
-      if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }).catch(() => {});
+      const src = await NativeQuotation.findOne({ tenantId: doc.tenantId, quotationId: data.quotationId }).select('_id').lean();
+      if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }, doc.tenantId).catch(() => {});
     }
     if (data.contractId) {
-      const src = await NativeContract.findOne({ contractId: data.contractId }).select('_id').lean();
-      if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }).catch(() => {});
+      const src = await NativeContract.findOne({ tenantId: doc.tenantId, contractId: data.contractId }).select('_id').lean();
+      if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'workorder', mongoId }, doc.tenantId).catch(() => {});
     }
   }
   indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'workorders', doc.toObject(), (doc as any).title);
   return doc;
 }
 
-export async function updateWorkorder(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateWorkorder(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
@@ -180,10 +184,11 @@ export async function updateWorkorder(id: string, tenantId: string, data: any, s
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
   const doc = await NativeWorkorder.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     normalizeStaffAssignment(data),
     { new: true, runValidators: true }
   );
+  if (!doc) await throwIfStale(NativeWorkorder, filter, guard);
 
   // Contract master engine: keep the linked visit's status in sync. The
   // visit's own status values ('completed'/'planned') are a separate,
@@ -209,14 +214,15 @@ export async function updateWorkorder(id: string, tenantId: string, data: any, s
   return doc;
 }
 
-export async function deleteWorkorder(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteWorkorder(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { workOrderId: id }] }
     : { workOrderId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
-  const deleted = await NativeWorkorder.findOneAndDelete(filter);
+  const deleted = await NativeWorkorder.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeWorkorder, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'workorders', String(deleted._id));
   return deleted;
 }

@@ -2,9 +2,13 @@ import { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
 import { logger } from '../utils/logger';
 import { sendError } from '../utils/response';
+import { redactUrl } from './audit.middleware';
 
+// URLs are redacted (redactUrl, same as the audit log and morgan) before they
+// reach a log line or a response: GET /api/internal/crm-* carries the
+// per-user internalAuth JWT in its query string.
 export function notFound(req: Request, res: Response): void {
-  sendError(res, `Route ${req.originalUrl} not found`, 404);
+  sendError(res, `Route ${redactUrl(req.originalUrl)} not found`, 404);
 }
 
 export function errorHandler(
@@ -16,7 +20,7 @@ export function errorHandler(
   logger.error('Unhandled error', {
     message: err.message,
     stack: err.stack,
-    path: req.originalUrl,
+    path: redactUrl(req.originalUrl),
     method: req.method,
   });
 

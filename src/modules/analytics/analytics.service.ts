@@ -20,6 +20,7 @@ import { AutomationRun } from '../automation/automation-run.model';
 import { Connector } from '../connectors/connector.model';
 import { Campaign } from '../campaigns/campaign.model';
 import { Analytics } from './analytics.model';
+import { resolveDealDefaultCurrency, dealCurrencyExpr, currencyAmounts, amountIn } from '../native-crm/shared/deal-currency';
 
 import { DateTime } from 'luxon';
 
@@ -260,6 +261,15 @@ function buildBaseFilter(tenantId: string, branchId?: string, supportsBranch: bo
   return filter;
 }
 
+/* LR-PL-ANALYTICS-001: deal money is added up per currency, never across
+ * currencies (the helpers are in native-crm/shared/deal-currency.ts, shared
+ * with the deal stats behind the dashboard's Revenue tile). Each money figure
+ * comes with byCurrency; its old single value is the default currency's part. */
+export { resolveDealDefaultCurrency, dealCurrencyExpr, currencyAmounts, amountIn };
+export type { CurrencyAmount } from '../native-crm/shared/deal-currency';
+
+const sumOf = (rows: any[], key: string): number => rows.reduce((s: number, r: any) => s + (Number(r?.[key]) || 0), 0);
+
 export async function getDashboardStats(tenantId: string, branchId?: string, dateFilter?: DateRangeFilter) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const range = parseDateRange(dateFilter);
@@ -268,6 +278,7 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
   const dealBase = buildBaseFilter(tenantId, branchId, true);
   const ticketBase = buildBaseFilter(tenantId, branchId, true);
   const woBase = buildBaseFilter(tenantId, branchId, true);
+  const defaultCurrency = await resolveDealDefaultCurrency(tenantId, branchId);
 
   const [
     channelBreakdown,
@@ -329,12 +340,12 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
     Lead.countDocuments({ ...leadBase, isConverted: true, ...dateMatch }),
     // Converted leads in prev period
     Lead.countDocuments({ ...leadBase, isConverted: true, createdAt: { $gte: range.prevStart, $lte: range.prevEnd } }),
-    // Deals aggregation
+    // Deals aggregation (LR-PL-ANALYTICS-001: one group per currency)
     Deal.aggregate([
       { $match: { ...dealBase, ...dateMatch } },
       {
         $group: {
-          _id: null,
+          _id: dealCurrencyExpr(defaultCurrency),
           totalCount: { $sum: 1 },
           openCount: {
             $sum: {
@@ -359,12 +370,12 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
         },
       },
     ]),
-    // Prev deals aggregation
+    // Prev deals aggregation (one group per currency)
     Deal.aggregate([
       { $match: { ...dealBase, createdAt: { $gte: range.prevStart, $lte: range.prevEnd } } },
       {
         $group: {
-          _id: null,
+          _id: dealCurrencyExpr(defaultCurrency),
           wonRevenue: {
             $sum: {
               $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, { $ifNull: ['$amount', { $ifNull: ['$value', 0] }] }, 0],
@@ -463,10 +474,10 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
       { $match: { ...ticketBase, ...dateMatch } },
       { $group: { _id: '$ticketStatus', count: { $sum: 1 } } },
     ]),
-    // Deal stages distribution
+    // Deal stages distribution (per stage and currency)
     Deal.aggregate([
       { $match: { ...dealBase, ...dateMatch } },
-      { $group: { _id: '$stage', count: { $sum: 1 }, value: { $sum: { $ifNull: ['$amount', 0] } } } },
+      { $group: { _id: { stage: '$stage', currency: dealCurrencyExpr(defaultCurrency) }, count: { $sum: 1 }, value: { $sum: { $ifNull: ['$amount', 0] } } } },
     ]),
     // Automation runs summary
     AutomationFlowRun.aggregate([
@@ -484,8 +495,32 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
 
   const byChannel = Object.fromEntries(channelBreakdown.map((r) => [r._id || 'unspecified', r.count as number]));
 
-  const currentDeal = dealStats[0] || { totalCount: 0, openCount: 0, openPipelineValue: 0, wonCount: 0, wonRevenue: 0 };
-  const prevDeal = prevDealStats[0] || { wonRevenue: 0 };
+  // LR-PL-ANALYTICS-001: counts are added up across currencies, money is not.
+  const dealGroups = dealStats as any[];
+  const prevDealGroups = prevDealStats as any[];
+  const pipelineByCurrency = currencyAmounts(dealGroups.map((r) => [r._id, r.openPipelineValue]), defaultCurrency);
+  const wonByCurrency = currencyAmounts(dealGroups.map((r) => [r._id, r.wonRevenue]), defaultCurrency);
+  const prevWonByCurrency = currencyAmounts(prevDealGroups.map((r) => [r._id, r.wonRevenue]), defaultCurrency);
+  const currentDeal = {
+    totalCount: sumOf(dealGroups, 'totalCount'),
+    openCount: sumOf(dealGroups, 'openCount'),
+    wonCount: sumOf(dealGroups, 'wonCount'),
+    openPipelineValue: amountIn(pipelineByCurrency, defaultCurrency),
+    wonRevenue: amountIn(wonByCurrency, defaultCurrency),
+  };
+  // The won-revenue change compares one currency: the default one, or the only
+  // currency either period has won in.
+  const wonCurrencies = new Set([...wonByCurrency, ...prevWonByCurrency].map((e) => e.currency));
+  const changeCurrency = wonCurrencies.size === 1 ? [...wonCurrencies][0] : defaultCurrency;
+  const prevDeal = { wonRevenue: amountIn(prevWonByCurrency, changeCurrency) };
+  const dealStageMap = new Map<string, { count: number; totals: [string, unknown][] }>();
+  for (const r of dealStagesRaw as any[]) {
+    const stage = r._id?.stage || 'prospect';
+    const entry = dealStageMap.get(stage) ?? { count: 0, totals: [] };
+    entry.count += Number(r.count) || 0;
+    entry.totals.push([r._id?.currency, r.value]);
+    dealStageMap.set(stage, entry);
+  }
 
   const convRateCurr = newLeadsCurr > 0 ? Math.round((convertedLeadsCurr / newLeadsCurr) * 1000) / 10 : null;
   const convRatePrev = newLeadsPrev > 0 ? Math.round((convertedLeadsPrev / newLeadsPrev) * 1000) / 10 : null;
@@ -542,13 +577,18 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
         change: convRatePrev !== null && convRateCurr !== null ? calcChange(convRateCurr, convRatePrev) : 0,
       },
       pipelineValue: {
-        value: currentDeal.openPipelineValue,
+        value: currentDeal.openPipelineValue,      // the default currency's part
+        currency: defaultCurrency,
+        byCurrency: pipelineByCurrency,
         openDeals: currentDeal.openCount,
       },
       wonRevenue: {
-        value: currentDeal.wonRevenue,
+        value: currentDeal.wonRevenue,             // the default currency's part
+        currency: defaultCurrency,
+        byCurrency: wonByCurrency,
         wonDeals: currentDeal.wonCount,
-        change: calcChange(currentDeal.wonRevenue, prevDeal.wonRevenue),
+        change: calcChange(amountIn(wonByCurrency, changeCurrency), prevDeal.wonRevenue),
+        changeCurrency,
       },
       openTickets: {
         value: openTicketsCount,
@@ -583,7 +623,10 @@ export async function getDashboardStats(tenantId: string, branchId?: string, dat
     },
     activityTimeline,
     ticketStatusDistribution: Object.fromEntries(ticketStatusRaw.map((r) => [r._id || 'open', r.count])),
-    dealsByStage: Object.fromEntries(dealStagesRaw.map((r) => [r._id || 'prospect', { count: r.count, value: r.value }])),
+    dealsByStage: Object.fromEntries([...dealStageMap].map(([stage, e]) => {
+      const byCurrency = currencyAmounts(e.totals, defaultCurrency);
+      return [stage, { count: e.count, value: amountIn(byCurrency, defaultCurrency), byCurrency }];
+    })),
     dateRange: {
       preset: range.preset,
       startDate: range.start.toISOString(),
@@ -605,6 +648,7 @@ export async function getLeadsAndSalesAnalytics(tenantId: string, branchId?: str
   const dateMatch = getDateMatch(range);
   const leadBase = buildBaseFilter(tenantId, branchId, true);
   const dealBase = buildBaseFilter(tenantId, branchId, true);
+  const defaultCurrency = await resolveDealDefaultCurrency(tenantId, branchId);
 
   const [
     leadsTimeline,
@@ -658,24 +702,23 @@ export async function getLeadsAndSalesAnalytics(tenantId: string, branchId?: str
         },
       },
     ]),
-    // Deal pipeline by stage
+    // Deal pipeline by stage (per stage and currency, LR-PL-ANALYTICS-001)
     Deal.aggregate([
       { $match: { ...dealBase, ...dateMatch } },
       {
         $group: {
-          _id: '$stage',
+          _id: { stage: '$stage', currency: dealCurrencyExpr(defaultCurrency) },
           count: { $sum: 1 },
           totalValue: { $sum: { $ifNull: ['$amount', 0] } },
         },
       },
-      { $sort: { totalValue: -1 } },
     ]),
-    // Won vs Lost deals
+    // Won vs Lost deals (one group per currency)
     Deal.aggregate([
       { $match: { ...dealBase, ...dateMatch } },
       {
         $group: {
-          _id: null,
+          _id: dealCurrencyExpr(defaultCurrency),
           totalCount: { $sum: 1 },
           wonCount: { $sum: { $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, 1, 0] } },
           wonValue: { $sum: { $cond: [{ $in: ['$stage', ['won', 'closed_won']] }, { $ifNull: ['$amount', 0] }, 0] } },
@@ -730,7 +773,37 @@ export async function getLeadsAndSalesAnalytics(tenantId: string, branchId?: str
   ]);
 
   const funnelData = leadConversionStats[0] || { total: 0, contacted: 0, qualified: 0, converted: 0 };
-  const wonLost = dealsWonLostRaw[0] || { wonCount: 0, wonValue: 0, lostCount: 0, lostValue: 0, openCount: 0, openValue: 0, totalCount: 0 };
+  // LR-PL-ANALYTICS-001: counts across currencies, money per currency; each
+  // value is the default currency's part, byCurrency has every currency.
+  const wlGroups = dealsWonLostRaw as any[];
+  const wonByCurrency = currencyAmounts(wlGroups.map((r) => [r._id, r.wonValue]), defaultCurrency);
+  const lostByCurrency = currencyAmounts(wlGroups.map((r) => [r._id, r.lostValue]), defaultCurrency);
+  const openByCurrency = currencyAmounts(wlGroups.map((r) => [r._id, r.openValue]), defaultCurrency);
+  const wonLost = {
+    totalCount: sumOf(wlGroups, 'totalCount'),
+    wonCount: sumOf(wlGroups, 'wonCount'),
+    wonValue: amountIn(wonByCurrency, defaultCurrency),
+    lostCount: sumOf(wlGroups, 'lostCount'),
+    lostValue: amountIn(lostByCurrency, defaultCurrency),
+    openCount: sumOf(wlGroups, 'openCount'),
+    openValue: amountIn(openByCurrency, defaultCurrency),
+    currency: defaultCurrency,
+    wonByCurrency,
+    lostByCurrency,
+    openByCurrency,
+  };
+  const pipelineStageMap = new Map<string, { count: number; totals: [string, unknown][] }>();
+  for (const r of dealPipelineRaw as any[]) {
+    const stage = r._id?.stage || 'prospect';
+    const entry = pipelineStageMap.get(stage) ?? { count: 0, totals: [] };
+    entry.count += Number(r.count) || 0;
+    entry.totals.push([r._id?.currency, r.totalValue]);
+    pipelineStageMap.set(stage, entry);
+  }
+  const dealPipeline = [...pipelineStageMap].map(([stage, e]) => {
+    const byCurrency = currencyAmounts(e.totals, defaultCurrency);
+    return { stage, count: e.count, totalValue: amountIn(byCurrency, defaultCurrency), byCurrency };
+  }).sort((a, b) => (b.totalValue - a.totalValue) || (b.count - a.count));
   const closedCount = wonLost.wonCount + wonLost.lostCount;
   const winRate = closedCount > 0 ? Math.round((wonLost.wonCount / closedCount) * 1000) / 10 : null;
 
@@ -756,7 +829,7 @@ export async function getLeadsAndSalesAnalytics(tenantId: string, branchId?: str
       { stage: 'Converted to Deal/Customer', count: funnelData.converted },
       { stage: 'Won Deals', count: wonLost.wonCount },
     ],
-    dealPipeline: dealPipelineRaw.map((r) => ({ stage: r._id || 'prospect', count: r.count, totalValue: r.totalValue })),
+    dealPipeline,
     dealsWonLost: {
       ...wonLost,
       closedCount,
@@ -765,7 +838,8 @@ export async function getLeadsAndSalesAnalytics(tenantId: string, branchId?: str
       formula: 'Won Deals / Closed Deals (Won + Lost)',
     },
     financialFlow: {
-      openPipelineValue: wonLost.openValue,
+      openPipelineValue: wonLost.openValue,             // the default currency's part
+      openPipelineByCurrency: openByCurrency,
       totalQuoted: quoteInfo.totalQuoted,
       quotationCount: quoteInfo.count,
       totalInvoiced: invInfo.totalInvoiced,

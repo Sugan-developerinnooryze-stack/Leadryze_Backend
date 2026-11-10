@@ -1,5 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
+import { getNextSequence } from '../shared/counter.model';
 
 export interface IVehicleDoc extends Document {
   tenantId:           mongoose.Types.ObjectId;
@@ -71,8 +72,9 @@ const schema = new Schema<IVehicleDoc>(
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();
-  const last = await (this.constructor as any).findOne({ tenantId: this.tenantId }).sort({ numId: -1 }).select('numId').lean();
-  this.numId     = (last?.numId ?? 0) + 1;
+  // LR-C4-NUM-001: the shared per-tenant counter, like every other numbered
+  // module. "Highest + 1" re-issued a deleted vehicle's number and raced.
+  this.numId     = await getNextSequence(this.tenantId, 'vehicles', this.constructor as any);
   const pfx         = await resolveClientPrefix(this.tenantId);
   this.clientId = pfx;
   this.vehicleId = `${pfx}-VEH-${String(this.numId).padStart(4, '0')}`;

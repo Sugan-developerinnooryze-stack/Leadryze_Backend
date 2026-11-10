@@ -30,6 +30,8 @@ export interface IInvoiceDoc extends Document {
   invoiceId:             string;
   customerId:            string;
   workOrderId?:          string;
+  /** LR-PL-INV-001: see the schema field. */
+  workOrderLock?:        string;
   quotationId?:          string;
   contractId?:           string;
   address?:              string;
@@ -99,6 +101,13 @@ const schema = new Schema<IInvoiceDoc>(
     invoiceId:             { type: String },
     customerId:            { type: String, required: true, trim: true },
     workOrderId:           { type: String, trim: true },
+    // LR-PL-INV-001: the work order this invoice holds: its workOrderId while
+    // it is that work order's one active invoice. Not set on a cancelled
+    // invoice, one made with the duplicate override, or one made before this
+    // field existed (scripts/backfill-invoice-work-order-locks.ts sets it on
+    // those). The unique index below lets only one invoice per work order
+    // hold it, also when several are created at the same moment.
+    workOrderLock:         { type: String, trim: true },
     quotationId:           { type: String, trim: true },
     contractId:            { type: String, trim: true },
     address:               { type: String, trim: true },
@@ -151,6 +160,13 @@ schema.pre('save', async function (next) {
 schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, customerId: 1 });
+schema.index({ tenantId: 1, dueDate: 1 }); // date-range reads (Daily Events, calendar)
+// LR-PL-INV-001: one active invoice per work order (see workOrderLock). A
+// partial index, so invoices without the field are not part of it.
+schema.index(
+  { tenantId: 1, workOrderLock: 1 },
+  { unique: true, partialFilterExpression: { workOrderLock: { $type: 'string' } } },
+);
 
 export const NativeInvoice = mongoose.model<IInvoiceDoc>(
   'NativeInvoice',

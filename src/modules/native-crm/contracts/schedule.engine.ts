@@ -6,6 +6,10 @@
  * (clamped to month end), never a hardcoded 30-day stride.
  */
 import { IContractServiceLine, IContractVisit, IScheduleRule } from './contract.model';
+import { effectiveLineRates, totalsWithLineRates } from '../shared/document-totals';
+
+/** LR-R26-CTR-007: the contract header's rates, used by a line without its own. */
+export interface ContractHeaderRates { discount?: unknown; gstPercentage?: unknown }
 
 const MAX_VISITS = 1000;
 const DAY_MS = 24 * 3600 * 1000;
@@ -128,11 +132,40 @@ export function expandRule(rule: IScheduleRule, start: Date, end: Date): Date[] 
 
 /* ── visit generation ──────────────────────────────────────────────────────── */
 
-function lineNet(line: IContractServiceLine): number {
+/** One line's amount with tax, at its effective rates (LR-R26-CTR-007: a
+ * line without its own discount or tax uses the contract header's; visits
+ * used only the line's, so a header GST never reached them). */
+function lineNet(line: IContractServiceLine, header: ContractHeaderRates = {}): number {
   const gross = (Number(line.amount) || 0) * (Number(line.count) || 1);
-  const afterDiscount = gross * (1 - (Number(line.discountPercent) || 0) / 100);
-  const withTax = afterDiscount * (1 + (Number(line.taxPercent) || 0) / 100);
+  const r = effectiveLineRates(line, header);
+  const afterDiscount = gross * (1 - r.discountPercent / 100);
+  const withTax = afterDiscount * (1 + r.taxPercent / 100);
   return Math.round(withTax * 100) / 100;
+}
+
+/** LR-R26-CTR-007: a contract's stored totals, the sum of its lines at their
+ * effective rates plus parts at the header's, to the cent. They used the
+ * header's rates for every line, ignoring each line's own. */
+export function computeContractTotals(services: any[], parts: any[], header: ContractHeaderRates) {
+  const t = totalsWithLineRates(services ?? [], parts ?? [], header);
+  return {
+    partsAmount:           t.partsAmount,
+    servicesAmount:        Math.round(t.afterDiscount * 100) / 100,
+    servicesAmountWithTax: Math.round(t.withTax * 100) / 100,
+  };
+}
+
+/** LR-R26-CTR-007: when a visit's work order starts: the visit's day at the
+ * contract start's time of day. A visit date is that day's midnight in the
+ * same frame dateOnly uses (local time of this process), so the contract
+ * start's offset from its own day's midnight gives that time (10:00 SGT for
+ * a contract starting at 10:00 SGT). Work orders used to start at midnight
+ * (08:00 SGT). */
+export function visitStartAt(serviceDate: Date | string, contractStart?: Date | string | null): Date {
+  const day = new Date(serviceDate);
+  const start = contractStart ? new Date(contractStart) : null;
+  if (!start || isNaN(start.getTime()) || isNaN(day.getTime())) return day;
+  return new Date(day.getTime() + (start.getTime() - dateOnly(start).getTime()));
 }
 
 /**
@@ -143,6 +176,7 @@ export function generateVisits(
   lines: IContractServiceLine[],
   startDate: Date | string,
   endDate: Date | string,
+  header: ContractHeaderRates = {},
 ): IContractVisit[] {
   const start = new Date(startDate);
   const end   = new Date(endDate);
@@ -166,17 +200,19 @@ export function generateVisits(
         entry = { date: d, services: [], amount: 0 };
         byDate.set(key, entry);
       }
+      // The rates the visit is priced with (the line's own, else the header's).
+      const rates = effectiveLineRates(line, header);
       entry.services.push({
         name:            line.name,
         amount:          Number(line.amount) || 0,
         count:           Number(line.count) || 1,
-        taxPercent:      line.taxPercent != null ? Number(line.taxPercent) : 0,
-        discountPercent: line.discountPercent != null ? Number(line.discountPercent) : 0,
+        taxPercent:      rates.taxPercent,
+        discountPercent: rates.discountPercent,
         durationHours:   line.durationHours,
         serviceId:       line.serviceId,
         frequency:       line.scheduleRule.frequency,
       });
-      entry.amount = Math.round((entry.amount + lineNet(line)) * 100) / 100;
+      entry.amount = Math.round((entry.amount + lineNet(line, header)) * 100) / 100;
     }
   }
 

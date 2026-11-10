@@ -4,6 +4,7 @@ import { RoundRobinCursor } from './round-robin-cursor.model';
 import { NativeTeam } from '../teams/team.model';
 import { NativeService } from '../services/service.model';
 import { isSlotFree } from '../meetings/availability.service';
+import { excludeDeactivatedLogins } from './bookable-staff';
 
 /** Rotates through a tenant's active staff roster (optionally scoped to one
  * team) and returns the next one in line — used to auto-assign a Lead
@@ -26,6 +27,8 @@ export async function assignRoundRobin(
   const tid = new mongoose.Types.ObjectId(tenantId);
   const filter: Record<string, unknown> = { tenantId: tid, status: 'active' };
   if (teamId) filter.teamId = new mongoose.Types.ObjectId(teamId);
+  // LR-C4-USER-006: never a staff profile whose linked login is deactivated.
+  await excludeDeactivatedLogins(filter, tid);
 
   const roster = await NativeStaff.find(filter)
     .select('staffId firstName lastName')

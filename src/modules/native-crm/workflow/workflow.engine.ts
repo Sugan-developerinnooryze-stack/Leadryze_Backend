@@ -23,14 +23,19 @@ export function getNextStep(current: DocType, steps: string[]): DocType | null {
 /**
  * Marks the source document workflowState='complete' and the child document
  * workflowState='in_progress'. Safe to call fire-and-forget.
+ *
+ * Both updates are scoped to `tenantId` (the child's own tenant), so an id
+ * belonging to another tenant matches nothing. No tenant, no update.
  */
 export async function advanceWorkflow(
   sourceRef: { type: DocType; mongoId: string },
-  childRef:  { type: DocType; mongoId: string }
+  childRef:  { type: DocType; mongoId: string },
+  tenantId:  mongoose.Types.ObjectId | string,
 ): Promise<void> {
+  if (!tenantId) return;
   const [sourceModel, childModel] = [MODEL_MAP[sourceRef.type], MODEL_MAP[childRef.type]];
   await Promise.all([
-    sourceModel.findByIdAndUpdate(sourceRef.mongoId, { workflowState: 'complete' }),
-    childModel.findByIdAndUpdate(childRef.mongoId,   { workflowState: 'in_progress' }),
+    sourceModel.findOneAndUpdate({ _id: sourceRef.mongoId, tenantId }, { workflowState: 'complete' }),
+    childModel.findOneAndUpdate({ _id: childRef.mongoId, tenantId },   { workflowState: 'in_progress' }),
   ]);
 }

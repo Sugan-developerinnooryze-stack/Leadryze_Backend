@@ -227,6 +227,7 @@ export async function convertLeadToCustomer(
   // convertLead()) that set the stage but never these back-references —
   // that duplicate now delegates here instead of re-implementing any of it.
   const wonKey = await getOutcomeStageKey(tenantId.toString(), 'lead', 'won', 'won');
+  const previousStatus = lead.status;
   lead.isConverted         = true;
   lead.convertedCustomerId = customer.customerId;
   lead.convertedAt         = new Date();
@@ -243,9 +244,11 @@ export async function convertLeadToCustomer(
   // Customer" step (per the requested AI Widget -> Team -> Staff ->
   // ... -> Converted trail), not lumped in with an ordinary stage move.
   const custId = (customer.customerId || '').toUpperCase();
+  // from/to record the stage move this conversion made (Daily Events counts
+  // it as "won today" when the lead wasn't already in a won stage).
   logTimeline(tenantId, 'leads', lead._id.toString(), 'converted',
     `Customer ${custId} created`, performedBy,
-    { type: 'customer', customerId: custId },
+    { type: 'customer', customerId: custId, from: previousStatus, to: wonKey },
   ).catch(() => {});
 
   // LR-PL-AUDIT-001: Customer created via conversion must be audited under Customers module

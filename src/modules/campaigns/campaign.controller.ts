@@ -146,7 +146,7 @@ export async function duplicateCampaign(req: AuthRequest, res: Response, next: N
 export async function testSendCampaign(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
     const result = await lifecycle.testSendCampaign(req.tenantId!, req.params.id, req.body.to);
-    sendSuccess(res, result, result.sent ? 'Test message sent' : 'Test message could not be sent — check channel configuration');
+    sendSuccess(res, result, result.sent ? 'Test message sent' : (result.reason ?? 'Test message could not be sent — check channel configuration'));
   } catch (err) { handleLifecycleError(err, res, next); }
 }
 

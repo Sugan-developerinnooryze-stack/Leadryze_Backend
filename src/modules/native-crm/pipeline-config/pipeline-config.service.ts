@@ -111,6 +111,14 @@ export async function getOrCreateStages(tenantId: string, module: PipelineModule
   return doc?.stages ?? [];
 }
 
+/** Read-only twin of getOrCreateStages for strictly read-only views (Daily
+ * Events): returns the tenant's saved stages, or the built-in defaults when
+ * none are saved yet — WITHOUT seeding a PipelineConfig document. */
+export async function peekStages(tenantId: string, module: BuiltInPipelineModule): Promise<IPipelineStage[]> {
+  const doc = await PipelineConfig.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId), module }).select('stages').lean();
+  return (doc?.stages as IPipelineStage[] | undefined) ?? DEFAULT_STAGES[module] ?? [];
+}
+
 export async function updateStages(tenantId: string, module: PipelineModule, stages: IPipelineStage[]): Promise<IPipelineStage[]> {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const normalized = stages.map((s, i) => ({ ...s, order: i }));

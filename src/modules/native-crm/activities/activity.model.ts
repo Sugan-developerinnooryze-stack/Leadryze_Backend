@@ -1,5 +1,6 @@
 ﻿import mongoose, { Schema, Document } from 'mongoose';
 import { resolveClientPrefix } from '../../../utils/client-id';
+import { getNextSequence } from '../shared/counter.model';
 
 export interface IActivityDoc extends Document {
   tenantId:       mongoose.Types.ObjectId;
@@ -46,12 +47,9 @@ const schema = new Schema<IActivityDoc>(
 
 schema.pre('save', async function (next) {
   if (!this.isNew) return next();
-  const last = await (this.constructor as any)
-    .findOne({ tenantId: this.tenantId })
-    .sort({ numId: -1 })
-    .select('numId')
-    .lean();
-  this.numId      = (last?.numId ?? 0) + 1;
+  // LR-C4-NUM-001: the shared per-tenant counter, like every other numbered
+  // module. "Highest + 1" re-issued a deleted activity's number and raced.
+  this.numId      = await getNextSequence(this.tenantId, 'activities', this.constructor as any);
   const pfx         = await resolveClientPrefix(this.tenantId);
   this.clientId = pfx;
   this.activityId = `${pfx}-ACT-${String(this.numId).padStart(4, '0')}`;
@@ -61,6 +59,7 @@ schema.pre('save', async function (next) {
 schema.index({ tenantId: 1 });
 schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, type: 1 });
+schema.index({ tenantId: 1, scheduledAt: 1 }); // date-range reads (Daily Events, calendar)
 
 export const NativeActivity = mongoose.model<IActivityDoc>(
   'NativeActivity',

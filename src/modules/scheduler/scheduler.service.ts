@@ -6,6 +6,7 @@ import { runContractScheduler } from '../native-crm/contracts/contract.scheduler
 import { pollPausedFlows, pollScheduledFlows } from '../native-crm/automation-flows/automation-flow.service';
 import { pollScheduledRules } from '../native-crm/automation-rules/automation-rule.service';
 import { runCallMeetingReminders } from './crm-reminders.scheduler';
+import { resolveEffectiveTimezone, whenFmt } from '../notifications/confirmation.service';
 import { Connector } from '../connectors/connector.model';
 import { Customer } from '../customers/customer.model';
 import { Activity } from '../activities/activity.model';
@@ -19,6 +20,7 @@ import { recoverStuckImports } from '../native-crm/datasets/dataset.service';
 import { retryFailedChatbotLeadEmails } from '../native-crm/lead-capture/chatbot-lead-email.service';
 import { getFeatureFlagsForTenants, isFeatureFlagEnabled } from '../tenants/tenant.service';
 import { runCampaignSchedulePromotion, runCampaignDispatchTicks } from '../campaigns/campaign-scheduler.service';
+import { sweepCrmAssistOperations } from '../crm-assistant/operations/expiry-sweep';
 
 // ─── BullMQ (Redis-dependent) — graceful stub when Redis unavailable ──────────
 let _bullmqAvailable = false;
@@ -231,7 +233,8 @@ async function runDailyFollowupCheck(): Promise<void> {
 }
 
 // ─── 20-minute meeting reminder ──────────────────────────────────────────────
-async function runMeetingReminders(): Promise<void> {
+// Exported for its test (LR-PL-NOTIF-001); only the cron below runs it.
+export async function runMeetingReminders(): Promise<void> {
   try {
     const now = new Date();
     const windowStart = new Date(now.getTime() + 18 * 60 * 1000); // 18 min from now
@@ -259,8 +262,11 @@ async function runMeetingReminders(): Promise<void> {
         continue;
       }
 
+      // LR-PL-NOTIF-001: in the tenant's zone with the zone named, as the
+      // Native CRM reminders do. It printed the server's clock (UTC on
+      // Render) with no zone. An activity has no zone or branch of its own.
       const startFmt = activity.startDate
-        ? new Date(activity.startDate).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
+        ? whenFmt('meeting', { _id: activity._id, tenantId, startDate: activity.startDate }, await resolveEffectiveTimezone(tenantId)) ?? 'soon'
         : 'soon';
 
       const subject  = `Reminder: ${activity.title} starts in 20 minutes`;
@@ -390,11 +396,22 @@ function initCronJobs(): void {
     await runCallMeetingReminders();
   });
 
-  // Contract → Work Order auto-generator — daily at 6am
-  cron.schedule('0 6 * * *', async () => {
+  // Contract → Work Order auto-generator (LR-R26-SCHED-001): every hour at
+  // :05 and once shortly after start-up, so a run missed while the server
+  // was asleep, restarting or redeploying is made up within the hour. It ran
+  // once a day at 06:00 UTC with no catch-up, so missed days were skipped and
+  // then created all at once. Each visit (and each nextServiceDate) is
+  // claimed atomically before its work order is created, so overlapping runs
+  // never create one twice; after generating, contracts past their end date
+  // move to Expired.
+  cron.schedule('5 * * * *', async () => {
     logger.info('Cron triggered: contract work-order scheduler');
     await runContractScheduler();
   });
+  setTimeout(() => {
+    logger.info('Start-up run: contract work-order scheduler');
+    runContractScheduler().catch((err) => logger.error('Contract scheduler start-up run failed', { error: (err as Error).message }));
+  }, 30_000).unref();
 
   // Advanced Mode Delay-node resume poll — every 2 minutes, same cadence as
   // the other windowed polls above. Cron-only by design (no BullMQ) — see
@@ -447,6 +464,14 @@ function initCronJobs(): void {
     await recoverStuckImports().catch((err) => logger.error('recoverStuckImports crashed', { error: (err as Error).message }));
   });
 
+  // CRM assistant staged operations: a staged change past its 10-minute
+  // expiry becomes 'expired', and a confirm stuck in 'executing' for more
+  // than 2 minutes becomes 'unknown', each with its audit entry (TTL
+  // deletion runs no code, so this is what records them).
+  cron.schedule('*/5 * * * *', async () => {
+    await sweepCrmAssistOperations().catch((err) => logger.error('sweepCrmAssistOperations crashed', { error: (err as Error).message }));
+  });
+
   // AI service keep-alive — Render's free/hobby tier spins a service down
   // after ~15 minutes with no incoming requests, and the next real request
   // (a visitor's chat message) then pays a 30-60+ second cold-boot tax,
@@ -466,7 +491,7 @@ function initCronJobs(): void {
       .catch((err) => logger.warn('AI service keep-alive ping failed', { error: (err as Error).message }));
   });
 
-  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign schedule promotion (1min), campaign dispatch ticks (1min), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator (6am daily), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min), AI service keep-alive (10min)');
+  logger.info('Cron jobs scheduled: CRM sync (30min), follow-up check (9am daily), campaign schedule promotion (1min), campaign dispatch ticks (1min), meeting reminders (2min), follow-ups (5min), Native CRM call/meeting reminders (2min), contract WO generator and expiry (hourly at :05, and 30s after start-up), Delay-node resume poll (2min), Schedule Trigger poll (1min, rules+flows), Dataset image-ZIP cleanup (hourly), Chatbot-lead email retry (hourly), Stuck dataset import recovery (5min), CRM assistant operation expiry (5min), AI service keep-alive (10min)');
 }
 
 // ─── Manual trigger helpers ───────────────────────────────────────────────────

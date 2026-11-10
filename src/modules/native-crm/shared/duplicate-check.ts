@@ -26,13 +26,14 @@ export async function findDuplicateContact(
   if (phone) {
     const rawPhone = String(phone).trim();
     const digits = rawPhone.replace(/\D/g, '');
+    // LR-IMP-001: exact digits only (spaces, dashes and brackets ignored), the
+    // approved rule (09-Oct: exact email and/or exact phone). It also matched
+    // on the last 10 digits, so a local number was a "duplicate" of a +1 lead,
+    // and +91 / +44 numbers ending in the same 10 digits matched each other
+    // (agreed 6 Nov: exact only; adding the tenant's country code to a local
+    // number is a later decision).
     if (digits.length >= 6) {
       or.push({ phoneSearch: digits });
-      if (digits.length > 10) {
-        or.push({ phoneSearch: digits.slice(-10) });
-      } else if (digits.length === 10) {
-        or.push({ phoneSearch: new RegExp(`${digits}$`) });
-      }
     }
     or.push({ phone: rawPhone });
     or.push({ mobile: rawPhone });

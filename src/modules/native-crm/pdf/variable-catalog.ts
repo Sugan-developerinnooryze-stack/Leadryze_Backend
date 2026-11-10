@@ -1,5 +1,6 @@
 import { ICustomFieldDoc } from '../custom-fields/custom-field.model';
 import { ITableColumn, TemplateDocType, TotalsRowKey } from '../custom-templates/custom-template.model';
+import { pdfMoney, invoicePayment } from './pdf-money';
 
 /**
  * Single source of truth for every variable the PDF template designer can
@@ -362,27 +363,27 @@ export const TOTALS_LABELS: Record<TotalsRowKey, string> = {
 
 export function totalsValue(key: TotalsRowKey, ctx: RenderCtx): string {
   const d = ctx.doc ?? {};
-  const svc = (d.services ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
-  const prt = (d.parts    ?? []).reduce((s: number, x: any) => s + (x.amount ?? 0) * (x.count ?? 1), 0);
-  const discountPct = d.discount ?? 0;
-  const gstPct = d.gstPercentage ?? 0;
-  // discount is a percentage (0-100), not a flat amount — matches totalsHtml().
-  const discountAmt = (svc + prt) * (discountPct / 100);
-  const afterDiscount = svc + prt - discountAmt;
-  // Derived fully from services/parts/discount/gst rather than trusting a
-  // persisted servicesAmountWithTax field — identical result for docTypes
-  // that do store one (invoice/quotation/contract keep them in sync, see
-  // invoice.service.ts), and the only way workorder (which has no such
-  // persisted field) can ever show a nonzero total at all.
-  const total = afterDiscount + afterDiscount * (gstPct / 100);
+  // LR-R26-PDF-002: the same numbers as the built-in templates' totals block
+  // (pdf-money.ts): an invoice's saved totals, as the invoice page shows them;
+  // for other documents the line rates count (the header rates were used for
+  // every line) and quotations keep their header-only sum. Paid / Balance Due
+  // are the receipts and the total minus them (all of it when marked paid with
+  // no receipts). They were all or nothing: a part-paid invoice printed Paid 0
+  // and the full total as Balance Due.
+  const m = pdfMoney(d, ctx.docType === 'quotation' ? 'quotation' : ctx.docType === 'invoice' ? 'invoice' : 'other');
+  const exact = m.lineRates || m.saved;   // amounts already at the cent
   switch (key) {
-    case 'servicesSubtotal': return fmtMoney(svc, ctx.cur);
-    case 'partsSubtotal':    return fmtMoney(prt, ctx.cur);
-    case 'subtotal':         return fmtMoney(svc + prt, ctx.cur);
-    case 'discount':         return discountAmt > 0 ? `-${fmtMoney(discountAmt, ctx.cur)}` : fmtMoney(0, ctx.cur);
-    case 'gst':              return `${gstPct}% · ${fmtMoney(afterDiscount * (gstPct / 100), ctx.cur)}`;
-    case 'total':            return fmtMoney(total, ctx.cur);
-    case 'paid':             return fmtMoney((d.paid || d.status === (ctx.invoicePaidKey ?? 'paid')) ? total : 0, ctx.cur);
-    case 'balance':          return fmtMoney((d.paid || d.status === (ctx.invoicePaidKey ?? 'paid')) ? 0 : total, ctx.cur);
+    case 'servicesSubtotal': return fmtMoney(m.servicesSubtotal, ctx.cur);
+    case 'partsSubtotal':    return fmtMoney(m.partsSubtotal, ctx.cur);
+    case 'subtotal':         return fmtMoney(m.subtotal, ctx.cur);
+    // (A rounding remainder is not a discount.)
+    case 'discount':         return m.discount > (exact ? 0.004 : 0) ? `-${fmtMoney(m.discount, ctx.cur)}` : fmtMoney(0, ctx.cur);
+    // With line rates there is no single GST rate to name, only the amount.
+    case 'gst':              return m.lineRates
+      ? fmtMoney(m.total - m.afterDiscount, ctx.cur)
+      : `${m.gstPercent}% · ${fmtMoney(exact ? m.total - m.afterDiscount : m.afterDiscount * (m.gstPercent / 100), ctx.cur)}`;
+    case 'total':            return fmtMoney(m.total, ctx.cur);
+    case 'paid':             return fmtMoney(invoicePayment(d, m.total, ctx.invoicePaidKey).rowPaid, ctx.cur);
+    case 'balance':          return fmtMoney(invoicePayment(d, m.total, ctx.invoicePaidKey).rowBalance, ctx.cur);
   }
 }

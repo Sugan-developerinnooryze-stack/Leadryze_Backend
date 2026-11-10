@@ -24,6 +24,9 @@ router.post('/:id/convert/opportunity', requirePermission('native_crm.leads.edit
 router.post('/:id/convert/customer',    requirePermission('native_crm.leads.edit'), validate({ params: idParam }), ctrl.convertToCustomer);
 router.get('/:id/conversions',          requirePermission('native_crm.leads.view'), validate({ params: idParam }), ctrl.getConversions);
 router.post('/:id/convert',     requirePermission('native_crm.leads.edit'), validate({ params: idParam }),        ctrl.convertLead);
-router.patch('/:id/stage',      requirePermission('native_crm.leads.edit'), validate({ params: idParam, body: updateStageSchema }), ctrl.updateStage);
+// LR-NEG-001: a stage move is an edit, so a locked lead (e.g. auto-locked on
+// Won) refuses it for non-admins, as PUT /:id does. Moves never saved while
+// the version token was being stripped, which hid this missing check.
+router.patch('/:id/stage',      requirePermission('native_crm.leads.edit'), validate({ params: idParam, body: updateStageSchema }), requireUnlocked('leads'), ctrl.updateStage);
 
 export default router;

@@ -327,5 +327,6 @@ schema.index({ tenantId: 1, status: 1 });
 schema.index({ tenantId: 1, leadOwner: 1 });
 schema.index({ tenantId: 1, isConverted: 1 });
 schema.index({ tenantId: 1, leadId: 1 });
+schema.index({ tenantId: 1, expectedCloseDate: 1 }); // date-range reads (Daily Events, calendar)
 
 export const Lead = mongoose.model<ILeadDoc>('Lead', schema, 'native_leads');

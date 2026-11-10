@@ -127,6 +127,18 @@ export function transformPIIResponse(
   return Array.isArray(items) ? items.map(transform) : transform(items);
 }
 
+/**
+ * LR-R26-PDF-002: the real values of a record's PII fields, for a document
+ * that goes to the customer themselves (a PDF sent by e-mail, WhatsApp or an
+ * automation). Decrypts every PII field (and any other ciphertext) and drops
+ * the internal search fields, as transformPIIResponse does for an admin. A
+ * PDF a staff member downloads or previews goes through transformPIIResponse
+ * with that staff member's role instead.
+ */
+export function decryptPIIFields<T>(items: T, module: string): T {
+  return transformPIIResponse(items, module, ADMIN_ROLES[0], []);
+}
+
 /** Decrypts a stored value if needed, then either reveals it or masks it. */
 function revealOrMask(field: string, val: string, reveal: boolean): string {
   const real = isEncrypted(val) ? safeDecrypt(val, field) : val;

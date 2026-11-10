@@ -10,6 +10,7 @@ import { sendWhatsAppNow } from '../messages/whatsapp.service';
 import { logger } from '../../utils/logger';
 import { config } from '../../config';
 import { Tenant } from '../tenants/tenant.model';
+import { resolveTenantReplyTo, REPLY_TO_MISSING_MESSAGE } from '../messages/tenant-reply-to';
 
 // audience.filter is tenant-authored JSON that has never been executed as a
 // live Mongo query before today (it was a Mixed bag nothing read) — allowlist
@@ -138,7 +139,9 @@ async function sendToRecipient(
   subjectTpl: string | undefined,
   bodyTpl: string,
   channel: 'email' | 'whatsapp' | 'sms',
-  tenant?: { name?: string; branding?: { companyName?: string; contactEmail?: string }; settings?: { timezone?: string } } | null
+  tenant?: { name?: string; branding?: { companyName?: string; contactEmail?: string }; settings?: { timezone?: string } } | null,
+  /** LR-PL-CAMP-003: the tenant's reply address (resolveTenantReplyTo), required for e-mail. */
+  replyTo?: string | null
 ): Promise<void> {
   const customer = await Customer.findById(recipient.customerId).lean();
   const resolvedTenant = tenant ?? (await Tenant.findById(tenantId).select('name branding settings').lean());
@@ -152,7 +155,8 @@ async function sendToRecipient(
     if (channel === 'email') {
       const subject = renderTemplate(subjectTpl || '', variables);
       const senderName = resolvedTenant?.branding?.companyName || resolvedTenant?.name || config.brevo.senderName;
-      const replyTo = resolvedTenant?.branding?.contactEmail || undefined;
+      // LR-PL-CAMP-003: never sent without the tenant's own reply address.
+      if (!replyTo) throw new Error(REPLY_TO_MISSING_MESSAGE);
       providerMessageId = await sendEmailNow({
         to: recipient.email!,
         toName: recipient.name,
@@ -242,6 +246,22 @@ export async function dispatchCampaignTick(campaignId: string, batchSize = 50): 
     return { processed: 0, done: stillPending === 0 };
   }
 
+  const tenant = await Tenant.findById(campaign.tenantId).select('name branding settings').lean();
+
+  // LR-PL-CAMP-003: an e-mail campaign is answered to the tenant's own
+  // address. Without one (for example it was removed after activation), the
+  // campaign stops here, before any recipient is claimed, like a missing
+  // template; the remaining recipients stay pending.
+  let replyTo: string | null = null;
+  if (campaign.channel === 'email') {
+    replyTo = await resolveTenantReplyTo(String(campaign.tenantId), tenant);
+    if (!replyTo) {
+      logger.warn('dispatchCampaignTick: tenant has no reply-to address, campaign stopped', { campaignId });
+      await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'failed', lastError: REPLY_TO_MISSING_MESSAGE } });
+      return { processed: 0, done: true };
+    }
+  }
+
   const ids = toClaim.map((r) => r._id);
   // Atomic claim: MongoDB re-evaluates {status:'pending'} at write time for
   // EACH matched document, so an overlapping tick's updateMany simply won't
@@ -250,10 +270,8 @@ export async function dispatchCampaignTick(campaignId: string, batchSize = 50): 
   await CampaignRecipient.updateMany({ _id: { $in: ids }, status: 'pending' }, { $set: { status: 'queued', queuedAt: new Date() } });
   const claimed = await CampaignRecipient.find({ _id: { $in: ids }, status: 'queued' });
 
-  const tenant = await Tenant.findById(campaign.tenantId).select('name branding settings').lean();
-
   await Promise.all(
-    claimed.map((r) => sendToRecipient(String(campaign.tenantId), r, template.subject, template.body, campaign.channel as 'email' | 'whatsapp' | 'sms', tenant))
+    claimed.map((r) => sendToRecipient(String(campaign.tenantId), r, template.subject, template.body, campaign.channel as 'email' | 'whatsapp' | 'sms', tenant, replyTo))
   );
 
   const remaining = await CampaignRecipient.countDocuments({ campaignId, status: { $in: ['pending', 'queued'] } });

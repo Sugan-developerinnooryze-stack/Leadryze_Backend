@@ -48,3 +48,19 @@ src/scripts/check_*
 src/scripts/backfill-ticket-numbers.ts
 tests/*.test.ts
 
+
+# Test fixtures and helpers: only the local Jest tests above use them
+# (tests/*.test.ts is already ignored).
+tests/fixtures/
+tests/helpers/
+
+# Developer check script (compares the CRM assistant's shared fixtures across
+# the three repos; needs the ignored fixtures).
+src/scripts/verify-crm-assist-contract-sync.ts
+
+# One-off data scripts, run by hand against a database and then not needed
+# (same as backfill-ticket-numbers.ts above).
+src/scripts/backfill-invoice-work-order-locks.ts
+src/scripts/check-duplicate-record-numbers.ts
+src/scripts/cleanup-legacy-seeded-campaigns.ts
+src/scripts/reconcile-invoice-paid-amounts.ts

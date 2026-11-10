@@ -6,7 +6,8 @@ import { advanceWorkflow } from '../workflow/workflow.engine';
 import { NativeQuotation } from '../quotations/quotation.model';
 import { NativeWorkorder } from '../workorders/workorder.model';
 import { NativeInvoice } from '../invoices/invoice.model';
-import { generateVisits, computeBalance, serviceRangeSummary } from './schedule.engine';
+import { generateVisits, computeBalance, serviceRangeSummary, computeContractTotals, visitStartAt } from './schedule.engine';
+import { effectiveLineRates } from '../shared/document-totals';
 import { isValidStageKey, getOutcomeStageKey } from '../pipeline-config/pipeline-config.service';
 import { DataScope } from '../../../types';
 import { applyDataScopeToFilter } from '../shared/data-scope';
@@ -17,6 +18,8 @@ import { applyDynamicFilters } from '../shared/dynamic-filter';
 import { getContractFilterCatalog } from './contract.filter-catalog';
 import { Tenant } from '../../tenants/tenant.model';
 import { zonedTimeToUtc } from '../shared/timezone';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
+import { logger } from '../../../utils/logger';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -150,13 +153,10 @@ export async function createContract(data: any) {
   await assertValidStatus(String(data.tenantId), data.status);
   const services: any[]  = data.services ?? [];
   const parts: any[]     = data.parts ?? [];
-  const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
-  const prtTotal = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-  const discount = Number(data.discount ?? 0);
-  const gst      = Number(data.gstPercentage ?? 0);
-  // discount is a percentage (0-100), not a flat amount — matches quotation.service.ts.
-  const subtotal = svcTotal + prtTotal;
-  const after    = subtotal - (subtotal * discount) / 100;
+  // LR-R26-CTR-007: discount is a percentage (0-100), as on quotations,
+  // invoices and work orders; each line at its own rates, else the header's.
+  const header = { discount: data.discount, gstPercentage: data.gstPercentage };
+  const totals = computeContractTotals(services, parts, header);
 
   // Master engine: expand per-service schedule rules into the visit schedule
   if (data.startDate) {
@@ -168,26 +168,26 @@ export async function createContract(data: any) {
 
   let visits = data.visits;
   if (hasScheduleRules(services) && data.startDate && data.endDate) {
-    visits = generateVisits(services, data.startDate, data.endDate);
+    visits = generateVisits(services, data.startDate, data.endDate, header);
   }
 
   const doc = await NativeContract.create({
     ...data,
     ...(visits !== undefined ? { visits } : {}),
-    partsAmount:           prtTotal,
-    servicesAmount:        after,
-    servicesAmountWithTax: after + (after * gst) / 100,
+    ...totals,
   });
   if (data.quotationId) {
     const mongoId = (doc._id as any).toString();
-    const src = await NativeQuotation.findOne({ quotationId: data.quotationId }).select('_id').lean();
-    if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'contract', mongoId }).catch(() => {});
+    // Scoped to this contract's own tenant: the quotation id comes from the
+    // caller and is not otherwise checked against it.
+    const src = await NativeQuotation.findOne({ tenantId: doc.tenantId, quotationId: data.quotationId }).select('_id').lean();
+    if (src) advanceWorkflow({ type: 'quotation', mongoId: (src._id as any).toString() }, { type: 'contract', mongoId }, doc.tenantId).catch(() => {});
   }
   indexNativeSearchRecord(String(doc.tenantId), 'native-crm', 'contracts', doc.toObject(), (doc as any).title);
   return doc;
 }
 
-export async function updateContract(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateContract(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
@@ -195,8 +195,11 @@ export async function updateContract(id: string, tenantId: string, data: any, sc
     : { contractId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'staffIds');
+  // LR-R26-CTR-007: the header rates price the visits too, so a change to
+  // them regenerates an unlocked schedule like a change of lines or dates.
   const touchesSchedule =
-    data.services !== undefined || data.startDate !== undefined || data.endDate !== undefined;
+    data.services !== undefined || data.startDate !== undefined || data.endDate !== undefined
+    || data.discount !== undefined || data.gstPercentage !== undefined;
 
   if (data.startDate !== undefined) {
     data.startDate = await normalizeContractStartDate(tenantId, data.startDate);
@@ -210,16 +213,12 @@ export async function updateContract(id: string, tenantId: string, data: any, sc
     const existing: any = await NativeContract.findOne(filter).lean();
     const services  = data.services        ?? existing?.services        ?? [];
     const parts     = data.parts           ?? existing?.parts           ?? [];
-    const discount  = Number(data.discount      ?? existing?.discount      ?? 0);
-    const gst       = Number(data.gstPercentage ?? existing?.gstPercentage ?? 0);
-    const svcTotal  = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
-    const prtTotal  = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-    // discount is a percentage (0-100), not a flat amount — matches createContract above.
-    const subtotal  = svcTotal + prtTotal;
-    const after     = subtotal - (subtotal * discount) / 100;
-    data.partsAmount           = prtTotal;
-    data.servicesAmount        = after;
-    data.servicesAmountWithTax = after + (after * gst) / 100;
+    const header    = {
+      discount:      data.discount      ?? existing?.discount      ?? 0,
+      gstPercentage: data.gstPercentage ?? existing?.gstPercentage ?? 0,
+    };
+    // As createContract: each line at its own rates, else the header's.
+    Object.assign(data, computeContractTotals(services, parts, header));
 
     // Regenerate the visit schedule only while no visit has a work order —
     // once any visit is scheduled or completed, the schedule is locked.
@@ -230,20 +229,21 @@ export async function updateContract(id: string, tenantId: string, data: any, sc
         (v: any) => v.status === 'scheduled' || v.status === 'completed',
       );
       if (!locked && start && end) {
-        data.visits = generateVisits(services, start, end);
+        data.visits = generateVisits(services, start, end, header);
       }
     }
   }
   const updated = await NativeContract.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeContract, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'contracts', updated.toObject(), (updated as any).title);
   return updated;
 }
 
-export async function deleteContract(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteContract(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { contractId: id }] }
@@ -273,7 +273,8 @@ export async function deleteContract(id: string, tenantId: string, scope?: DataS
     );
   }
 
-  const deleted = await NativeContract.findOneAndDelete(filter);
+  const deleted = await NativeContract.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeContract, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'contracts', String(deleted._id));
   return deleted;
 }
@@ -298,6 +299,47 @@ export async function updateVisitStatus(
     { $set },
     { new: true },
   );
+}
+
+/**
+ * LR-R26-SCHED-001: give back visits whose claim is older than olderThanMs
+ * and still has no work order linked: a run that stopped between the claim
+ * and the work order (a deploy, a crash, the database gone) left them
+ * 'scheduled' with nothing behind them, and nothing picks up a scheduled
+ * visit again. If the claim's work order was made after all (only its link is
+ * missing), it is linked instead. Visits scheduled before claims had a time
+ * are not touched. Run at the start of every generator run.
+ */
+export async function releaseStaleVisitClaims(now: Date = new Date(), olderThanMs = 15 * 60_000): Promise<{ released: number; linked: number }> {
+  const cutoff = new Date(now.getTime() - olderThanMs);
+  const stale = { status: 'scheduled', claimedAt: { $lt: cutoff }, woId: { $in: [null, ''] } };
+  const contracts: any[] = await NativeContract.find({ visits: { $elemMatch: stale } })
+    .select('_id tenantId contractId visits').lean();
+  let released = 0;
+  let linked = 0;
+  for (const contract of contracts) {
+    for (const visit of contract.visits ?? []) {
+      if (visit.status !== 'scheduled' || visit.woId || !visit.claimedAt || new Date(visit.claimedAt) >= cutoff) continue;
+      const sameClaim = { _id: contract._id, visits: { $elemMatch: { visitNumber: visit.visitNumber, status: 'scheduled', claimedAt: visit.claimedAt } } };
+      try {
+        const wo: any = await NativeWorkorder.findOne({
+          tenantId: contract.tenantId, contractId: contract.contractId, contractVisitNumber: visit.visitNumber,
+          createdAt: { $gte: visit.claimedAt },
+        }).select('_id workOrderId').lean();
+        if (wo) {
+          await NativeContract.updateOne(sameClaim, { $set: { 'visits.$.workOrderId': wo.workOrderId, 'visits.$.woId': String(wo._id) } });
+          linked++;
+        } else {
+          await NativeContract.updateOne(sameClaim, { $set: { 'visits.$.status': 'planned' }, $unset: { 'visits.$.claimedAt': 1 } });
+          released++;
+          logger.warn('Contract visit claim given back: no work order was made', { contractId: contract.contractId, visitNumber: visit.visitNumber });
+        }
+      } catch (err) {
+        logger.error('Contract visit claim check failed', { contractId: contract.contractId, visitNumber: visit.visitNumber, error: (err as Error).message });
+      }
+    }
+  }
+  return { released, linked };
 }
 
 /**
@@ -326,23 +368,44 @@ export async function generateWorkordersForVisits(
 
   let created = 0;
   for (const visit of targets) {
+    // LR-R26-SCHED-001: claim the visit before creating its work order, so two
+    // runs at once (the hourly run and the start-up run, two servers during a
+    // deploy, Generate All clicked twice) cannot both create one. Only the run
+    // whose update turns this visit from 'planned' to 'scheduled' goes on.
+    // The claim carries its time, so one left behind by a run that stopped
+    // half-way (a deploy, a crash) is given back later (releaseStaleVisitClaims).
+    const claimedAt = new Date();
+    const claimed = await NativeContract.findOneAndUpdate(
+      { _id: id, tenantId: tid, visits: { $elemMatch: { visitNumber: visit.visitNumber, status: 'planned' } } },
+      { $set: { 'visits.$.status': 'scheduled', 'visits.$.claimedAt': claimedAt } },
+      { projection: { _id: 1 } },
+    );
+    if (!claimed) continue;
     try {
+      // LR-R26-CTR-007: each line's rates are the visit's own (above 0), else
+      // the contract line's, else the contract header's. A visit made before
+      // this fix stored 0 for a rate its line did not set, and that 0 won:
+      // the work order lost the contract's GST.
+      const header = { discount: contract.discount, gstPercentage: contract.gstPercentage };
       const visitServices = (visit.services ?? []).map((vs: any) => {
         const matched = (contract.services ?? []).find((cs: any) => cs.name === vs.name || (cs.serviceId && cs.serviceId === vs.serviceId));
+        const lineRates = effectiveLineRates(matched, header);
+        const rates = effectiveLineRates(vs, { discount: lineRates.discountPercent, gstPercentage: lineRates.taxPercent });
         return {
           name:            vs.name,
           description:     vs.description ?? matched?.description,
           amount:          vs.amount,
           count:           vs.count,
-          taxPercent:      vs.taxPercent ?? matched?.taxPercent ?? (contract.gstPercentage || 0),
-          discountPercent: vs.discountPercent ?? matched?.discountPercent ?? (contract.discount || 0),
+          taxPercent:      rates.taxPercent,
+          discountPercent: rates.discountPercent,
           durationHours:   vs.durationHours,
           serviceId:       vs.serviceId,
           frequency:       vs.frequency,
         };
       });
-      const disc = visitServices.find((s: any) => s.discountPercent != null)?.discountPercent ?? contract.discount ?? 0;
-      const gst  = visitServices.find((s: any) => s.taxPercent != null)?.taxPercent ?? contract.gstPercentage ?? 0;
+      // The work order's header: the first line's rates (one line: the same).
+      const disc = visitServices[0]?.discountPercent ?? (Number(contract.discount) || 0);
+      const gst  = visitServices[0]?.taxPercent ?? (Number(contract.gstPercentage) || 0);
 
       const wo: any = await createWorkorder({
         tenantId:              contract.tenantId,
@@ -357,7 +420,8 @@ export async function generateWorkordersForVisits(
         teamId:                contract.teamId,
         staffId:               contract.staffId,
         staffIds:              contract.staffIds ?? [],
-        scheduledDate:         visit.serviceDate,
+        // LR-R26-CTR-007: at the contract's start time, not midnight.
+        scheduledDate:         visitStartAt(visit.serviceDate, contract.startDate),
         durationHours:         visit.services?.reduce((s: number, x: any) => s + (Number(x.durationHours) || 0), 0) || undefined,
         status:                scheduledKey,
         priority:              contract.priority && ['low', 'medium', 'high'].includes(contract.priority) ? contract.priority : 'medium',
@@ -371,8 +435,26 @@ export async function generateWorkordersForVisits(
         woId:        wo?._id ? String(wo._id) : undefined,
       });
       created++;
-    } catch {
-      // continue with remaining visits
+    } catch (err) {
+      // LR-R26-SCHED-001: say which visit failed (this was silent: a failing
+      // run only logged 'created: 0'), and give the visit back unless this
+      // claim's work order was made (an older one, e.g. cancelled, does not
+      // count), so the next run tries again. Then go on with the others.
+      logger.error('Contract visit work order failed', {
+        contractId: contract.contractId, visitNumber: visit.visitNumber, error: (err as Error)?.message,
+      });
+      const made = await NativeWorkorder.exists({
+        tenantId: contract.tenantId, contractId: contract.contractId, contractVisitNumber: visit.visitNumber,
+        createdAt: { $gte: claimedAt },
+      }).catch(() => null);
+      if (!made) {
+        await NativeContract.updateOne(
+          { _id: id, tenantId: tid, visits: { $elemMatch: { visitNumber: visit.visitNumber, status: 'scheduled', claimedAt } } },
+          { $set: { 'visits.$.status': 'planned' }, $unset: { 'visits.$.claimedAt': 1 } },
+        ).catch((e: Error) => logger.error('Contract visit could not be given back; the next run gives it back', {
+          contractId: contract.contractId, visitNumber: visit.visitNumber, error: e?.message,
+        }));
+      }
     }
   }
   return { created, skipped: targets.length - created };

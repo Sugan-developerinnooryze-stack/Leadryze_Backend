@@ -93,6 +93,9 @@ export interface NativeCrmLogParams {
   statusCode?: number;
   ip?: string;
   url?: string;
+  /** 'assistant' for a change the CRM assistant made; left out otherwise, so
+   * screen entries keep their exact shape. */
+  origin?: 'assistant';
 }
 
 /** The single place a NativeCrmLog document actually gets written — used by
@@ -121,6 +124,7 @@ export async function writeNativeCrmLog(params: NativeCrmLogParams): Promise<voi
     statusCode: params.statusCode ?? 200,
     ip:         params.ip ?? 'unknown',
     url:        params.url ?? '',
+    ...(params.origin ? { origin: params.origin } : {}),
     timestamp:  new Date(),
   });
 }

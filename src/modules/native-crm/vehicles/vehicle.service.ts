@@ -3,6 +3,7 @@ import { NativeVehicle } from './vehicle.model';
 import { DataScope } from '../../../types';
 import { applyDataScopeToCreatedByFilter } from '../shared/data-scope';
 import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/search-index';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listVehicles(tenantId: string, opts: any, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -40,26 +41,28 @@ export async function createVehicle(data: any) {
   return created;
 }
 
-export async function updateVehicle(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateVehicle(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { vehicleId: id }] }
     : { vehicleId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const updated = await NativeVehicle.findOneAndUpdate(filter, data, { new: true, runValidators: true });
+  const updated = await NativeVehicle.findOneAndUpdate(withExpectedVersion(filter, guard), data, { new: true, runValidators: true });
+  if (!updated) await throwIfStale(NativeVehicle, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'vehicles', updated.toObject(), (updated as any).name);
   return updated;
 }
 
-export async function deleteVehicle(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteVehicle(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { vehicleId: id }] }
     : { vehicleId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeVehicle.findOneAndDelete(filter);
+  const deleted = await NativeVehicle.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeVehicle, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'vehicles', String(deleted._id));
   return deleted;
 }

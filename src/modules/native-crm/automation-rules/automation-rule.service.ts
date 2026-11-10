@@ -20,6 +20,7 @@ import { CustomModuleDef, CustomRecord } from '../../custom-modules/custom-modul
 import { listCustomFields } from '../custom-fields/custom-field.service';
 import { BUILT_IN_TARGET_FIELDS, ITargetFieldDef } from './target-field-catalog';
 import { decrypt, isEncrypted } from '../../../utils/crypto';
+import { escapeRegex } from '../../../utils/escape-regex';
 import { logger } from '../../../utils/logger';
 
 /** Lead/Customer/Staff all PII-encrypt email/phone at rest (see
@@ -644,6 +645,26 @@ export async function createRecordInTargetModule(
  * automation.publish/.delete are Admin-only — a Manager-authored update
  * action cannot affect real, live traffic until an Admin explicitly
  * publishes it. */
+/** LR-NEG-001: a Lead or Deal save is refused without the record's version
+ * token (it protects a person saving from a stale screen). An automation step
+ * has no screen: it acts on the record as it is when the step runs, so it
+ * reads the current token and sends it with the change. Only a save landing
+ * between this read and the step's own write gets the conflict. A person's
+ * edit made earlier, for example during a Delay, is not protected: the step
+ * writes over it, as automation steps always did before the token became
+ * mandatory (a Condition after a Delay still reads the paused snapshot). */
+async function withCurrentVersion(
+  model: mongoose.Model<any>, tenantId: string, id: string, payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (!mongoose.isValidObjectId(id)) return payload;
+  const current = await model
+    .findOne({ _id: id, tenantId: new mongoose.Types.ObjectId(tenantId) })
+    .select('updatedAt __v')
+    .lean<{ updatedAt?: Date; __v?: number }>();
+  if (!current) return payload; // the update itself reports "not found", as before
+  return { ...payload, updatedAt: current.updatedAt, __v: current.__v };
+}
+
 export async function updateRecordInTargetModule(
   tenantId: string, targetModule: string, id: string, payload: Record<string, unknown>, depth: number,
 ): Promise<Record<string, any> | null> {
@@ -654,11 +675,13 @@ export async function updateRecordInTargetModule(
   switch (targetModule as BuiltInPipelineModule) {
     case 'lead': {
       const { updateLead } = await import('../leads/lead.service');
-      return updateLead(id, tenantId, payload);
+      const { Lead } = await import('../leads/lead.model');
+      return updateLead(id, tenantId, await withCurrentVersion(Lead, tenantId, id, payload));
     }
     case 'deal': {
       const { updateDeal } = await import('../deals/deal.service');
-      return updateDeal(tenantId, id, payload as any);
+      const { Deal } = await import('../deals/deal.model');
+      return updateDeal(tenantId, id, await withCurrentVersion(Deal, tenantId, id, payload) as any);
     }
     case 'task': {
       const { updateTask } = await import('../tasks/task.service');
@@ -1144,10 +1167,6 @@ export async function runAutomationOnWebhook(
    the "condition" vocabulary already built for condition nodes has to become
    a real Mongo query here instead of an in-memory check against one record
    already in hand. */
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 /** '=' / '!=' equality — coerces the literal string value to a boolean or
  * number when it looks like one, so `amount = 50000` matches a genuinely

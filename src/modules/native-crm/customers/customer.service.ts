@@ -11,6 +11,8 @@ import { NativeWorkorder } from '../workorders/workorder.model';
 import { NativeInvoice } from '../invoices/invoice.model';
 import { NativeReceipt } from '../receipts/receipt.model';
 import { NativeContract } from '../contracts/contract.model';
+import { preparePiiUpdate } from '../shared/pii-update';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 export async function listCustomers(tenantId: string, opts: CustomerListOptions, branchId?: string | null, scope?: DataScope) {
   const tid   = new mongoose.Types.ObjectId(tenantId);
@@ -52,23 +54,25 @@ export async function createCustomer(data: any) {
   return doc;
 }
 
-export async function updateCustomer(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateCustomer(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { customerId: id }] }
     : { customerId: id };
   const filter: any = { ...idFilter, tenantId: tid };
   applyDataScopeToFilter(filter, scope, 'assignedStaffId');
+  // findOneAndUpdate skips the pre('save') hook that encrypts PII on create.
   const updated = await NativeCustomer.findOneAndUpdate(
-    filter,
-    data,
+    withExpectedVersion(filter, guard),
+    preparePiiUpdate(data, 'customers', NativeCustomer),
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeCustomer, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'customers', updated.toObject(), updated.name);
   return updated;
 }
 
-export async function deleteCustomer(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteCustomer(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { customerId: id }] }
@@ -104,7 +108,8 @@ export async function deleteCustomer(id: string, tenantId: string, scope?: DataS
     );
   }
 
-  const deleted = await NativeCustomer.findOneAndDelete(filter);
+  const deleted = await NativeCustomer.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeCustomer, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'customers', String(deleted._id));
   return deleted;
 }
@@ -117,12 +122,20 @@ export async function deleteCustomer(id: string, tenantId: string, scope?: DataS
  * the tenant's real, operationally-used Customer entity (the one Work
  * Orders/Invoices/Quotations/Contracts actually reference), unlike the
  * separate legacy top-level `customers` module. */
-export async function getCustomerStats(tenantId: string, scope?: DataScope, range?: string, customFrom?: string, customTo?: string) {
+export async function getCustomerStats(
+  tenantId: string, scope?: DataScope, range?: string, customFrom?: string, customTo?: string,
+  /** Optional, trailing and only passed by the internal CRM assistant's
+   * /crm-stats (so its customer stats match its branch-scoped customer
+   * list/count). The human Customers stats endpoint never passes it and
+   * stays tenant-wide, exactly as before. */
+  branchId?: string | null,
+) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
   const baseFilter: Record<string, unknown> = { tenantId: tid };
+  if (branchId) baseFilter.branchId = new mongoose.Types.ObjectId(branchId);
   applyDataScopeToFilter(baseFilter, scope, 'assignedStaffId');
 
   const rangedFilter = { ...baseFilter };

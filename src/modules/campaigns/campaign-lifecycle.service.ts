@@ -8,6 +8,7 @@ import { sendSmsNow } from '../messages/twilio.service';
 import { sendWhatsAppNow } from '../messages/whatsapp.service';
 import { previewAudience, createRecipientsForCampaign, dispatchCampaignTick, renderVariablesForCustomer } from './campaign-dispatch.service';
 import { Tenant } from '../tenants/tenant.model';
+import { resolveTenantReplyTo, REPLY_TO_MISSING_MESSAGE } from '../messages/tenant-reply-to';
 import { config } from '../../config';
 
 export class CampaignActionError extends Error {
@@ -22,6 +23,23 @@ async function loadDraftCampaign(tenantId: string, id: string): Promise<ICampaig
   const campaign = await Campaign.findOne({ _id: id, tenantId });
   if (!campaign) throw new CampaignActionError('Campaign not found', 404);
   return campaign;
+}
+
+/**
+ * LR-PL-CAMP-002: a campaign with this many recipients or fewer is sent in a
+ * single dispatch tick (dispatchCampaignTick sends 50 a tick), so activation
+ * waits for that tick, for up to ACTIVATE_WAIT_MS, and returns the campaign as
+ * it is then: usually Completed with its sent count. The page then shows the
+ * result without depending on later reads. Larger campaigns, and a tick that
+ * takes longer, are answered as before (Running) and finish in the background.
+ */
+export const ACTIVATE_WAIT_MAX_RECIPIENTS = 50;
+export const ACTIVATE_WAIT_MS = 10_000;
+
+function waitAtMost(done: Promise<void>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); });
+  return Promise.race([done, timeout]).finally(() => clearTimeout(timer));
 }
 
 // The idempotency guarantee: only a status:'draft' campaign can ever be
@@ -46,6 +64,10 @@ export async function activateCampaign(tenantId: string, id: string): Promise<IC
   if (template.type !== campaign.channel) {
     throw new CampaignActionError(`Selected template is for ${template.type}, but this campaign's channel is ${campaign.channel}`, 400);
   }
+  // LR-PL-CAMP-003: an e-mail campaign needs the tenant's own reply address.
+  if (campaign.channel === 'email' && !(await resolveTenantReplyTo(tenantId))) {
+    throw new CampaignActionError(REPLY_TO_MISSING_MESSAGE, 400);
+  }
 
   const preview = await previewAudience(tenantId, campaign.audience, campaign.channel as 'email' | 'whatsapp' | 'sms');
   if (preview.count === 0) {
@@ -66,16 +88,34 @@ export async function activateCampaign(tenantId: string, id: string): Promise<IC
     // Fire-and-forget — covers "Send Now" immediately and drives all batches
     // to completion with zero BullMQ dependency. The restart/safety-net cron
     // (campaign-scheduler.service.ts) guarantees forward progress regardless.
+    let firstTickDone: () => void = () => {};
+    const firstTick = new Promise<void>((resolve) => { firstTickDone = resolve; });
     void (async () => {
       try {
         let result = await dispatchCampaignTick(String(campaign._id));
+        firstTickDone();
         while (!result.done && result.processed > 0) {
           result = await dispatchCampaignTick(String(campaign._id));
         }
       } catch {
         // logging handled in dispatchCampaignTick
+      } finally {
+        firstTickDone();
       }
     })();
+
+    // LR-PL-CAMP-002: a small campaign is answered after its one tick (see
+    // ACTIVATE_WAIT_MAX_RECIPIENTS). If the re-read fails, the campaign as
+    // saved above is returned, as before.
+    if (recipientCount <= ACTIVATE_WAIT_MAX_RECIPIENTS) {
+      await waitAtMost(firstTick, ACTIVATE_WAIT_MS);
+      try {
+        const latest = await Campaign.findOne({ _id: campaign._id, tenantId });
+        if (latest) return latest;
+      } catch {
+        // fall through to the campaign as saved
+      }
+    }
   }
 
   return campaign;
@@ -95,6 +135,10 @@ export async function resumeCampaign(tenantId: string, id: string): Promise<ICam
   const campaign = await loadDraftCampaign(tenantId, id);
   if (campaign.status !== 'paused') {
     throw new CampaignActionError(`Campaign cannot be resumed from status "${campaign.status}"`, 409);
+  }
+  // LR-PL-CAMP-003: as on activation (the send itself would stop without one).
+  if (campaign.channel === 'email' && !(await resolveTenantReplyTo(tenantId))) {
+    throw new CampaignActionError(REPLY_TO_MISSING_MESSAGE, 400);
   }
   const startAt = campaign.schedule?.startAt;
   const sendNow = !startAt || new Date(startAt).getTime() <= Date.now();
@@ -148,7 +192,7 @@ export async function duplicateCampaign(tenantId: string, userId: string, id: st
 
 // One-off test send — deliberately does NOT create a CampaignRecipient row
 // and does NOT touch campaign.stats, so it never pollutes real send counts.
-export async function testSendCampaign(tenantId: string, id: string, to: string): Promise<{ sent: boolean }> {
+export async function testSendCampaign(tenantId: string, id: string, to: string): Promise<{ sent: boolean; reason?: string }> {
   const campaign = await loadDraftCampaign(tenantId, id);
   if (!campaign.templateId) throw new CampaignActionError('Select a message template first', 400);
   const template = await getTemplateById(tenantId, String(campaign.templateId));
@@ -182,7 +226,9 @@ export async function testSendCampaign(tenantId: string, id: string, to: string)
   if (campaign.channel === 'email') {
     const subject = renderTemplate(template.subject || '', variables);
     const senderName = tenant?.branding?.companyName || tenant?.name || config.brevo.senderName;
-    const replyTo = tenant?.branding?.contactEmail || undefined;
+    // LR-PL-CAMP-003: not sent without the tenant's own reply address.
+    const replyTo = await resolveTenantReplyTo(tenantId, tenant);
+    if (!replyTo) return { sent: false, reason: REPLY_TO_MISSING_MESSAGE };
     try {
       messageId = await sendEmailNow({
         to,

@@ -11,7 +11,9 @@ import { indexNativeSearchRecord, removeNativeSearchRecord } from '../shared/sea
 import { advanceWorkflow } from '../workflow/workflow.engine';
 import { resolveDateRange, applyDateRangeToFilter } from '../shared/date-range';
 import { applyDynamicFilters } from '../shared/dynamic-filter';
+import { computeDocumentTotals } from '../shared/document-totals';
 import { getQuotationFilterCatalog } from './quotation.filter-catalog';
+import { WriteGuard, withExpectedVersion, throwIfStale } from '../../../utils/stale-write';
 
 async function assertValidStatus(tenantId: string, status: string | undefined): Promise<void> {
   if (!status) return;
@@ -78,36 +80,32 @@ export async function getQuotationById(id: string, tenantId: string, scope?: Dat
 
 export async function createQuotation(data: any) {
   await assertValidStatus(String(data.tenantId), data.status);
-  const services: any[]  = data.services ?? [];
-  const parts: any[]     = data.parts ?? [];
-  const svcTotal = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
-  const prtTotal = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
-  const discount = Number(data.discount ?? 0);
-  const gst      = Number(data.gstPercentage ?? 0);
+  // Totals: NC/shared/document-totals.ts (pinned by tests/document-totals-golden.test.ts).
   // discount is a percentage (0-100), not a flat amount — matches the
   // on-screen preview in ServiceLinesEditor.tsx.
-  const subtotal = svcTotal + prtTotal;
-  const after    = subtotal - (subtotal * discount) / 100;
+  const t = computeDocumentTotals('quotation', { services: data.services, parts: data.parts, discount: data.discount, gstPercentage: data.gstPercentage });
   const created = await NativeQuotation.create({
     ...data,
-    partsAmount:           prtTotal,
-    servicesAmount:        after,
-    servicesAmountWithTax: after + (after * gst) / 100,
+    partsAmount:           t.partsAmount,
+    servicesAmount:        t.servicesAmount,
+    servicesAmountWithTax: t.servicesAmountWithTax,
   });
   // Mirrors the identical source-linking pattern already used by
   // createWorkorder/createContract/createInvoice — marks the source
   // Contract workflowState='complete' once a Quotation has been created
   // from it, so the Contract row's "convert" button (once that also checks
-  // workflowState) stops offering to convert it again.
+  // workflowState) stops offering to convert it again. Scoped to this
+  // quotation's own tenant: the contract id comes from the caller and is
+  // not otherwise checked against it.
   if (data.createdBy !== 'system' && data.contractId) {
-    const src = await NativeContract.findOne({ contractId: data.contractId }).select('_id').lean();
-    if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'quotation', mongoId: (created._id as any).toString() }).catch(() => {});
+    const src = await NativeContract.findOne({ tenantId: created.tenantId, contractId: data.contractId }).select('_id').lean();
+    if (src) advanceWorkflow({ type: 'contract', mongoId: (src._id as any).toString() }, { type: 'quotation', mongoId: (created._id as any).toString() }, created.tenantId).catch(() => {});
   }
   indexNativeSearchRecord(String(created.tenantId), 'native-crm', 'quotations', created.toObject(), created.title);
   return created;
 }
 
-export async function updateQuotation(id: string, tenantId: string, data: any, scope?: DataScope) {
+export async function updateQuotation(id: string, tenantId: string, data: any, scope?: DataScope, guard?: WriteGuard) {
   await assertValidStatus(tenantId, data.status);
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
@@ -117,36 +115,39 @@ export async function updateQuotation(id: string, tenantId: string, data: any, s
   applyDataScopeToCreatedByFilter(filter, scope);
   if (data.services !== undefined || data.parts !== undefined || data.discount !== undefined || data.gstPercentage !== undefined) {
     const existing = await NativeQuotation.findOne(filter).lean();
-    const services  = data.services        ?? (existing as any)?.services        ?? [];
-    const parts     = data.parts           ?? (existing as any)?.parts           ?? [];
-    const discount  = Number(data.discount      ?? (existing as any)?.discount      ?? 0);
-    const gst       = Number(data.gstPercentage ?? (existing as any)?.gstPercentage ?? 0);
-    const svcTotal  = services.reduce((sum: number, s: any) => sum + (Number(s.amount) * Number(s.count || 1)), 0);
-    const prtTotal  = parts.reduce((sum: number, p: any) => sum + (Number(p.amount) * Number(p.count || 1)), 0);
+    // Totals: NC/shared/document-totals.ts (pinned by tests/document-totals-golden.test.ts).
     // discount is a percentage (0-100), not a flat amount — matches createQuotation.
-    const subtotal  = svcTotal + prtTotal;
-    const after     = subtotal - (subtotal * discount) / 100;
-    data.partsAmount           = prtTotal;
-    data.servicesAmount        = after;
-    data.servicesAmountWithTax = after + (after * gst) / 100;
+    // Number() of discount and GST first, as before the shared function: the same value, and the
+    // same error first for a body without the screen's Zod.
+    const t = computeDocumentTotals('quotation', {
+      services:      data.services      ?? (existing as any)?.services,
+      parts:         data.parts         ?? (existing as any)?.parts,
+      discount:      Number(data.discount      ?? (existing as any)?.discount      ?? 0),
+      gstPercentage: Number(data.gstPercentage ?? (existing as any)?.gstPercentage ?? 0),
+    });
+    data.partsAmount           = t.partsAmount;
+    data.servicesAmount        = t.servicesAmount;
+    data.servicesAmountWithTax = t.servicesAmountWithTax;
   }
   const updated = await NativeQuotation.findOneAndUpdate(
-    filter,
+    withExpectedVersion(filter, guard),
     data,
     { new: true, runValidators: true }
   );
+  if (!updated) await throwIfStale(NativeQuotation, filter, guard);
   if (updated) indexNativeSearchRecord(tenantId, 'native-crm', 'quotations', updated.toObject(), updated.title);
   return updated;
 }
 
-export async function deleteQuotation(id: string, tenantId: string, scope?: DataScope) {
+export async function deleteQuotation(id: string, tenantId: string, scope?: DataScope, guard?: WriteGuard) {
   const tid = new mongoose.Types.ObjectId(tenantId);
   const idFilter = mongoose.isValidObjectId(id)
     ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { quotationId: id }] }
     : { quotationId: id };
   const filter: Record<string, unknown> = { ...idFilter, tenantId: tid };
   applyDataScopeToCreatedByFilter(filter, scope);
-  const deleted = await NativeQuotation.findOneAndDelete(filter);
+  const deleted = await NativeQuotation.findOneAndDelete(withExpectedVersion(filter, guard));
+  if (!deleted) await throwIfStale(NativeQuotation, filter, guard);
   if (deleted) removeNativeSearchRecord(tenantId, 'native-crm', 'quotations', String(deleted._id));
   return deleted;
 }

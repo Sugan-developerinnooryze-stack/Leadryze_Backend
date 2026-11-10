@@ -5,6 +5,7 @@ import { LeadImportTriage } from './lead-import-triage.model';
 import { decrypt, isEncrypted } from '../../../utils/crypto';
 
 import { findDuplicateContact } from '../shared/duplicate-check';
+import { PHONE_FORMAT_REGEX } from './lead.validation';
 
 export interface ImportRow {
   firstName?: string;
@@ -31,11 +32,19 @@ export interface RejectedRow {
   data:   ImportRow;
 }
 
+/** LR-IMP-001: a row skipped as a duplicate, and the lead it matched. */
+export interface DuplicateRow {
+  row:          number;
+  matchedId:    string;
+  matchedLabel: string;
+}
+
 export interface ImportSummary {
   batchId:    string;
   total:      number;
   created:    number;
   duplicates: number;
+  duplicateRows: DuplicateRow[];
   triage:     number;
   rejected:   RejectedRow[];
 }
@@ -63,6 +72,14 @@ function validateRow(row: ImportRow): string[] {
   const phone = normalizePhone(row.phone || row.mobile);
   if (!email && !phone) errors.push('either email or phone is required');
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push('email is not a valid format');
+  // LR-C4-IMP-003: the same phone rule as the lead form and Leads > File. A
+  // spreadsheet number read as display text ("9.19877E+11") was saved as the
+  // lead's phone here.
+  for (const field of ['phone', 'mobile'] as const) {
+    const value = row[field];
+    const text = value != null ? String(value).trim() : '';
+    if (text && !PHONE_FORMAT_REGEX.test(text)) errors.push(`${field} is not a valid phone number`);
+  }
 
   // LR-R2-IMP-001: validate expectedRevenue (≥ 0, ≤ 1e12)
   if (row.expectedRevenue !== undefined && row.expectedRevenue !== null && row.expectedRevenue !== '') {
@@ -109,7 +126,7 @@ function toLeadPayload(tenantId: string, row: ImportRow, batchId: string, create
  */
 export async function importLeadsCsv(tenantId: string, rows: ImportRow[], createdBy?: string): Promise<ImportSummary> {
   const batchId = new mongoose.Types.ObjectId().toString();
-  const summary: ImportSummary = { batchId, total: rows.length, created: 0, duplicates: 0, triage: 0, rejected: [] };
+  const summary: ImportSummary = { batchId, total: rows.length, created: 0, duplicates: 0, duplicateRows: [], triage: 0, rejected: [] };
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -129,6 +146,8 @@ export async function importLeadsCsv(tenantId: string, rows: ImportRow[], create
 
       if (duplicate) {
         summary.duplicates++;
+        // LR-IMP-001: say which row and which lead (only a count before).
+        summary.duplicateRows.push({ row: i + 2, matchedId: duplicate.id, matchedLabel: duplicate.label });
         continue;
       }
 
@@ -166,7 +185,18 @@ export async function resolveTriageItem(
   if (item.status !== 'pending') throw new Error('This item has already been resolved');
 
   if (action === 'create') {
-    await createLead(toLeadPayload(tenantId, item.rawRow as ImportRow, item.batchId, userId));
+    // LR-IMP-001: the same checks as an imported row. "Create as new lead"
+    // created the lead with no field check and no duplicate check.
+    const row = item.rawRow as ImportRow;
+    const errors = validateRow(row);
+    if (errors.length) throw new Error(`This row cannot be created: ${errors.join('; ')}`);
+    const duplicate = await findDuplicateContact(Lead, tenantId, {
+      email: row.email != null ? String(row.email) : undefined,
+      phone: row.phone != null ? String(row.phone) : undefined,
+      mobile: row.mobile != null ? String(row.mobile) : undefined,
+    });
+    if (duplicate) throw new Error(`This row matches the existing lead ${duplicate.label} (${duplicate.id}); skip it instead`);
+    await createLead(toLeadPayload(tenantId, row, item.batchId, userId));
     item.status = 'created';
   } else {
     item.status = 'skipped';
